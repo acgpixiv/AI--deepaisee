@@ -74,7 +74,7 @@ GitHub 单文件硬上限 100MB，下面这些放不进 Git，**需要自己补*
 | --- | --- | --- |
 | `models\embeddinggemma2.gguf` | 533MB | HuggingFace 上 EmbeddingGemma 300M 的 GGUF 转换版 |
 | `models\clip\model.onnx` + `vocab.txt` | 183MB | `Xenova/chinese-clip-vit-base-patch16` 的 `onnx/model_quantized.onnx` 改名为 `model.onnx`，词表取同目录 `vocab.txt` |
-| `models\clap\audio_model.onnx` + `text_model.onnx` + `vocab.txt` + `merges.txt` | 155MB | `Xenova/clap-htsat-unfused` 的两个 `onnx/*_model_quantized.onnx`，`vocab.json` 改名为 `vocab.txt` |
+| `models\clap\audio_model.onnx` + `text_model.onnx` + `vocab.json` + `merges.txt` | 155MB | `Xenova/clap-htsat-unfused` 的两个 `onnx/*_model_quantized.onnx`，词表 `vocab.json` 与 `merges.txt` 原样保留（**不要改名**） |
 | `tools\bin\ffmpeg.exe` | 84MB | 任意 Windows 版 ffmpeg（需要 `-ss` 抽帧与 `f32le` 解码，7.x 已验证） |
 
 文件放到位后不用改配置：程序启动时会在 `models\` 下找 `.gguf` 自动装载，CLIP/CLAP 默认读 `<exe>\models\clip` 与 `<exe>\models\clap`。跨模态模型首次装好后需要**重建一次索引**才会产出 512 维图文/音文向量。
