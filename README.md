@@ -144,6 +144,21 @@ cd src-tauri && cargo build --release --features llama,custom-protocol
 - 正文命中的结果会在标题下显示**加粗高亮的片段**，前后各留 60 字上下文
 - 选中结果后可导出清单（CSV / TXT / JSON）
 
+### 界面截图
+
+<table>
+<tr>
+<td width="50%"><img src="docs/screenshots/v0.20-find-image.png" alt="用一句话找图片"><br><sub>文字找图：「一只黑色的狗」→ 命中真实照片，视频按首帧参与匹配</sub></td>
+<td width="50%"><img src="docs/screenshots/v0.20-find-audio.png" alt="用一句话找声音"><br><sub>文字找声音：「钢琴」→ 命中钢琴音频，纯画面查询不会串到声音</sub></td>
+</tr>
+<tr>
+<td><img src="docs/screenshots/v0.20-models.png" alt="模型管理"><br><sub>模型管理页：扫描模型目录、一键切换、查看维度与路径</sub></td>
+<td><img src="docs/screenshots/v0.20-search.png" alt="全文检索"><br><sub>全文检索：正文命中的片段直接显示在标题下方</sub></td>
+</tr>
+</table>
+
+> 截图为开发机上的实测记录，列表里的「所在位置」是测试目录。
+
 ### 全文搜索支持哪些格式
 
 | 类别 | 扩展名 | 抽取方式 |
