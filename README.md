@@ -403,11 +403,11 @@ A：正常。体积占比 99% 的目录会占满画布，其余目录在右侧�
 **Q：扫描 `C:\Windows` 报「拒绝访问」？**
 A：系统目录需要管理员权限。扫描时无权限的目录会被跳过并计入「错误」计数，不会中断整体扫描。
 
-**Q：改完代码 `cargo build` 报 `failed to open ...\.cargo-build-lock` / `拒绝访问 (os error 5)`？**
-A：本机沙箱只给 `D:\deepaisee` 根目录写入权，`src-tauri\target` 里旧锁文件的完整性级别比进程高，删不掉也打不开。换一个目标目录即可，不必改权限：
+**Q：`cargo build` 报 `failed to open ...\.cargo-build-lock` / `拒绝访问 (os error 5)`？**
+A：`target` 目录里有残留的锁文件，且其完整性级别高于当前进程（常见于从加固过的环境里带出来的 `target`）。不用改 ACL，直接换一个构建目标目录即可：
 
 ```bat
-set CARGO_TARGET_DIR=D:\deepaisee\build-target
+set CARGO_TARGET_DIR=D:\build\deepaisee
 cd src-tauri && cargo build --release --features llama,custom-protocol
 ```
 

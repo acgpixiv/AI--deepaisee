@@ -56,7 +56,7 @@ v0.17 试过用 EmbeddingGemma 2 的视觉塔：mtmd 能导出、能编码、向
 - `similar()` 升级为按源文件类型挑空间：图片/视频 → CLIP 优先，音频 → CLAP 优先，文本 → 主向量库优先，找不到再跨空间兜底。
 - 四个向量空间：`vectors\`（768 维）、`vectors_media\`（256 维兜底）、`vectors_clip\`（512）、`vectors_audio\`（512）。
 
-### 六、真机实测（`D:\deepaisee\_xtest\docs`，6 图 + 6 音频 + 2 视频）
+### 六、真机实测（本地测试目录，6 图 + 6 音频 + 2 视频）
 
 | 查询 | 结果 |
 | --- | --- |
@@ -316,7 +316,7 @@ search 蓝色   → img104.jpg 0.72、img0_1920x1200.jpg 0.67
   - `--cli index --what embed --wait` → 「检测到文本向量库为空，已重置 18 条记录重新入队」→ `向量 18（失败 0）`。
 - 修复：CLI 在 PowerShell 管道 / 重定向输出时一个字都收不到。原因是 `attach_console()` 无条件 `AttachConsole` + `SetStdHandle`，把调用者已经给好的管道句柄覆盖掉了。现在先 `GetStdHandle(STD_OUTPUT_HANDLE)`，句柄有效就完全不碰（直接输出与 `> file` 重定向都验证过）。
 - 新增：`npm run tauri build` 现在能完整产出 **NSIS 安装包** `deepaisee_0.0.16_x64-setup.exe`（9.62 MB），不再只靠绿色免安装目录分发。
-- 发布版实测（`D:\deepaisee\dist-app`，16 个文件）：
+- 发布版实测（绿色便携目录，16 个文件）：
   - `--selftest` → **通过 11 项，失败 0 项**，模型 `llama.cpp · 768 维`。
   - `--cli stats` → 16 个文件 / 6.12 MB，文本库 3 条 / 768 维，媒体库 196 条 / 256 维。
   - `--cli search 余弦 --limit 2` → `vector_search.py 0.46`、`会议纪要-2026Q3.md 0.29`。
@@ -414,7 +414,7 @@ search 蓝色   → img104.jpg 0.72、img0_1920x1200.jpg 0.67
 **工程骨架**
 
 - Tauri 2 + Vue 3 + Vite 脚手架，深色主题 CSS 变量，应用图标（32/64/128/256 + ico）。
-- 工具链：MSYS2 UCRT64 gcc 16.2 + rustc 1.99.1（`x86_64-pc-windows-gnu`）+ Node 22 + CMake/Ninja，全部装在 `D:\deepaisee\tools\`，走清华/rsproxy 镜像。
+- 工具链：MSYS2 UCRT64 gcc 16.2 + rustc 1.99.1（`x86_64-pc-windows-gnu`）+ Node 22 + CMake/Ninja，走清华/rsproxy 镜像。
 
 ---
 
