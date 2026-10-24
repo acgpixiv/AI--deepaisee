@@ -1,0 +1,59 @@
+[package]
+name = "deepaisee"
+version = "0.0.20"
+description = "deepaisee - AI disk search (Tauri 2 + Vue 3 + llama.cpp)"
+authors = ["deepaisee"]
+edition = "2021"
+rust-version = "1.77.2"
+# 无 default-run 时 `tauri build` 会报 "failed to find main binary"。
+default-run = "deepaisee"
+
+[lib]
+name = "deepaisee_lib"
+# Windows GNU 工具链下 cdylib 会导出海量符号，ld 报 "export ordinal too large: 111178"。
+# 桌面端只需要 rlib（main.rs 直接链接），cdylib/staticlib 是给移动端用的，这里不需要。
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+cmake = "0.1"
+
+[features]
+# 默认就带上 llama.cpp：否则 `tauri build` 不带 --features llama 时会编译出
+# 一个没有本地推理能力的版本，运行时悄悄退回哈希基线（表现为状态栏 hash · 256 维）。
+default = ["llama"]
+llama = []
+# 打包版必须开：tauri 的 build.rs 用 tauri/custom-protocol 决定 `cfg(dev)`。
+# 没有它时窗口会去连 http://localhost:1420（Vite 开发服务器），双击 exe 直接白屏。
+custom-protocol = ["tauri/custom-protocol"]
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+rusqlite = { version = "0.32", features = ["bundled"] }
+walkdir = "2"
+notify = "6"
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+chrono = { version = "0.4", features = ["serde"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+encoding_rs = "0.8"
+pdf-extract = "0.7"
+pinyin = "0.10"
+base64 = "0.22"
+parking_lot = "0.12"
+dirs = "5"
+open = "5"
+strsim = "0.11"
+libc = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

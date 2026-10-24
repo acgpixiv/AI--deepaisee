@@ -15,11 +15,22 @@
 
 ## 一、快速开始
 
-### 1. 直接运行（已构建版）
+### 0. 这个仓库里有什么
+
+| 内容 | 位置 | 说明 |
+| --- | --- | --- |
+| **可直接运行的便携版** | 根目录：`deepaisee.exe` + 4 个 `.dll` + 启动器 | 缺模型与 ffmpeg，见下节 |
+| **前端源码** | `src/`（13 个文件，Vue 3） | 约 2,900 行 |
+| **后端源码** | `src-tauri/src/`（33 个 `.rs`） | 约 9,500 行 |
+| **构建配置** | `src-tauri/{Cargo.toml,​build.rs,​tauri.conf.json}`、`package.json` 等 | — |
+| **验收截图** | `docs/screenshots/` | 6 张 |
+| **依赖源码** | ❌ 不含 `vendor/llama.cpp` | 需按第 2 节 clone |
+
+### 1. 直接运行（仓库已带 exe）
 
 ```
-dist-app\deepaisee 启动器.cmd     ← 推荐：带菜单的启动器
-dist-app\deepaisee.exe            ← 直接运行，跳过菜单
+deepaisee 启动器.cmd     ← 推荐：带菜单的启动器
+deepaisee.exe            ← 直接运行，跳过菜单
 ```
 
 **启动器**（`deepaisee 启动器.cmd` + `launcher.ps1`）提供六个入口：
@@ -37,7 +48,7 @@ dist-app\deepaisee.exe            ← 直接运行，跳过菜单
 
 首次启动会自动加载模型（约 0.5~1.5 秒）。数据写在 exe 同级的 `data\` 目录，整个文件夹可以拷走。
 
-`dist-app\` 里必须一起带的文件（少一个就起不来或功能缺失）：
+运行时必须一起带的文件（少一个就起不来或功能缺失）：
 
 | 文件 | 作用 | 缺了会怎样 |
 | --- | --- | --- |
@@ -50,6 +61,8 @@ dist-app\deepaisee.exe            ← 直接运行，跳过菜单
 | `models\clap\` | CLAP 音文模型（155MB） | 文字找声音停用，退回频谱特征 |
 | `tools\bin\ffmpeg.exe` | 抽帧 / 音频解码 | 视频缩略图与音频/视频向量失败 |
 | `launcher.ps1` / `deepaisee 启动器.cmd` | 启动器（可选） | 不影响主程序，只是少了菜单 |
+
+> 表格里带体积的 4 项**不在本仓库**（超过 GitHub 100MB 单文件限制），要自己补，见下节。
 
 验证办法：`deepaisee.exe --selftest`，看 `selftest.txt` 末尾是不是 `失败 0 项`。库里还没索引文件时，检索类检查会标成 `[SKIP]` 而不是失败 —— 此时先把「扫描 / 索引」页的目录扫进来再跑一次。
 
@@ -68,6 +81,15 @@ GitHub 单文件硬上限 100MB，下面这些放不进 Git，**需要自己补*
 
 ### 2. 源码运行
 
+**先把 llama.cpp 源码放到 `vendor/llama.cpp`**（不入库，需 clone）：
+
+```bat
+git clone --depth 1 https://github.com/ggml-org/llama.cpp vendor/llama.cpp
+```
+
+`--features llama` 会通过 `src-tauri/native/CMakeLists.txt` 把 `vendor/llama.cpp` 编成静态库。
+如果只想跑「不含本地推理」的部分，可以加 `--no-default-features`，此时会退化成哈希基线。
+
 ```bat
 :: 前端依赖
 npm install
@@ -76,7 +98,20 @@ npm install
 npm run tauri dev
 ```
 
-编译工具链（本机已装在 `D:\deepaisee\tools\`）：MSYS2 UCRT64 gcc 16.2、rustc 1.99.1（`x86_64-pc-windows-gnu`）、Node 22、CMake + Ninja。
+**工具链要求**（Windows）：
+
+| 组件 | 版本 | 说明 |
+| --- | --- | --- |
+| Rust | 1.77.2+ | 目标 `x86_64-pc-windows-gnu`（MSVC 也可） |
+| MSYS2 UCRT64 | gcc 16.2 | `build.rs` 会按 `DEEPAISEE_UCRT64_BIN` → PATH → `C:\msys64\ucrt64\bin` 顺序找 |
+| Node.js | 20+ | 前端构建 |
+| CMake + Ninja | 3.20+ | 编 llama.cpp |
+
+若 MSYS2 装在非默认路径，设环境变量：
+
+```bat
+set DEEPAISEE_UCRT64_BIN=D:\your\msys64\ucrt64\bin
+```
 
 ### 3. 构建发布版
 
@@ -383,4 +418,10 @@ A：漏了 `custom-protocol` feature。没有它 `tauri-build` 会按开发模�
 
 ## 十一、许可
 
-个人自用工具。llama.cpp 为 MIT 许可；EmbeddingGemma 模型权重版权归 Google 所有，请遵守其许可条款。
+本项目以 **MIT** 发布，见 [LICENSE](LICENSE)。第三方组件的许可与来源见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+
+需要留意的几条：
+- **llama.cpp** — MIT。
+- **EmbeddingGemma 模型权重** — 版权归 Google，遵守 Gemma Terms of Use。
+- **Chinese-CLIP / CLAP** — Apache-2.0（权重不随仓库分发）。
+- **FFmpeg** — LGPL/GPL，本项目通过独立进程调用，未静态链接。

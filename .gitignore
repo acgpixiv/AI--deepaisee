@@ -1,3 +1,37 @@
+# ───────── 依赖与构建产物 ─────────
+node_modules/
+dist/
+src-tauri/target/
+build-target/
+src-tauri/gen/schemas/
+
+# ───────── 运行时数据与大文件 ─────────
+# 模型权重：几个单文件都超过 GitHub 100MB 硬上限，见 README「关于模型文件」
 models/
-tools/
 data/
+*.gguf
+*.onnx
+*.safetensors
+
+# 本地编译工具链与第三方二进制（按需自备）
+tools/
+*.pdb
+*.ilk
+
+# 依赖源码：按 README 的 clone 说明获取
+vendor/llama.cpp/
+
+# ───────── 系统与编辑器 ─────────
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# ───────── 日志与临时目录 ─────────
+*.log
+__pycache__/
+*.pyc
+_tmp/
+_tmp_*/
