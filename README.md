@@ -249,7 +249,7 @@ deepaisee.exe --cli serve --port 8770
 搜索「余弦」：1 条，2 ms
 ------------------------------------------------------------------------------
  0.31  文本        328 B  vector_search.py
-        C:\Users\alin\AppData\Local\Temp\ds-test\code\vector_search.py
+        <临时目录>\ds-test\code\vector_search.py
         余弦相似度检索：把查询向量与库里每条向量做点积 …
 ```
 
