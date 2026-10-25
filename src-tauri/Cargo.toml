@@ -63,5 +63,8 @@ embeddinggemma2 = { package = "embeddinggemma-2", path = "../vendor/embeddinggem
 codegen-units = 1
 lto = true
 opt-level = "s"
-panic = "abort"
+# PDF/font parsers are third-party code and may panic on malformed documents.
+# Keep release panics unwindable so textract's catch_unwind boundary can turn
+# one bad PDF into an indexed error instead of terminating the whole app.
+panic = "unwind"
 strip = true
