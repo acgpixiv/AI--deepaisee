@@ -8,12 +8,29 @@
 #include "llama.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
+
+std::once_flag backend_init_once;
+
+void ensure_backend_initialized() {
+    std::call_once(backend_init_once, [] {
+        // Backend enumeration can itself print device discovery lines. The
+        // desktop app reports device state through its own API, so keep the
+        // native logger quiet before initialization as well as during model
+        // execution.
+        llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
+        llama_backend_init();
+    });
+}
 
 struct Handle {
     llama_model *model = nullptr;
@@ -29,25 +46,130 @@ void set_err(char *err, int err_len, const char *msg) {
     }
 }
 
+std::string device_key(ggml_backend_dev_t dev) {
+    ggml_backend_dev_props props{};
+    ggml_backend_dev_get_props(dev, &props);
+    const char *backend = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+    const char *name = ggml_backend_dev_name(dev);
+    std::string key = backend ? backend : "unknown";
+    key.push_back('|');
+    key += props.device_id && *props.device_id ? props.device_id : (name ? name : "unknown");
+    return key;
+}
+
 }  // namespace
 
 extern "C" {
 
+// Enumerate devices from the exact GGML backends linked into this build. This
+// deliberately excludes CPU/BLAS devices: they are not accelerators that can
+// satisfy a user's GPU selection. CUDA and Vulkan builds expose only devices
+// supported by their linked backends.
+int ds_llama_device_count() {
+    ensure_backend_initialized();
+    int count = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        const auto dev = ggml_backend_dev_get(i);
+        const auto type = ggml_backend_dev_type(dev);
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+int ds_llama_device_info(int wanted, char *name, int name_len, char *description,
+                         int description_len, char *device_id, int device_id_len,
+                         char *physical_id, int physical_id_len,
+                         char *backend, int backend_len, std::uint64_t *free_bytes,
+                         std::uint64_t *total_bytes, int *type) {
+    ensure_backend_initialized();
+    if (wanted < 0 || !name || name_len <= 0 || !description || description_len <= 0 ||
+        !device_id || device_id_len <= 0 || !physical_id || physical_id_len <= 0 ||
+        !backend || backend_len <= 0) {
+        return -1;
+    }
+    int current = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        const auto dev = ggml_backend_dev_get(i);
+        const auto dev_type = ggml_backend_dev_type(dev);
+        if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        if (current++ != wanted) {
+            continue;
+        }
+        const char *dev_name = ggml_backend_dev_name(dev);
+        const char *dev_desc = ggml_backend_dev_description(dev);
+        ggml_backend_dev_props props{};
+        ggml_backend_dev_get_props(dev, &props);
+        const char *reg_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+        std::snprintf(name, static_cast<size_t>(name_len), "%s", dev_name ? dev_name : "");
+        std::snprintf(description, static_cast<size_t>(description_len), "%s", dev_desc ? dev_desc : "");
+        const auto key = device_key(dev);
+        std::snprintf(device_id, static_cast<size_t>(device_id_len), "%s", key.c_str());
+        std::snprintf(physical_id, static_cast<size_t>(physical_id_len), "%s", props.device_id ? props.device_id : "");
+        std::snprintf(backend, static_cast<size_t>(backend_len), "%s", reg_name ? reg_name : "");
+        size_t free_mem = 0;
+        size_t total_mem = 0;
+        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+        if (free_bytes) {
+            *free_bytes = static_cast<std::uint64_t>(free_mem);
+        }
+        if (total_bytes) {
+            *total_bytes = static_cast<std::uint64_t>(total_mem);
+        }
+        if (type) {
+            *type = dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU ? 1 : 0;
+        }
+        return 0;
+    }
+    return -1;
+}
+
 // 创建句柄。返回 nullptr 表示失败，错误信息写入 err。
-void *ds_llama_create(const char *model_path, int n_gpu_layers, int n_ctx,
-                      int n_threads, char *err, int err_len) {
+void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
+                      const char *device_name, char *err, int err_len) {
     if (!model_path || !*model_path) {
         set_err(err, err_len, "模型路径为空");
         return nullptr;
     }
 
-    llama_backend_init();
+    ensure_backend_initialized();
     // llama.cpp 默认把 graph/内存布局逐行打到 stderr（一次编码上千行），
     // 桌面端没有控制台，这些日志会拖慢编码并污染日志文件，直接静音。
     llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
 
     llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = n_gpu_layers;
+    // CPU model-layer execution is intentionally disabled. `-1` means all
+    // layers are assigned to the selected GGML accelerator.
+    mparams.n_gpu_layers = -1;
+    ggml_backend_dev_t selected_devices[2] = { nullptr, nullptr };
+    if (device_name && *device_name) {
+        ggml_backend_dev_t selected = nullptr;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            auto candidate = ggml_backend_dev_get(i);
+            const auto type = ggml_backend_dev_type(candidate);
+            if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                device_key(candidate) == device_name) {
+                selected = candidate;
+                break;
+            }
+        }
+        if (!selected) {
+            set_err(err, err_len, "璇烽€夋嫨鐨勬樉鍗′笉鍦ㄥ綋鍓嶅悗绔敮鎸佺殑璁惧鍒楄〃涓�");
+            return nullptr;
+        }
+        const auto type = ggml_backend_dev_type(selected);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            set_err(err, err_len, "鎸囧畾璁惧涓嶆槸 GPU 鎴栭泦鎴愭樉鍗�");
+            return nullptr;
+        }
+        selected_devices[0] = selected;
+        mparams.devices = selected_devices;
+        mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
+        mparams.main_gpu = 0;
+    }
 
     llama_model *model = llama_model_load_from_file(model_path, mparams);
     if (!model) {
@@ -59,8 +181,17 @@ void *ds_llama_create(const char *model_path, int n_gpu_layers, int n_ctx,
     cparams.n_ctx = static_cast<uint32_t>(n_ctx > 0 ? n_ctx : 2048);
     cparams.n_batch = 512;
     cparams.n_ubatch = 512;
-    cparams.n_threads = n_threads > 0 ? n_threads : 4;
-    cparams.n_threads_batch = n_threads > 0 ? n_threads : 4;
+    // A zero thread setting means "automatic". The previous fallback of four
+    // threads left tokenisation, prompt preparation and CPU-side kernels
+    // underutilised on ordinary desktop CPUs. Keep an explicit user value
+    // authoritative, otherwise use all logical cores and give batched work a
+    // little more room to overlap host-side preparation with GPU execution.
+    const int automatic_threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    const int threads = n_threads > 0 ? n_threads : automatic_threads;
+    cparams.n_threads = threads;
+    cparams.n_threads_batch = n_threads > 0
+        ? n_threads
+        : std::max(threads, std::min(threads * 2, 64));
     cparams.embeddings = true;
     cparams.pooling_type = LLAMA_POOLING_TYPE_MEAN;
     cparams.offload_kqv = true;
@@ -203,7 +334,6 @@ void ds_llama_free(void *handle) {
         llama_model_free(h->model);
     }
     delete h;
-    llama_backend_free();
 }
 
 }  // extern "C"

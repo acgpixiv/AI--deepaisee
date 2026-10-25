@@ -87,6 +87,9 @@ export interface ScanProgress {
 
 export interface IndexStats {
   queued: number;
+  total: number;
+  completed: number;
+  cancelled: boolean;
   running: boolean;
   text_done: number;
   text_fail: number;
@@ -94,6 +97,7 @@ export interface IndexStats {
   emb_fail: number;
   thumb_done: number;
   current: string;
+  current_items: string[];
 }
 
 export interface ModelInfo {
@@ -108,6 +112,15 @@ export interface ModelInfo {
   clip: string;
   /** 跨模态音频模型（CLAP）状态，空串 = 未安装 */
   clap: string;
+}
+
+export interface GpuDevice {
+  id: string;
+  name: string;
+  backend: string;
+  total_memory: number;
+  free_memory: number;
+  integrated: boolean;
 }
 
 /** 模型目录里的一个 GGUF 文件 */
@@ -125,6 +138,44 @@ export interface ModelEntry {
   kind_label: string;
   /** 是否当前正在使用 */
   active: boolean;
+  /** gguf 或 safetensors */
+  format: string;
+  /** 当前 llama.cpp 通路是否可直接加载 */
+  direct_loadable: boolean;
+  /** 模型文件所在目录 */
+  model_dir: string;
+  /** 模型声明支持的输入模态：text / image / audio / video */
+  modalities: string[];
+  /** 可用的推理适配器候选；不代表扩展已安装 */
+  candidate_backends: string[];
+}
+
+export interface ModelImportFile {
+  path: string;
+  relative_path: string;
+  format: string;
+  kind: string;
+  kind_label: string;
+  size: number;
+}
+
+export interface ModelImportResult {
+  source: string;
+  destination: string;
+  copied_files: number;
+  total_bytes: number;
+  files: ModelImportFile[];
+  primary_model: string;
+  primary_kind: string;
+  direct_loadable: boolean;
+  needs_conversion: boolean;
+  warnings: string[];
+  architecture: string;
+  components: string[];
+  /** 导入模型声明支持的输入模态：text / image / audio / video */
+  modalities: string[];
+  /** 可用的推理适配器候选；不代表扩展已安装 */
+  candidate_backends: string[];
 }
 
 export interface TreeNode {
@@ -145,6 +196,14 @@ export interface WatchStatus {
 export interface ServerStatus {
   running: boolean;
   url: string;
+}
+
+export interface ExtensionStatus {
+  onnxruntime: boolean;
+  onnxruntime_path: string;
+  python: boolean;
+  python_path: string;
+  root: string;
 }
 
 export interface Activity {
@@ -175,6 +234,29 @@ export interface AppConfig {
   server: any;
 }
 
+export interface RootIndexStats {
+  root: string;
+  enabled: boolean;
+  last_scan: number;
+  index_progress: number;
+  kinds_label: string;
+  files: number;
+  bytes: number;
+  bytes_label: string;
+  added: number;
+  updated: number;
+  skipped: number;
+  errors: number;
+  missing: number;
+  text_ok: number;
+  embed_ok: number;
+  completed: number;
+  text_pending: number;
+  embed_pending: number;
+  last_error: string;
+  kinds: { kind: string; label: string; count: number; bytes: number }[];
+}
+
 /** 部分配置（深合并用）：后端会把传入的字段并入当前配置，其余保持不变。 */
 export type PartialConfig = DeepPartial<AppConfig>;
 export type DeepPartial<T> = T extends object
@@ -195,24 +277,32 @@ export const api = {
   stats: () => invoke<StatsOut>("stats"),
   recent: (limit = 50) => invoke<Hit[]>("recent", { limit }),
 
-  scanStart: (roots?: string[]) => invoke<void>("scan_start", { roots }),
+  scanStart: (roots?: string[], indexWhat?: string) => invoke<void>("scan_start", { roots, indexWhat }),
   scanCancel: () => invoke<void>("scan_cancel"),
   scanProgress: () => invoke<ScanProgress>("scan_progress"),
+  indexRoots: () => invoke<RootIndexStats[]>("index_roots"),
 
-  indexStart: (what?: string, force?: boolean) =>
-    invoke<number>("index_start", { what, force }),
+  indexStart: (what?: string, force?: boolean, roots?: string[]) =>
+    invoke<number>("index_start", { what, force, roots }),
+  indexCancel: () => invoke<void>("index_cancel"),
   indexStats: () => invoke<IndexStats>("index_stats"),
 
   modelInfo: () => invoke<ModelInfo>("model_info"),
+  gpuDevices: () => invoke<GpuDevice[]>("gpu_devices"),
   modelLoad: (backend: string, path?: string) =>
     invoke<ModelInfo>("model_load", { backend, path }),
+  modelDeactivate: () => invoke<ModelInfo>("model_deactivate"),
   modelList: () => invoke<ModelEntry[]>("model_list"),
   modelDir: () => invoke<string>("model_dir_path"),
   modelDelete: (path: string) => invoke<void>("model_delete", { path }),
   modelImport: (src: string) => invoke<string>("model_import", { src }),
+  modelImportFolder: (src: string) => invoke<ModelImportResult>("model_import_folder", { src }),
 
   openPath: (path: string) => invoke<void>("open_path", { path }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
+  renamePath: (path: string, name: string) => invoke<string>("rename_path", { path, name }),
+  ensurePreview: (fileId: number, path: string) =>
+    invoke<boolean>("ensure_preview", { fileId, path }),
 
   opExport: (paths: string[], out: string, fmt?: string) =>
     invoke<number>("op_export", { paths, out, fmt }),
@@ -238,6 +328,9 @@ export const api = {
   dbVacuum: () => invoke<void>("db_vacuum"),
   dbClear: () => invoke<void>("db_clear"),
   dataDir: () => invoke<string>("data_dir_path"),
+  extensionStatus: () => invoke<ExtensionStatus>("extension_status"),
+  extensionInstall: (kind: "onnxruntime" | "python") =>
+    invoke<ExtensionStatus>("extension_install", { kind }),
 };
 
 /** Tauri 未注入时（比如直接用浏览器打开 vite dev）给一个明确的错误。 */

@@ -24,7 +24,7 @@ pub struct AppState {
     pub audio_vectors: RwLock<Arc<VectorStore>>,
     pub embedder: RwLock<Arc<dyn Embedder>>,
     /// 媒体兜底编码器（始终是 hash）
-    pub media_embedder: Arc<dyn Embedder>,
+    pub media_embedder: RwLock<Arc<dyn Embedder>>,
     /// 中文 CLIP（可选，缺模型时为 None）
     pub clip: RwLock<Option<Arc<crate::ai::clip::ClipModel>>>,
     /// CLAP 音频-文本对齐（可选）
@@ -80,6 +80,8 @@ impl AppState {
         std::fs::create_dir_all(&data_dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
         let db = Arc::new(Db::open(&data_dir.join("index.db")).map_err(|e| format!("打开数据库失败: {e}"))?);
         db.migrate().map_err(|e| format!("数据库迁移失败: {e}"))?;
+        db.sync_index_roots(&cfg.scan.roots, &cfg.scan.disabled_roots)
+            .map_err(|e| format!("同步索引目录失败: {e}"))?;
         let vec_dir = data_dir.join("vectors");
         // 先用默认的 hash 后端建 embedder，向量库维度跟随后端实际输出，
         // 不能直接用 config 里的 embedding_dim（那可能是 llama 的 512 或旧的 768）。
@@ -111,7 +113,7 @@ impl AppState {
             clip_vectors: RwLock::new(clip_vectors),
             audio_vectors: RwLock::new(audio_vectors),
             embedder: RwLock::new(embedder),
-            media_embedder,
+            media_embedder: RwLock::new(media_embedder),
             clip: RwLock::new(clip),
             clap: RwLock::new(clap),
             indexer: RwLock::new(None),
@@ -138,6 +140,8 @@ impl AppState {
     }
 
     pub fn search(&self, q: &mut crate::search::SearchQuery) -> Vec<crate::search::Hit> {
+        let scan = self.cfg.read().scan.clone();
+        crate::search::apply_enabled_root_scope(q, &scan.roots, &scan.disabled_roots);
         // 跨模态：把查询词编码成图片/声音空间里的向量。
         // 模型没装时静默跳过，用户仍然能靠文件名/标签搜到东西。
         if q.cross_modal == Some(true) && q.text.chars().count() >= 2 {
@@ -169,12 +173,14 @@ impl AppState {
 
     /// 重建 Indexer（切换 embedding 后端后调用）。
     pub fn rebuild_indexer(&self) -> Arc<Indexer> {
-        let cfg = self.cfg.read().index.clone();
+        let app_cfg = self.cfg.read().clone();
+        let cfg = app_cfg.index.clone();
         let embedder = Arc::clone(&self.embedder.read());
         let vecs = Arc::clone(&self.vectors.read());
         let media_vecs = Arc::clone(&self.media_vectors.read());
         let clip_vecs = Arc::clone(&self.clip_vectors.read());
         let audio_vecs = Arc::clone(&self.audio_vectors.read());
+        let configured_batch_size = cfg.batch_size;
         let idx = Arc::new(Indexer::new(
             Arc::clone(&self.db),
             vecs,
@@ -182,12 +188,25 @@ impl AppState {
             clip_vecs,
             audio_vecs,
             embedder,
-            Arc::clone(&self.media_embedder),
+            Arc::clone(&self.media_embedder.read()),
             cfg,
             self.data_dir.join("thumbs"),
         ));
+        let batch_size = match app_cfg.model.parallel_mode.as_str() {
+            "eco" => 1,
+            "turbo" | "狂暴" => configured_batch_size.max(96).min(128),
+            _ => configured_batch_size.max(48).min(64),
+        };
+        idx.set_batch_size(batch_size);
         {
             idx.set_cross_modal(self.clip.read().clone(), self.clap.read().clone());
+        }
+        // Stop the previous worker before swapping in a new embedder.  The
+        // worker owns an Arc<Indexer>, so simply replacing the slot would
+        // leave it running with the old model (and potentially its GPU
+        // allocation) until process exit.
+        if let Some(previous) = self.indexer.write().take() {
+            previous.stop();
         }
         *self.indexer.write() = Some(Arc::clone(&idx));
         idx.start();

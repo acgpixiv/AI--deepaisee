@@ -43,20 +43,7 @@ pub fn run() {
         }
     };
     let _ = state.db.log("app", &format!("deepaisee {} 启动", APP_DISPLAY_VERSION));
-    let idx = state.rebuild_indexer();
-    // 启动时把上次没做完的索引任务重新排队。
-    //
-    // 只排「上次在跑、但没跑完」的那部分：如果库里积压的是几十万条 pending
-    // （比如用户刚扫完整个盘、还没建索引就退出了），无条件全量入队会让进程
-    // 一启动就满载，用户以为程序卡死。这里限制启动阶段最多补 5000 条，
-    // 剩下的留给用户在「扫描/索引」页手动点「重建索引」。
-    let auto = idx.enqueue_all_pending_limited("auto", 5000);
-    if auto >= 5000 {
-        let _ = state.db.log(
-            "index",
-            &format!("启动补索引已达上限 {auto} 条，其余请在「扫描/索引」页手动重建"),
-        );
-    }
+    let _ = state.rebuild_indexer();
     let shared = Arc::new(state);
 
     // 后台自动加载嵌入模型（llama.cpp 加载 GGUF 约 0.5~2 秒，不阻塞窗口出现）
@@ -80,35 +67,50 @@ pub fn run() {
             let mut cfg = cfg;
             if cfg.model.embed_model.trim().is_empty() {
                 for dir in [st.app_dir.join("models"), st.data_dir.join("models")] {
-                    if let Ok(rd) = std::fs::read_dir(&dir) {
-                        let found = rd
-                            .flatten()
-                            .map(|e| e.path())
-                            .find(|p| {
-                                p.extension()
-                                    .map(|x| x.eq_ignore_ascii_case("gguf"))
-                                    .unwrap_or(false)
-                            });
-                        if let Some(p) = found {
-                            cfg.model.embed_model = p.to_string_lossy().replace('\\', "/");
-                            let mut c = st.cfg.read().clone();
-                            c.model.embed_model = cfg.model.embed_model.clone();
-                            let _ = c.save(&crate::config::config_path(Some(&st.app_dir)));
-                            *st.cfg.write() = c;
-                            trace(format!("autodetect model={}", cfg.model.embed_model));
-                            break;
-                        }
+                    let entries = crate::models::scan(&cfg.model, std::slice::from_ref(&dir));
+                    // Prefer a complete multimodal safetensors package when
+                    // present. Its vision/audio towers would be lost if the
+                    // text-only GGUF is selected first.
+                    let found = entries
+                        .iter()
+                        .find(|m| {
+                            m.kind == "embed"
+                                && m.format == "safetensors"
+                                && m.modalities.iter().any(|x| matches!(x.as_str(), "image" | "audio" | "video"))
+                        })
+                        .or_else(|| {
+                            entries.iter().find(|m| {
+                                m.direct_loadable && m.kind == "embed"
+                            })
+                        });
+                    if let Some(found) = found {
+                        cfg.model.embed_model = found.path.clone();
+                        let mut c = st.cfg.read().clone();
+                        c.model.embed_model = cfg.model.embed_model.clone();
+                        let _ = c.save(&crate::config::config_path(Some(&st.app_dir)));
+                        *st.cfg.write() = c;
+                        trace(format!("autodetect model={}", cfg.model.embed_model));
+                        break;
                     }
                 }
             }
             if cfg.model.auto_load && !cfg.model.embed_model.trim().is_empty() {
                 std::thread::sleep(std::time::Duration::from_millis(600));
-                match crate::ai::build_embedder(&cfg.model) {
+                match crate::ai::build_embedder_with_batch(&cfg.model, cfg.index.batch_size) {
                     Ok(emb) => {
+                        let emb: Arc<dyn crate::ai::Embedder> = Arc::from(emb);
+                        let emb = crate::ai::maybe_replicate(
+                            emb,
+                            &cfg.model,
+                            cfg.index.batch_size,
+                        );
                         let dim = emb.dim();
                         let info = emb.info();
+                        let shared_media = info.backend == "candle"
+                            && info.modalities.iter().any(|m| matches!(m.as_str(), "image" | "audio" | "video"));
+                        let media_dim = if shared_media { dim } else { 256 };
                         trace(format!("loaded dim={} backend={}", dim, info.backend));
-                        *st.embedder.write() = Arc::from(emb);
+                        *st.embedder.write() = Arc::clone(&emb);
                         let mut c = st.cfg.read().clone();
                         c.model.embedding_dim = dim;
                         let _ = c.save(&crate::config::config_path(Some(&st.app_dir)));
@@ -128,11 +130,25 @@ pub fn run() {
                             }
                             *st.vectors.write() = Arc::new(v);
                         }
+                        let media_dir = st.data_dir.join("vectors_media");
+                        let old_media_count = st.media_vectors.read().len();
+                        if let Ok(v) = crate::vector::VectorStore::open(&media_dir, media_dim) {
+                            if old_media_count > 0 && v.len() == 0 {
+                                let _ = st.db.reset_states("embed");
+                                let _ = st.db.log("model", "媒体向量空间已切换，已把文件标记为待重新向量化");
+                            }
+                            *st.media_vectors.write() = Arc::new(v);
+                        }
+                        let media_embedder: Arc<dyn crate::ai::Embedder> = if shared_media {
+                            Arc::clone(&emb)
+                        } else {
+                            Arc::new(crate::ai::hash::HashEmbedder::new())
+                        };
+                        *st.media_embedder.write() = media_embedder;
                         let _ = st.rebuild_indexer();
                         // 刚重置过状态的话，立刻排队，用户无需手动点重建。
-                        if let Some(idx) = st.indexer() {
-                            let _ = idx.enqueue_all_pending_limited("embed", 5000);
-                        }
+                        // The model is ready for search; pending files are
+                        // indexed only after an explicit user action.
                         let _ = st.db.log(
                             "model",
                             &format!(
@@ -161,20 +177,27 @@ pub fn run() {
             cmd::search_semantic,
             cmd::similar,
             cmd::stats,
+            cmd::index_roots,
             cmd::recent,
             cmd::scan_start,
             cmd::scan_cancel,
             cmd::scan_progress,
             cmd::index_start,
+            cmd::index_cancel,
             cmd::index_stats,
             cmd::model_info,
+            cmd::gpu_devices,
             cmd::model_load,
+            cmd::model_deactivate,
             cmd::model_list,
             cmd::model_dir_path,
             cmd::model_delete,
             cmd::model_import,
+            cmd::model_import_folder,
             cmd::open_path,
             cmd::reveal_path,
+            cmd::rename_path,
+            cmd::ensure_preview,
             cmd::op_export,
             cmd::rules_list,
             cmd::rules_save,
@@ -190,6 +213,8 @@ pub fn run() {
             cmd::db_vacuum,
             cmd::db_clear,
             cmd::data_dir_path,
+            cmd::extension_status,
+            cmd::extension_install,
         ])
         .setup(|app| {
             // 开发期打开 devtools
@@ -202,6 +227,15 @@ pub fn run() {
             let _ = app;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("deepaisee 启动失败");
+        .build(tauri::generate_context!())
+        .expect("deepaisee 初始化失败")
+        .run(|app_handle, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                use tauri::Manager;
+                let state = app_handle.state::<Arc<state::AppState>>();
+                if let Some(indexer) = state.indexer() {
+                    indexer.stop();
+                }
+            }
+        });
 }

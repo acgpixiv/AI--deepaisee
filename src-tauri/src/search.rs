@@ -7,6 +7,10 @@ use crate::vector::{normalize, VectorStore};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+/// Keep an explicit safety ceiling for a single UI request while removing the
+/// old 200-result behavior. Larger result sets should be paged with `offset`.
+const MAX_RESULT_LIMIT: usize = 10_000;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchQuery {
@@ -81,7 +85,11 @@ impl Hit {
             mtime: r.mtime,
             mtime_label: format_ts(r.mtime),
             category: r.category.clone(),
-            thumb: r.thumb_key.is_some() || r.kind == "image" || r.kind == "video",
+            thumb: r.thumb_key.is_some()
+                || r.kind == "image"
+                || r.kind == "video"
+                || (r.kind == "document"
+                    && matches!(r.ext.to_ascii_lowercase().as_str(), "pdf" | "docx")),
             score,
             reason: reason.to_string(),
             snippet: None,
@@ -103,6 +111,63 @@ pub struct SearchEngine<'a> {
     pub cfg: &'a SearchConfig,
 }
 
+fn limit_for_cross(q: &SearchQuery) -> usize {
+    q.limit.unwrap_or(800).clamp(400, MAX_RESULT_LIMIT)
+}
+
+/// Restrict a query to configured, enabled index roots while preserving a
+/// caller's narrower root selection. `SearchEngine` is also used directly by
+/// LAN and CLI entry points, so they must apply the same scope as AppState.
+pub fn apply_enabled_root_scope(
+    q: &mut SearchQuery,
+    configured_roots: &[String],
+    disabled_roots: &[String],
+) {
+    if configured_roots.is_empty() {
+        return;
+    }
+
+    let enabled: Vec<String> = configured_roots
+        .iter()
+        .filter(|root| {
+            !disabled_roots.iter().any(|disabled| {
+                crate::util::norm_path(disabled)
+                    .eq_ignore_ascii_case(&crate::util::norm_path(root))
+            })
+        })
+        .map(|root| crate::util::norm_path(root))
+        .collect();
+    let requested = std::mem::take(&mut q.roots);
+    let mut roots = Vec::new();
+    for active in &enabled {
+        let active_lower = active.to_ascii_lowercase();
+        for requested_root in &requested {
+            let requested_root = crate::util::norm_path(requested_root);
+            let requested_lower = requested_root.to_ascii_lowercase();
+            let active_prefix = format!("{}\\", active_lower.trim_end_matches('\\'));
+            let requested_prefix = format!("{}\\", requested_lower.trim_end_matches('\\'));
+            if active_lower == requested_lower || active_lower.starts_with(&requested_prefix) {
+                roots.push(active.clone());
+                break;
+            }
+            if requested_lower.starts_with(&active_prefix) {
+                roots.push(requested_root);
+                break;
+            }
+        }
+        if requested.is_empty() {
+            roots.push(active.clone());
+        }
+    }
+    roots.sort_by_key(|root| root.to_ascii_lowercase());
+    roots.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    q.roots = if roots.is_empty() {
+        vec!["__deepaisee_no_enabled_index_root__".into()]
+    } else {
+        roots
+    };
+}
+
 pub fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
         .filter(|s| !s.is_empty())
@@ -110,40 +175,43 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn name_score(q: &str, name: &str) -> (f32, &'static str) {
-    let ql = q.to_lowercase();
+fn name_score(
+    ql: &str,
+    query_chars: usize,
+    query_terms: &[String],
+    name: &str,
+) -> (f32, &'static str) {
     let nl = name.to_lowercase();
     if nl == ql {
         return (1.0, "名称精确匹配");
     }
-    if nl.starts_with(&ql) {
+    if nl.starts_with(ql) {
         return (0.92, "名称前缀匹配");
     }
-    if nl.contains(&ql) {
-        let cover = ql.chars().count() as f32 / nl.chars().count().max(1) as f32;
+    if nl.contains(ql) {
+        let cover = query_chars as f32 / nl.chars().count().max(1) as f32;
         return (0.72 + 0.26 * cover.min(1.0), "名称包含");
     }
     // 逐词命中
-    let qt = tokenize(q);
-    if qt.len() > 1 {
-        let hit = qt.iter().filter(|t| nl.contains(t.as_str())).count();
+    if query_terms.len() > 1 {
+        let hit = query_terms.iter().filter(|t| nl.contains(t.as_str())).count();
         if hit > 0 {
-            let ratio = hit as f32 / qt.len() as f32;
+            let ratio = hit as f32 / query_terms.len() as f32;
             return (0.55 + 0.2 * ratio, "名称多词命中");
         }
     }
     (0.0, "")
 }
 
-fn fuzzy_score(q: &str, name: &str) -> f32 {
-    if q.chars().count() < 3 {
+fn fuzzy_score(ql: &str, query_chars: usize, name: &str) -> f32 {
+    if query_chars < 3 {
         return 0.0;
     }
     let stem = std::path::Path::new(name)
         .file_stem()
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    let sim = strsim::jaro_winkler(&q.to_lowercase(), &stem);
+    let sim = strsim::jaro_winkler(ql, &stem);
     if sim >= 0.80 {
         0.35f32 + 0.35 * ((sim - 0.80) as f32 / 0.20)
     } else {
@@ -154,9 +222,12 @@ fn fuzzy_score(q: &str, name: &str) -> f32 {
 impl<'a> SearchEngine<'a> {
     pub fn search(&self, q: &SearchQuery) -> Vec<Hit> {
         let text = q.text.trim().to_string();
-        let limit = q.limit.unwrap_or(self.cfg.page_size).max(1);
+        let lower_text = text.to_lowercase();
+        let query_terms = tokenize(&text);
+        let query_chars = text.chars().count();
+        let limit = q.limit.unwrap_or(self.cfg.page_size).clamp(1, MAX_RESULT_LIMIT);
         let offset = q.offset.unwrap_or(0);
-        let low_text = text.chars().count() < 2;
+        let low_text = query_chars < 2;
         // 相似检索：只有向量、没有文本
         let pure_vector = q.query_vector.is_some() && low_text;
         let rows = self.candidate_rows(q, if low_text { 20_000 } else { 50_000 });
@@ -166,11 +237,12 @@ impl<'a> SearchEngine<'a> {
             let use_pinyin = q.use_pinyin.unwrap_or(self.cfg.use_pinyin);
             let use_fuzzy = q.use_fuzzy.unwrap_or(self.cfg.use_fuzzy);
             for r in &rows {
-                let (mut score, mut reason) = name_score(&text, &r.name);
+                let (mut score, mut reason) =
+                    name_score(&lower_text, query_chars, &query_terms, &r.name);
                 if score == 0.0 {
                     let pl = norm_path_lower(&r.path);
-                    if pl.contains(&text.to_lowercase()) {
-                        let cover = text.chars().count() as f32 / pl.chars().count().max(1) as f32;
+                    if pl.contains(&lower_text) {
+                        let cover = query_chars as f32 / pl.chars().count().max(1) as f32;
                         score = 0.50 + 0.15 * cover.min(1.0);
                         reason = "路径匹配";
                     }
@@ -183,7 +255,7 @@ impl<'a> SearchEngine<'a> {
                     }
                 }
                 if score == 0.0 && use_fuzzy {
-                    let fs = fuzzy_score(&text, &r.name);
+                    let fs = fuzzy_score(&lower_text, query_chars, &r.name);
                     if fs > 0.0 {
                         score = fs;
                         reason = "模糊匹配";
@@ -195,12 +267,12 @@ impl<'a> SearchEngine<'a> {
                 // 画面内容，不是文件名」的预期。
                 if score < 0.62 {
                     if let Some(tags) = &r.tags {
-                        let low = text.to_lowercase();
                         let parts: Vec<&str> = tags.split(',').filter(|s| !s.is_empty()).collect();
                         let hit = parts
                             .iter()
                             .filter(|t| {
-                                t.to_lowercase().contains(&low) || low.contains(&t.to_lowercase())
+                                let tag = t.to_lowercase();
+                                tag.contains(&lower_text) || lower_text.contains(&tag)
                             })
                             .count();
                         if hit > 0 {
@@ -231,7 +303,7 @@ impl<'a> SearchEngine<'a> {
         let mut fts_ids: HashSet<i64> = HashSet::new();
         if use_fts && !low_text {
             if let Some(expr) = build_fts_expr(&text) {
-                if let Ok(hits) = self.db.search_fts(&expr, 500) {
+                if let Ok(hits) = self.db.search_fts(&expr, limit.max(500).min(MAX_RESULT_LIMIT)) {
                     // bm25() 返回的是负数，越负越相关（ORDER BY 升序 = 最相关在前）。
                     // 所以取反后再归一化，否则最相关的那条 rel 会是 0、其余为负，
                     // 全部被阈值滤掉 —— 表现为「正文里明明有这个词却搜不到」。
@@ -285,30 +357,35 @@ impl<'a> SearchEngine<'a> {
                 // 这里用「结构化过滤后的候选集」，既尊重类型/路径/大小筛选，又能召回。
                 let allowed: HashSet<i64> = rows.iter().map(|r| r.id).collect();
                 let allowed_ref = if pure_vector { None } else { Some(&allowed) };
-                // 文本查询查文本空间，媒体相似检索查媒体空间；
-                // 两个空间的维度不同，绝不能混查。
-                let store = if q.vector_space.as_deref() == Some("media") {
-                    self.media_vectors
-                } else {
-                    self.vectors
-                };
-                let hits = store.search(&qvec, 800, allowed_ref);
-                let floor = self.cfg.semantic_floor;
-                for (fid, sc) in hits {
-                    let rel = ((sc - floor) / (1.0 - floor)).clamp(0.0, 1.0);
-                    if rel <= 0.0 {
-                        continue;
+                // 传统后端的文本与媒体空间维度不同，不能混查；
+                // Candle 多模态模型显式声明 shared 后才会同时搜索两个空间。
+                // Candle shares one vector space for text and media. Legacy
+                // backends keep separate dimensions and search one store.
+                let stores: Vec<&VectorStore> = match q.vector_space.as_deref() {
+                    Some("media") => vec![self.media_vectors],
+                    Some("shared") if self.media_vectors.dim() == qvec.len() => {
+                        vec![self.vectors, self.media_vectors]
                     }
-                    let add = self.cfg.semantic_weight * 1.6 * rel;
-                    if let Some((_, score, reason)) = scored.get_mut(&fid) {
-                        *score += add;
-                        // 原因只做「升级」不做降级：名称/全文这种确定性命中
-                        // 比语义更有解释力，不能被后执行的语义分支覆盖成「语义相似」。
-                        if reason == "全部" {
-                            *reason = "语义相似".to_string();
+                    _ => vec![self.vectors],
+                };
+                let floor = self.cfg.semantic_floor;
+                for store in stores {
+                    for (fid, sc) in store.search(&qvec, limit.max(800).min(MAX_RESULT_LIMIT), allowed_ref) {
+                        let rel = ((sc - floor) / (1.0 - floor)).clamp(0.0, 1.0);
+                        if rel <= 0.0 {
+                            continue;
                         }
-                    } else if let Ok(Some(r)) = self.db.get_by_id(fid) {
-                        scored.insert(fid, (r, add, "语义相似".to_string()));
+                        let add = self.cfg.semantic_weight * 1.6 * rel;
+                        if let Some((_, score, reason)) = scored.get_mut(&fid) {
+                            *score += add;
+                            // 原因只做「升级」不做降级：名称/全文这种确定性命中
+                            // 比语义更有解释力，不能被后执行的语义分支覆盖成「语义相似」。
+                            if reason == "全部" {
+                                *reason = "语义相似".to_string();
+                            }
+                        } else if let Ok(Some(r)) = self.db.get_by_id(fid) {
+                            scored.insert(fid, (r, add, "语义相似".to_string()));
+                        }
                     }
                 }
             }
@@ -401,12 +478,12 @@ impl<'a> SearchEngine<'a> {
             let mut v = qv.clone();
             normalize(&mut v);
             // 媒体空间里「视频」的向量也是从画面来的，所以可以一起查。
-            self.clip_vectors.search(&v, 400, None)
+            self.clip_vectors.search(&v, limit_for_cross(q), None)
         });
         let audio_hits = q.audio_query.as_ref().map(|qv| {
             let mut v = qv.clone();
             normalize(&mut v);
-            self.audio_vectors.search(&v, 400, None)
+            self.audio_vectors.search(&v, limit_for_cross(q), None)
         });
         // 「突出度」= top1 减去中位数。两个模型对无关内容的基线差很多
         // （CLIP 随便配都 0.30，CLAP 只有 0.13），比绝对值等于比基线，
@@ -487,8 +564,11 @@ impl<'a> SearchEngine<'a> {
                 if i > 0 {
                     sql.push_str(" OR ");
                 }
-                sql.push_str("path LIKE ?");
-                args.push(format!("{}%", r.trim_end_matches('\\')).into());
+                let param = args.len() + 1;
+                sql.push_str(&format!(
+                    "path = ?{param} COLLATE NOCASE OR substr(path,1,length(?{param})+1) = (?{param} || char(92)) COLLATE NOCASE"
+                ));
+                args.push(crate::util::norm_path(r).trim_end_matches('\\').to_string().into());
             }
             sql.push(')');
         }
@@ -673,13 +753,53 @@ pub fn similar(
     kind_filter: Option<&str>,
     top: usize,
 ) -> Vec<Hit> {
-    let src_kind = db.get_by_id(file_id).ok().flatten().map(|r| r.kind.clone());
+    similar_scoped(
+        db,
+        vectors,
+        media_vectors,
+        clip_vectors,
+        audio_vectors,
+        file_id,
+        kind_filter,
+        top,
+        None,
+    )
+}
+
+/// Similar-file search scoped to active scan roots. `None` keeps the legacy
+/// unrestricted behavior for callers such as isolated self-tests.
+pub fn similar_scoped(
+    db: &Db,
+    vectors: &VectorStore,
+    media_vectors: &VectorStore,
+    clip_vectors: &VectorStore,
+    audio_vectors: &VectorStore,
+    file_id: i64,
+    kind_filter: Option<&str>,
+    top: usize,
+    allowed_roots: Option<&[String]>,
+) -> Vec<Hit> {
+    let allowed_ids = match allowed_roots {
+        Some(roots) => match db.file_ids_in_roots(roots) {
+            Ok(ids) => Some(ids.into_iter().collect::<HashSet<_>>()),
+            Err(_) => return Vec::new(),
+        },
+        None => None,
+    };
+    if allowed_ids.as_ref().is_some_and(|ids| !ids.contains(&file_id)) {
+        return Vec::new();
+    }
+    let source = db.get_by_id(file_id).ok().flatten();
+    let src_kind = source.as_ref().map(|r| r.kind.clone());
+    let is_pdf = source.as_ref().map(|r| r.ext.eq_ignore_ascii_case("pdf")).unwrap_or(false);
     let spaces: [&VectorStore; 4] = [clip_vectors, audio_vectors, vectors, media_vectors];
     // 先按源文件类型挑首选空间，找不到再按顺序兜底 ——
     // 用户刚装好 CLIP 时，老文件只有 hash 向量，不能直接报「没有相似项」。
-    let order: Vec<&VectorStore> = match src_kind.as_deref() {
-        Some("image") | Some("video") => vec![clip_vectors, vectors, media_vectors],
-        Some("audio") => vec![audio_vectors, media_vectors],
+    let order: Vec<&VectorStore> = match (is_pdf, src_kind.as_deref()) {
+        (true, _) | (false, Some("image" | "video")) => {
+            vec![clip_vectors, vectors, media_vectors]
+        }
+        (false, Some("audio")) => vec![audio_vectors, media_vectors],
         _ => vec![vectors, media_vectors],
     };
     let mut store = None;
@@ -703,7 +823,7 @@ pub fn similar(
         Some(k) if k != "auto" && !k.is_empty() => Some(k.to_string()),
         _ => src_kind.clone(),
     };
-    let hits = store.search(&qvec, top * 8 + 16, None);
+    let hits = store.search(&qvec, top * 8 + 16, allowed_ids.as_ref());
     let mut out = Vec::new();
     for (fid, sc) in hits {
         if fid == file_id {
@@ -726,4 +846,42 @@ pub fn similar(
     }
     let _ = now_ts();
     out
+}
+
+#[cfg(test)]
+mod root_scope_tests {
+    use super::{apply_enabled_root_scope, SearchQuery};
+
+    fn query_roots(requested: &[&str], configured: &[&str], disabled: &[&str]) -> Vec<String> {
+        let mut query = SearchQuery::default();
+        query.roots = requested.iter().map(|root| (*root).to_string()).collect();
+        let configured: Vec<String> = configured.iter().map(|root| (*root).to_string()).collect();
+        let disabled: Vec<String> = disabled.iter().map(|root| (*root).to_string()).collect();
+        apply_enabled_root_scope(&mut query, &configured, &disabled);
+        query.roots
+    }
+
+    #[test]
+    fn defaults_to_enabled_roots_and_rejects_disabled_selection() {
+        assert_eq!(
+            query_roots(&[], &["D:\\Docs", "D:\\Media"], &["D:\\Docs"]),
+            vec!["D:\\Media"]
+        );
+        assert_eq!(
+            query_roots(&["D:\\Docs"], &["D:\\Docs", "D:\\Media"], &["D:\\Docs"]),
+            vec!["__deepaisee_no_enabled_index_root__"]
+        );
+    }
+
+    #[test]
+    fn preserves_nested_selection_but_clamps_parent_selection() {
+        assert_eq!(
+            query_roots(&["D:\\Media\\Photos"], &["D:\\Media"], &[]),
+            vec!["D:\\Media\\Photos"]
+        );
+        assert_eq!(
+            query_roots(&["D:\\"], &["D:\\Media"], &[]),
+            vec!["D:\\Media"]
+        );
+    }
 }

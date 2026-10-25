@@ -1,26 +1,36 @@
 <script setup lang="ts">
-// 右侧抽屉：规则 / 局域网 / 日志 / 设置（模型另有独立的「模型」页）
-import { onMounted, ref, watch } from "vue";
-import { api, type Activity, type AppConfig, type Rule, type ServerStatus, type WatchStatus } from "../api";
+import { computed, onMounted, ref, watch } from "vue";
+import { Cpu, Files, Package, ScrollText, Wifi } from "lucide-vue-next";
+import { api, type Activity, type AppConfig, type PartialConfig, type Rule, type ServerStatus, type WatchStatus } from "../api";
 import { refreshStats, toast } from "../store";
+import SettingsIndexTab from "./SettingsIndexTab.vue";
+import SettingsModelTab from "./SettingsModelTab.vue";
+import SettingsLanTab from "./SettingsLanTab.vue";
+import SettingsLogTab from "./SettingsLogTab.vue";
+import SettingsExtensionTab from "./SettingsExtensionTab.vue";
 
 const props = defineProps<{ open: boolean; tab: string }>();
-const emit = defineEmits<{ (e: "close"): void; (e: "tab", t: string): void }>();
+const emit = defineEmits<{ (event: "tab", tab: string): void }>();
 
 const TABS = [
-  { k: "rules", t: "分类规则" },
-  { k: "lan", t: "局域网" },
-  { k: "log", t: "日志" },
-  { k: "settings", t: "设置" },
-];
+  { key: "index", label: "文件索引", icon: Files },
+  { key: "model", label: "模型配置", icon: Cpu },
+  { key: "lan", label: "局域网配置", icon: Wifi },
+  { key: "extensions", label: "可选扩展", icon: Package },
+  { key: "log", label: "日志", icon: ScrollText },
+] as const;
 
+const activeTab = computed(() => TABS.some((item) => item.key === props.tab) ? props.tab : "index");
 const cfg = ref<AppConfig | null>(null);
 const rules = ref<Rule[]>([]);
 const logs = ref<Activity[]>([]);
 const logKind = ref("");
 const srv = ref<ServerStatus | null>(null);
-const watchState = ref<WatchStatus | null>(null);
+const watcher = ref<WatchStatus | null>(null);
 const dataDir = ref("");
+const watchRootsText = ref("");
+const excludeDirsText = ref("");
+const loading = ref(false);
 
 const newRule = ref<Rule>({
   id: 0,
@@ -33,52 +43,164 @@ const newRule = ref<Rule>({
   enabled: true,
 });
 
-async function loadAll() {
+async function load() {
+  loading.value = true;
   try {
-    cfg.value = await api.getConfig();
-  } catch {}
-  try {
-    rules.value = await api.rulesList();
-  } catch {}
-  try {
-    logs.value = await api.activityList(logKind.value || undefined, 300);
-  } catch {}
-  try {
-    srv.value = await api.serverStatus();
-  } catch {}
-  try {
-    watchState.value = await api.watchStatus();
-  } catch {}
-  try {
-    dataDir.value = await api.dataDir();
-  } catch {}
+    const [config, currentServer, currentWatcher, currentRules, currentLogs, dir] = await Promise.all([
+      api.getConfig(),
+      api.serverStatus(),
+      api.watchStatus(),
+      api.rulesList(),
+      api.activityList(logKind.value || undefined, 300),
+      api.dataDir(),
+    ]);
+    cfg.value = config;
+    srv.value = currentServer;
+    watcher.value = currentWatcher;
+    rules.value = currentRules;
+    logs.value = currentLogs;
+    dataDir.value = dir;
+    watchRootsText.value = (config.watch.roots || []).join("\n");
+    excludeDirsText.value = (config.scan.exclude_dirs || []).join("\n");
+  } catch (error) {
+    toast(`读取设置失败：${error}`, "error");
+  } finally {
+    loading.value = false;
+  }
 }
 
-watch(
-  () => props.open,
-  (v) => {
-    if (v) loadAll();
+async function savePatch(patch: PartialConfig, message = "设置已保存") {
+  try {
+    await api.saveConfig(patch);
+    cfg.value = await api.getConfig();
+    toast(message, "ok");
+    return true;
+  } catch (error) {
+    toast(`保存失败：${error}`, "error");
+    return false;
   }
-);
-watch(
-  () => props.tab,
-  (t) => {
-    if (t === "log") refreshLogs();
+}
+
+async function saveFileConfig(): Promise<boolean> {
+  if (!cfg.value) return false;
+  return savePatch({
+    scan: {
+      max_size_mb: cfg.value.scan.max_size_mb,
+      min_size_kb: cfg.value.scan.min_size_kb,
+      exclude_dirs: excludeDirsText.value.split(/\r?\n|,/).map((value) => value.trim()).filter(Boolean),
+      follow_links: cfg.value.scan.follow_links,
+    },
+    index: {
+      max_text_chars: cfg.value.index.max_text_chars,
+      image_max_side: cfg.value.index.image_max_side,
+      video_frames: cfg.value.index.video_frames,
+      audio_seconds: cfg.value.index.audio_seconds,
+      batch_size: cfg.value.index.batch_size,
+      auto_fulltext: cfg.value.index.auto_fulltext,
+      auto_embed: cfg.value.index.auto_embed,
+    },
+    search: {
+      page_size: cfg.value.search.page_size,
+      use_pinyin: cfg.value.search.use_pinyin,
+      use_fuzzy: cfg.value.search.use_fuzzy,
+      use_semantic: cfg.value.search.use_semantic,
+      use_fulltext: cfg.value.search.use_fulltext,
+      semantic_weight: cfg.value.search.semantic_weight,
+      semantic_floor: cfg.value.search.semantic_floor,
+      debounce_ms: cfg.value.search.debounce_ms,
+    },
+  });
+}
+
+async function saveModelConfig(): Promise<boolean> {
+  if (!cfg.value) return false;
+  return savePatch({
+    model: {
+      embed_model: cfg.value.model.embed_model,
+      chat_model: cfg.value.model.chat_model,
+      n_threads: cfg.value.model.n_threads,
+      gpu_device: cfg.value.model.gpu_device,
+      context_size: cfg.value.model.context_size,
+      auto_load: cfg.value.model.auto_load,
+      parallel_mode: cfg.value.model.parallel_mode,
+      clip_dir: cfg.value.model.clip_dir,
+      clip_enabled: cfg.value.model.clip_enabled,
+      clap_dir: cfg.value.model.clap_dir,
+      clap_enabled: cfg.value.model.clap_enabled,
+    },
+  }, "模型设置已保存");
+}
+
+function watchRoots() {
+  return watchRootsText.value.split(/\r?\n|,/).map((value) => value.trim()).filter(Boolean);
+}
+
+async function saveLanConfig(): Promise<boolean> {
+  if (!cfg.value) return false;
+  return savePatch({
+    server: {
+      enabled: cfg.value.server.enabled,
+      bind: cfg.value.server.bind,
+      port: cfg.value.server.port,
+      token: cfg.value.server.token,
+      allow_write: cfg.value.server.allow_write,
+    },
+    watch: {
+      enabled: cfg.value.watch.enabled,
+      auto_index: cfg.value.watch.auto_index,
+      debounce_secs: cfg.value.watch.debounce_secs,
+      roots: watchRoots(),
+    },
+  }, "局域网设置已保存");
+}
+
+async function toggleServer() {
+  if (!(await saveLanConfig())) return;
+  try {
+    if (srv.value?.running) {
+      await api.serverStop();
+      srv.value = { running: false, url: "" };
+      toast("局域网服务已停止", "warn");
+    } else {
+      const url = await api.serverStart();
+      srv.value = { running: true, url };
+      toast(`局域网服务已启动：${url}`, "ok");
+    }
+  } catch (error) {
+    toast(`服务操作失败：${error}`, "error");
   }
-);
+}
+
+async function toggleWatcher() {
+  if (!(await saveLanConfig())) return;
+  try {
+    if (watcher.value?.running) {
+      await api.watchStop();
+      toast("实时监控已停止", "warn");
+    } else {
+      const count = await api.watchStart();
+      toast(`实时监控已开启，监视 ${count} 个目录`, "ok");
+    }
+    watcher.value = await api.watchStatus();
+  } catch (error) {
+    toast(`监控操作失败：${error}`, "error");
+  }
+}
 
 async function refreshLogs() {
   try {
     logs.value = await api.activityList(logKind.value || undefined, 300);
-  } catch {}
+  } catch (error) {
+    toast(`读取日志失败：${error}`, "error");
+  }
 }
 
-// ---------------------------------------------------------------- 规则
 async function addRule() {
-  if (!newRule.value.value.trim() || !newRule.value.category.trim())
-    return toast("请填写匹配内容与分类名", "warn");
-  const r: Rule = { ...newRule.value, id: 0 };
-  rules.value.push(r);
+  if (!newRule.value.value.trim() || !newRule.value.category.trim()) {
+    toast("请填写匹配内容与分类名", "warn");
+    return;
+  }
+  rules.value.push({ ...newRule.value, id: 0 });
   await saveRules();
   newRule.value.value = "";
   newRule.value.category = "";
@@ -86,67 +208,25 @@ async function addRule() {
 
 async function saveRules() {
   try {
-    await api.rulesSave(rules.value.map((r, i) => ({ ...r, priority: r.priority ?? i })));
-    toast("规则已保存", "ok");
-  } catch (e) {
-    toast(`保存失败：${e}`, "error");
+    await api.rulesSave(rules.value.map((rule, index) => ({ ...rule, priority: rule.priority ?? index })));
+    toast("分类规则已保存", "ok");
+  } catch (error) {
+    toast(`保存规则失败：${error}`, "error");
   }
+}
+
+async function deleteRule(index: number) {
+  rules.value.splice(index, 1);
+  await saveRules();
 }
 
 async function applyRules() {
   try {
-    const n = await api.rulesApply();
-    toast(`已按规则重新分类 ${n} 个文件`, "ok");
+    const count = await api.rulesApply();
+    toast(`已重新分类 ${count} 个文件`, "ok");
     await refreshStats();
-  } catch (e) {
-    toast(`应用失败：${e}`, "error");
-  }
-}
-
-async function delRule(i: number) {
-  rules.value.splice(i, 1);
-  await saveRules();
-}
-
-// ---------------------------------------------------------------- 局域网
-async function startServer() {
-  try {
-    const url = await api.serverStart();
-    srv.value = { running: true, url };
-    toast(`局域网服务已启动：${url}`, "ok");
-  } catch (e) {
-    toast(`启动失败：${e}`, "error");
-  }
-}
-async function stopServer() {
-  await api.serverStop();
-  srv.value = { running: false, url: "" };
-  toast("局域网服务已停止", "warn");
-}
-
-async function toggleWatch() {
-  try {
-    if (watchState.value?.running) {
-      await api.watchStop();
-      toast("实时监控已停止", "warn");
-    } else {
-      const n = await api.watchStart();
-      toast(`实时监控已开启，监视 ${n} 个目录`, "ok");
-    }
-    watchState.value = await api.watchStatus();
-  } catch (e) {
-    toast(`${e}`, "error");
-  }
-}
-
-// ---------------------------------------------------------------- 设置
-async function saveCfg() {
-  if (!cfg.value) return;
-  try {
-    await api.saveConfig(cfg.value);
-    toast("设置已保存", "ok");
-  } catch (e) {
-    toast(`保存失败：${e}`, "error");
+  } catch (error) {
+    toast(`应用规则失败：${error}`, "error");
   }
 }
 
@@ -155,8 +235,8 @@ async function vacuum() {
     await api.dbVacuum();
     toast("数据库已压缩", "ok");
     await refreshStats();
-  } catch (e) {
-    toast(`${e}`, "error");
+  } catch (error) {
+    toast(`压缩失败：${error}`, "error");
   }
 }
 
@@ -166,262 +246,206 @@ async function clearAll() {
     await api.dbClear();
     toast("索引已清空", "ok");
     await refreshStats();
-  } catch (e) {
-    toast(`${e}`, "error");
+  } catch (error) {
+    toast(`清空失败：${error}`, "error");
   }
 }
 
-onMounted(loadAll);
+watch(() => props.open, (open) => { if (open) load(); });
+watch(() => props.tab, (tab) => { if (tab === "log") refreshLogs(); });
+onMounted(load);
 </script>
 
 <template>
-  <transition name="slide">
-    <aside v-if="open" class="drawer">
-      <div class="dh">
-        <span class="dt">设置与工具</span>
-        <button class="x" @click="emit('close')">×</button>
+  <div class="settings-page">
+    <aside class="settings-sidebar">
+      <div class="settings-sidebar-head">
+        <div>
+          <div class="settings-title">设置</div>
+          <div class="settings-subtitle">deepaisee</div>
+        </div>
       </div>
-      <div class="tabs">
+      <nav class="settings-nav" aria-label="设置分类">
         <button
-          v-for="t in TABS"
-          :key="t.k"
-          class="tab"
-          :class="{ active: tab === t.k }"
-          @click="emit('tab', t.k)"
+          v-for="item in TABS"
+          :key="item.key"
+          class="settings-nav-item"
+          :class="{ active: activeTab === item.key }"
+          @click="emit('tab', item.key)"
         >
-          {{ t.t }}
+          <component :is="item.icon" :size="17" aria-hidden="true" />
+          <span>{{ item.label }}</span>
         </button>
-      </div>
-
-      <div class="dc">
-        <!-- ------------------------------------------------ 规则 -->
-        <template v-if="tab === 'rules'">
-          <div class="sec-t">新增规则</div>
-          <div class="ruleform">
-            <select v-model="newRule.field">
-              <option value="name">文件名</option>
-              <option value="ext">扩展名</option>
-              <option value="path">完整路径</option>
-              <option value="kind">文件类型</option>
-            </select>
-            <select v-model="newRule.op">
-              <option value="contains">包含</option>
-              <option value="equals">等于</option>
-              <option value="startswith">开头是</option>
-              <option value="endswith">结尾是</option>
-              <option value="regex">正则</option>
-            </select>
-            <input v-model="newRule.value" placeholder="匹配内容，如 合同 / .jpg" />
-            <input v-model="newRule.category" placeholder="归为分类" />
-            <button class="primary" @click="addRule">添加</button>
-          </div>
-
-          <div class="sec-t mt">已有规则</div>
-          <div class="rules">
-            <div v-for="(r, i) in rules" :key="i" class="rule">
-              <input type="checkbox" v-model="r.enabled" />
-              <span class="mono tiny">{{ r.field }} {{ r.op }} "{{ r.value }}"</span>
-              <span class="arrow">→</span>
-              <span class="cat">{{ r.category }}</span>
-              <button class="mini" @click="delRule(i)">删</button>
-            </div>
-            <div v-if="!rules.length" class="none">还没有规则</div>
-          </div>
-          <div class="row">
-            <button class="primary" @click="applyRules">按规则重新分类</button>
-            <button class="ghost" @click="saveRules">保存</button>
-          </div>
-        </template>
-
-        <!-- ------------------------------------------------ 局域网 -->
-        <template v-else-if="tab === 'lan'">
-          <div class="sec-t">手机 / 平板访问</div>
-          <div class="row">
-            <span class="badge" :class="srv?.running ? 'ok' : 'muted'">
-              {{ srv?.running ? "运行中" : "已停止" }}
-            </span>
-          </div>
-          <div v-if="srv?.running" class="url mono">{{ srv.url }}</div>
-          <div class="row">
-            <button class="primary" v-if="!srv?.running" @click="startServer">启动服务</button>
-            <button class="ghost" v-else @click="stopServer">停止服务</button>
-          </div>
-          <p class="muted tiny">
-            同一局域网内的手机浏览器打开上面的地址即可搜索、预览、下载。
-            端口在「设置」里改（默认 8770）。
-          </p>
-
-          <div class="sec-t mt">实时监控</div>
-          <div class="row">
-            <span class="badge" :class="watchState?.running ? 'ok' : 'muted'">
-              {{ watchState?.running ? `监控 ${watchState.roots} 个目录` : "未开启" }}
-            </span>
-            <button @click="toggleWatch">{{ watchState?.running ? "停止" : "开启" }}</button>
-          </div>
-          <p class="muted tiny">
-            开启后新增/修改/删除文件会自动更新索引，无需手动重扫。
-          </p>
-        </template>
-
-        <!-- ------------------------------------------------ 日志 -->
-        <template v-else-if="tab === 'log'">
-          <div class="row">
-            <select v-model="logKind" @change="refreshLogs">
-              <option value="">全部</option>
-              <option value="scan">扫描</option>
-              <option value="index">索引</option>
-              <option value="model">模型</option>
-              <option value="op">文件操作</option>
-              <option value="watch">监控</option>
-              <option value="server">局域网</option>
-              <option value="error">错误</option>
-            </select>
-            <button class="ghost" @click="refreshLogs">刷新</button>
-          </div>
-          <div class="logs">
-            <div v-for="l in logs" :key="l.id" class="logline">
-              <span class="lt mono">{{ new Date(l.ts * 1000).toLocaleTimeString() }}</span>
-              <span class="lk" :class="l.kind">{{ l.kind }}</span>
-              <span class="lm">{{ l.msg }}</span>
-            </div>
-            <div v-if="!logs.length" class="none">暂无日志</div>
-          </div>
-        </template>
-
-        <!-- ------------------------------------------------ 设置 -->
-        <template v-else>
-          <template v-if="cfg">
-            <div class="sec-t">扫描</div>
-            <div class="field">
-              <label>最大文件（MB，0=不限）</label>
-              <input type="number" v-model.number="cfg.scan.max_size_mb" />
-            </div>
-            <div class="field">
-              <label>最小文件（KB）</label>
-              <input type="number" v-model.number="cfg.scan.min_size_kb" />
-            </div>
-
-            <div class="sec-t mt">索引</div>
-            <div class="field">
-              <label>正文最大字符数</label>
-              <input type="number" v-model.number="cfg.index.max_text_chars" />
-            </div>
-            <div class="field">
-              <label>视频抽帧数</label>
-              <input type="number" v-model.number="cfg.index.video_frames" />
-            </div>
-
-            <div class="sec-t mt">搜索</div>
-            <div class="field">
-              <label>语义权重 {{ Number(cfg.search.semantic_weight).toFixed(2) }}</label>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.05"
-                v-model.number="cfg.search.semantic_weight"
-              />
-            </div>
-            <div class="field">
-              <label>每页条数</label>
-              <input type="number" v-model.number="cfg.search.page_size" />
-            </div>
-
-            <div class="sec-t mt">局域网</div>
-            <div class="field">
-              <label>端口</label>
-              <input type="number" v-model.number="cfg.server.port" />
-            </div>
-            <div class="field">
-              <label>访问令牌（留空不校验）</label>
-              <input v-model="cfg.server.token" />
-            </div>
-
-            <div class="row">
-              <button class="primary" @click="saveCfg">保存设置</button>
-            </div>
-
-            <div class="sec-t mt">数据</div>
-            <div class="pathbox mono">{{ dataDir }}</div>
-            <div class="row">
-              <button class="ghost" @click="vacuum">压缩数据库</button>
-              <button class="ghost danger" @click="clearAll">清空索引</button>
-            </div>
-          </template>
-          <div v-else class="none">读取配置中…</div>
-        </template>
-      </div>
+      </nav>
     </aside>
-  </transition>
+
+    <section class="settings-main">
+      <header class="settings-main-head">
+        <div>
+          <h1>{{ TABS.find((item) => item.key === activeTab)?.label }}</h1>
+          <p v-if="activeTab === 'index'">扫描目录、建立全文与向量索引、管理分类规则。</p>
+          <p v-else-if="activeTab === 'model'">管理嵌入模型、跨模态模型和 GPU 推理参数。</p>
+          <p v-else-if="activeTab === 'lan'">配置局域网访问和文件变化监控。</p>
+          <p v-else-if="activeTab === 'log'">查看应用、扫描、索引和模型活动。</p>
+          <p v-else>按需安装 ONNX Runtime 和 Python sidecar，扩展文件保存在项目目录。</p>
+        </div>
+      </header>
+
+      <div v-if="loading" class="settings-loading">正在读取设置…</div>
+      <div v-else-if="cfg" class="settings-scroll">
+        <SettingsIndexTab
+          v-if="activeTab === 'index'"
+          :cfg="cfg"
+          :rules="rules"
+          :new-rule="newRule"
+          :exclude-dirs-text="excludeDirsText"
+          :data-dir="dataDir"
+          :save-file-config="saveFileConfig"
+          :add-rule="addRule"
+          :delete-rule="deleteRule"
+          :apply-rules="applyRules"
+          :save-rules="saveRules"
+          :vacuum="vacuum"
+          :clear-all="clearAll"
+          @update-exclude-dirs="excludeDirsText = $event"
+        />
+        <SettingsModelTab
+          v-if="activeTab === 'model'"
+          :cfg="cfg"
+          :save-model-config="saveModelConfig"
+        />
+        <SettingsLanTab
+          v-if="activeTab === 'lan'"
+          :cfg="cfg"
+          :srv="srv"
+          :watcher="watcher"
+          :watch-roots-text="watchRootsText"
+          :save-lan-config="saveLanConfig"
+          :toggle-server="toggleServer"
+          :toggle-watcher="toggleWatcher"
+          @update-watch-roots="watchRootsText = $event"
+        />
+        <SettingsLogTab
+          v-if="activeTab === 'log'"
+          :logs="logs"
+          :log-kind="logKind"
+          :refresh-logs="refreshLogs"
+          @update-log-kind="logKind = $event"
+        />
+        <SettingsExtensionTab v-if="activeTab === 'extensions'" />
+      </div>
+    </section>
+  </div>
 </template>
 
 <style scoped>
-.drawer {
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: 460px;
-  background: var(--panel);
-  border-left: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  z-index: 40;
-  box-shadow: -18px 0 40px rgba(0, 0, 0, .45);
+.settings-page { height: 100%; display: flex; min-height: 0; background: var(--bg); }
+.settings-sidebar { width: 218px; flex: none; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: #151a17; }
+.settings-sidebar-head { display: flex; align-items: center; gap: 9px; min-height: 68px; padding: 12px 15px; border-bottom: 1px solid var(--border); }
+.back-button { width: 30px; height: 30px; }
+.settings-title { font-size: 15px; font-weight: 650; }
+.settings-subtitle { color: #849087; font: 10px Consolas, monospace; margin-top: 2px; }
+.settings-nav { display: flex; flex-direction: column; gap: 3px; padding: 14px 10px; }
+.settings-nav-item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px 12px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: #909b93; text-align: left; font-size: 12px; }
+.settings-nav-item:hover { color: var(--text); background: #202723; border-color: #2e3a32; }
+.settings-nav-item.active { color: #d8e8dc; background: #294033; border-color: #45624e; }
+.settings-sidebar-foot { display: none; margin-top: auto; padding: 14px; line-height: 1.5; }
+.settings-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.settings-main-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; padding: 24px clamp(18px, 4vw, 58px) 18px; border-bottom: 1px solid var(--border); }
+.settings-main-head h1 { min-height: 0; margin: 0; color: var(--text); font-size: 21px; font-weight: 600; }
+.settings-main-head p { margin: 6px 0 0; color: #849087; font-size: 12px; }
+.settings-scroll { flex: 1; min-height: 0; overflow: auto; padding: 18px clamp(18px, 4vw, 58px) 38px; }
+.settings-loading { display: grid; place-items: center; flex: 1; color: var(--muted); font-size: 12px; }
+.settings-scroll :deep(.embedded-view) { height: auto; min-height: 0; margin-bottom: 16px; }
+.settings-scroll :deep(.embedded-view .view) { height: auto; min-height: 0; overflow: visible; }
+.settings-scroll :deep(.embedded-view .list) { flex: none; min-height: 0; max-height: none; overflow: visible; }
+.settings-scroll :deep(.settings-section) { margin-top: 14px; padding: 18px; border: 1px solid var(--border); border-radius: 7px; background: #151a17; }
+.settings-scroll :deep(.section-head) { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 16px; }
+.settings-scroll :deep(.section-head h2) { display: flex; align-items: center; gap: 7px; margin: 0; color: #cbd5cd; font-size: 14px; font-weight: 600; }
+.settings-scroll :deep(.section-head p), .settings-scroll :deep(.settings-section > div > p) { margin: 5px 0 0; color: #849087; font-size: 11px; }
+.settings-scroll :deep(.form-grid) { display: grid; gap: 12px; }
+.settings-scroll :deep(.form-grid.three) { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.settings-scroll :deep(label) { display: flex; flex-direction: column; gap: 6px; color: #9aa59d; font-size: 11px; }
+.settings-scroll :deep(label small) { color: var(--muted); font-size: 10px; line-height: 1.35; }
+.settings-scroll :deep(label input), .settings-scroll :deep(label select), .settings-scroll :deep(textarea) { width: 100%; min-width: 0; }
+.settings-scroll :deep(textarea) { resize: vertical; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; color: var(--text); font: inherit; outline: none; }
+.settings-scroll :deep(textarea:focus) { border-color: var(--accent); }
+.settings-scroll :deep(.switch-row) { display: flex; flex-wrap: wrap; gap: 15px; margin-top: 15px; }
+.settings-scroll :deep(.switch-row label) { flex-direction: row; align-items: center; gap: 6px; color: #aeb9b0; }
+.settings-scroll :deep(.switch-row input) { width: auto; accent-color: var(--accent); }
+.settings-scroll :deep(.save-button), .settings-scroll :deep(.secondary-button), .settings-scroll :deep(.danger-button) { display: inline-flex; align-items: center; gap: 6px; padding: 7px 11px; border-radius: 5px; font-size: 11px; }
+.settings-scroll :deep(.save-button) { color: #142017; background: var(--accent); border-color: var(--accent); }
+.settings-scroll :deep(.save-button:hover) { background: #a9d9b4; border-color: #a9d9b4; }
+.settings-scroll :deep(.secondary-button) { background: #222a25; border-color: #344139; color: #c4d0c7; }
+.settings-scroll :deep(.danger-button) { background: transparent; border-color: #593a37; color: #f0a09a; }
+.settings-scroll :deep(.action-row) { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.settings-scroll :deep(.rule-form) { display: grid; grid-template-columns: 140px 140px minmax(0, 1fr) minmax(0, 1fr) auto; gap: 7px; }
+.settings-scroll :deep(.rule-list) { margin-top: 12px; border-top: 1px solid #27312a; }
+.settings-scroll :deep(.rule-row) { display: flex; align-items: center; gap: 8px; min-height: 35px; border-bottom: 1px solid #27312a; color: #c0cbc2; font-size: 11px; }
+.settings-scroll :deep(.rule-row .mono) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-scroll :deep(.tiny-button) { width: 27px; height: 27px; margin-left: auto; }
+.settings-scroll :deep(.empty-line) { padding: 16px 0; color: var(--muted); font-size: 12px; }
+.settings-scroll :deep(.data-section) { display: flex; justify-content: space-between; align-items: center; gap: 18px; }
+.settings-scroll :deep(.data-section > div:first-child) { min-width: 0; }
+.settings-scroll :deep(.data-section .muted) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-scroll :deep(.model-hint) { margin-top: 14px; line-height: 1.5; }
+.settings-scroll :deep(.status) { display: inline-flex; align-items: center; gap: 6px; color: #929d95; font-size: 11px; }
+.settings-scroll :deep(.status span) { width: 7px; height: 7px; border-radius: 50%; background: #59635c; }
+.settings-scroll :deep(.status.on) { color: #a7d7b1; }
+.settings-scroll :deep(.status.on span) { background: #78c78b; box-shadow: 0 0 8px #78c78b; }
+.settings-scroll :deep(.server-url) { margin-bottom: 14px; padding: 10px; color: #a8d8b4; background: #1b2b20; border: 1px solid #34533d; border-radius: 5px; overflow-wrap: anywhere; }
+.settings-scroll :deep(.wide-label) { margin-top: 4px; }
+.settings-scroll :deep(.exclude-label) { margin-top: 14px; }
+.settings-scroll :deep(.log-toolbar) { margin-bottom: 10px; }
+.settings-scroll :deep(.log-toolbar select) { min-width: 150px; }
+.settings-scroll :deep(.logs) { border-top: 1px solid #27312a; }
+.settings-scroll :deep(.log-row) { display: grid; grid-template-columns: 82px 60px minmax(0, 1fr); gap: 10px; align-items: baseline; min-height: 35px; padding: 8px 0; border-bottom: 1px solid #27312a; color: #bdc8bf; font-size: 11px; }
+.settings-scroll :deep(.log-time) { color: #748078; }
+.settings-scroll :deep(.log-kind) { color: #9eb7a3; }
+.settings-scroll :deep(.log-kind.error) { color: #f29f97; }
+/* Keep the settings surface aligned with the flat white/black shell. */
+.settings-sidebar { background: #fff; }
+.settings-subtitle, .settings-main-head p, .settings-sidebar-foot { color: #666; }
+.settings-nav-item { color: #444; border-radius: 2px; }
+.settings-nav-item:hover { color: #111; background: #f0f0f0; border-color: #111; }
+.settings-nav-item.active { color: #fff; background: #111; border-color: #111; }
+.settings-scroll :deep(.settings-section) { background: #fff; border-radius: 2px; }
+.settings-scroll :deep(.settings-section) { border-color: #111; }
+.settings-scroll :deep(.section-head h2) { color: #111; }
+.settings-scroll :deep(.section-head p), .settings-scroll :deep(.settings-section > div > p), .settings-scroll :deep(label) { color: #555; }
+.settings-scroll :deep(textarea) { background: #fff; border-color: #111; border-radius: 2px; color: #111; }
+.settings-scroll :deep(.save-button) { color: #fff; background: #111; border-color: #111; border-radius: 2px; }
+.settings-scroll :deep(.save-button:hover) { background: #333; border-color: #333; }
+.settings-scroll :deep(.secondary-button) { background: #fff; border-color: #111; color: #111; border-radius: 2px; }
+.settings-scroll :deep(.danger-button) { background: #fff; border-color: #9b2923; color: #9b2923; border-radius: 2px; }
+.settings-scroll :deep(.rule-row), .settings-scroll :deep(.log-row) { border-color: #ddd; color: #222; }
+.settings-scroll :deep(.rule-list), .settings-scroll :deep(.logs) { border-color: #111; }
+.settings-scroll :deep(.switch-row label) { color: #222; }
+.settings-scroll :deep(.switch-row input) { accent-color: #111; }
+.settings-scroll :deep(input), .settings-scroll :deep(select) { background: #fff; border-color: #111; border-radius: 2px; color: #111; }
+.settings-scroll :deep(input::placeholder), .settings-scroll :deep(textarea::placeholder) { color: #777; }
+.settings-scroll :deep(.model-hint), .settings-scroll :deep(.empty-line) { color: #555; }
+.settings-scroll :deep(.status) { color: #555; }
+.settings-scroll :deep(.status.on) { color: #111; }
+.settings-scroll :deep(.status.on span) { background: #111; box-shadow: none; }
+.settings-scroll :deep(.server-url) { color: #111; background: #f7f7f7; border-color: #111; border-radius: 2px; }
+.settings-scroll :deep(.log-time), .settings-scroll :deep(.log-kind) { color: #555; }
+.settings-scroll :deep(.log-row > span:last-child) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 820px) {
+  .settings-sidebar { width: 172px; }
+  .settings-main-head, .settings-scroll { padding-inline: 18px; }
+  .settings-scroll :deep(.form-grid.three) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .settings-scroll :deep(.rule-form) { grid-template-columns: 1fr 1fr; }
+  .settings-scroll :deep(.rule-form input), .settings-scroll :deep(.rule-form button) { grid-column: span 2; }
 }
-.slide-enter-active, .slide-leave-active { transition: transform .18s ease; }
-.slide-enter-from, .slide-leave-to { transform: translateX(100%); }
-.dh {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 12px 14px; border-bottom: 1px solid var(--border);
+@media (max-width: 600px) {
+  .settings-sidebar { width: 54px; }
+  .settings-sidebar-head { justify-content: center; padding-inline: 8px; }
+  .settings-title, .settings-subtitle, .settings-nav-item span, .settings-sidebar-foot { display: none; }
+  .settings-nav { padding-inline: 7px; }
+  .settings-nav-item { justify-content: center; padding-inline: 0; }
+  .settings-scroll :deep(.form-grid.three) { grid-template-columns: 1fr; }
+  .settings-scroll :deep(.data-section) { align-items: flex-start; flex-direction: column; }
+  .settings-scroll :deep(.embedded-view) { height: auto; }
 }
-.dt { font-size: 14px; font-weight: 600; }
-.x { background: transparent; border: none; font-size: 20px; color: var(--muted); padding: 0 6px; }
-.tabs { display: flex; gap: 4px; padding: 10px 12px; flex-wrap: wrap; }
-.dc { flex: 1; overflow: auto; padding: 4px 14px 20px; min-height: 0; }
-.sec-t { font-size: 12px; color: var(--muted); margin: 10px 0 8px; }
-.sec-t.mt { margin-top: 20px; }
-.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; }
-.field label { font-size: 12px; color: var(--muted); }
-.field input, .field select { width: 100%; }
-.badge {
-  display: inline-block; font-size: 11px; padding: 3px 9px; border-radius: 999px;
-  border: 1px solid var(--border); color: var(--muted);
-}
-.badge.ok { color: #22c55e; border-color: rgba(34, 197, 94, .45); background: rgba(34, 197, 94, .12); }
-.badge.warn { color: #f59e0b; border-color: rgba(245, 158, 11, .45); background: rgba(245, 158, 11, .12); }
-.caps { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
-.caps li { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-.caps b { width: 96px; font-weight: 500; }
-.ok { color: #22c55e; }
-.warn { color: #f59e0b; }
-.ruleform { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-.ruleform input, .ruleform select { min-width: 0; }
-.rules { display: flex; flex-direction: column; gap: 5px; max-height: 240px; overflow: auto; }
-.rule {
-  display: flex; align-items: center; gap: 6px; font-size: 12px;
-  background: var(--panel-2); border: 1px solid var(--border); border-radius: 7px; padding: 5px 8px;
-}
-.arrow { color: var(--muted); }
-.cat { color: var(--accent); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mini { padding: 1px 7px; font-size: 11px; }
-.url {
-  margin: 8px 0; padding: 8px 10px; background: var(--panel-2);
-  border: 1px solid var(--border); border-radius: 7px; font-size: 12px; word-break: break-all;
-}
-.logs { display: flex; flex-direction: column; gap: 3px; }
-.logline { display: grid; grid-template-columns: 66px 58px 1fr; gap: 6px; font-size: 11px; padding: 3px 0; border-bottom: 1px solid rgba(36,48,74,.4); }
-.lt { color: #64748b; }
-.lk { color: var(--accent); }
-.lk.error { color: var(--danger); }
-.lm { color: #c4d0e3; word-break: break-all; }
-.pathbox {
-  font-size: 11px; color: var(--muted); background: var(--panel-2);
-  border: 1px solid var(--border); border-radius: 7px; padding: 7px 9px; margin-bottom: 8px;
-  word-break: break-all;
-}
-.danger { color: #f87171; border-color: rgba(239, 68, 68, .4); }
-.none { color: var(--muted); font-size: 12px; padding: 10px 0; }
-.tiny { font-size: 11px; line-height: 1.6; }
 </style>

@@ -244,6 +244,48 @@ pub fn make_thumb(src: &Path, dest: &Path, size: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Generate a first-page/embedded-image thumbnail for document cards.
+/// PDF extraction already decodes common raster streams, while DOCX stores
+/// previewable images under `word/media`. Unsupported documents simply fall
+/// back to the file-type icon in the gallery.
+pub fn make_document_thumb(src: &Path, dest: &Path, size: u32) -> bool {
+    let ext = src
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let image = if ext == "pdf" {
+        crate::textract::pdf_images(src, 1).into_iter().next()
+    } else if ext == "docx" {
+        let Some(file) = std::fs::File::open(src).ok() else { return false };
+        let Ok(mut archive) = zip::ZipArchive::new(file) else { return false };
+        let mut names: Vec<String> = archive
+            .file_names()
+            .filter(|name| name.starts_with("word/media/"))
+            .map(str::to_owned)
+            .collect();
+        names.sort();
+        let mut image = None;
+        for name in names {
+            let Ok(mut entry) = archive.by_name(&name) else { continue };
+            let mut bytes = Vec::new();
+            if std::io::Read::read_to_end(&mut entry, &mut bytes).is_err() {
+                continue;
+            }
+            if let Ok(value) = image::load_from_memory(&bytes) {
+                image = Some(value);
+                break;
+            }
+        }
+        image
+    } else {
+        None
+    };
+    let Some(image) = image else { return false };
+    let image = image.thumbnail(size, size);
+    image.save_with_format(dest, image::ImageFormat::Jpeg).is_ok() && dest.is_file()
+}
+
 /// 视频基本信息（宽高）。
 pub fn video_size(path: &Path) -> Option<(u32, u32)> {
     let ff = ffmpeg_path()?;

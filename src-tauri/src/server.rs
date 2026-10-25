@@ -22,6 +22,8 @@ pub struct ServerState {
     pub clip_vectors: Arc<VectorStore>,
     pub audio_vectors: Arc<VectorStore>,
     pub cfg: Arc<crate::config::SearchConfig>,
+    pub scan_roots: Vec<String>,
+    pub disabled_roots: Vec<String>,
     pub token: String,
     pub allow_write: bool,
     pub data_dir: std::path::PathBuf,
@@ -166,6 +168,7 @@ async fn api_search(
         }
     }
     q.limit = Some(p.limit.unwrap_or(50));
+    crate::search::apply_enabled_root_scope(&mut q, &st.scan_roots, &st.disabled_roots);
     let engine = SearchEngine {
         db: &st.db,
         vectors: &st.vectors,
@@ -204,6 +207,7 @@ async fn api_facets(State(st): State<ServerState>, Query(p): Query<SearchParams>
     }
     let mut q = SearchQuery::default();
     q.text = p.q.unwrap_or_default();
+    crate::search::apply_enabled_root_scope(&mut q, &st.scan_roots, &st.disabled_roots);
     let engine = SearchEngine {
         db: &st.db,
         vectors: &st.vectors,

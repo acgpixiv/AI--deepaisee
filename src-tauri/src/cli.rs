@@ -18,11 +18,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::ai::build_embedder;
 use crate::config::{config_path, data_dir, AppConfig};
 use crate::db::Db;
 use crate::scan::Scanner;
-use crate::search::{similar, SearchEngine, SearchQuery};
+use crate::search::{SearchEngine, SearchQuery};
 use crate::vector::VectorStore;
 
 /// 把 stdout 接到父进程的控制台上（windowed 程序默认没有控制台）。
@@ -101,8 +100,12 @@ impl Ctx {
         let data_dir = data_dir(Some(&app_dir));
         let cfg = AppConfig::load(&config_path(Some(&app_dir)));
         let db = Db::open(&data_dir.join("index.db")).map_err(|e| format!("打开数据库失败：{e}"))?;
+        db.sync_index_roots(&cfg.scan.roots, &cfg.scan.disabled_roots)
+            .map_err(|e| format!("同步索引目录失败：{e}"))?;
         // 维度必须和真正要用的 embedder 一致，否则向量库会按错误步长解析
-        let dim = build_embedder(&cfg.model).map(|e| e.dim()).unwrap_or(512);
+        let dim = crate::ai::build_embedder_with_batch(&cfg.model, cfg.index.batch_size)
+            .map(|e| e.dim())
+            .unwrap_or(512);
         let vectors = VectorStore::open(&data_dir.join("vectors"), dim)
             .map_err(|e| format!("打开向量库失败：{e}"))?;
         let media = VectorStore::open(&data_dir.join("vectors_media"), 256)
@@ -142,8 +145,16 @@ impl Ctx {
         }
     }
 
+    fn apply_root_scope(&self, q: &mut SearchQuery) {
+        crate::search::apply_enabled_root_scope(
+            q,
+            &self.cfg.scan.roots,
+            &self.cfg.scan.disabled_roots,
+        );
+    }
+
     fn query_vec(&self, text: &str) -> Option<Vec<f32>> {
-        build_embedder(&self.cfg.model)
+        crate::ai::build_embedder_with_batch(&self.cfg.model, self.cfg.index.batch_size)
             .ok()
             .and_then(|e| e.embed_text(text, true).ok())
     }
@@ -331,6 +342,7 @@ fn cmd_search(ctx: &Ctx, args: &[String]) -> i32 {
             q.audio_query = m.text_vec(&p).ok();
         }
     }
+    ctx.apply_root_scope(&mut q);
     let t = Instant::now();
     let hits = ctx.engine().search(&q);
     let ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -351,13 +363,15 @@ fn cmd_sem(ctx: &Ctx, args: &[String]) -> i32 {
         return 1;
     };
     let t = Instant::now();
-    let hits = ctx.engine().search(&SearchQuery {
+    let mut q = SearchQuery {
         text,
         query_vector: Some(vec),
         use_semantic: Some(true),
         limit: Some(20),
         ..Default::default()
-    });
+    };
+    ctx.apply_root_scope(&mut q);
+    let hits = ctx.engine().search(&q);
     let ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("语义检索：{} 条，{ms:.0} ms", hits.len());
     println!("{}", "-".repeat(78));
@@ -376,7 +390,13 @@ fn cmd_similar(ctx: &Ctx, args: &[String]) -> i32 {
         return 1;
     };
     let t = Instant::now();
-    let hits = similar(
+    let enabled_roots: Vec<String> = ctx.cfg.scan.roots.iter()
+        .filter(|root| !ctx.cfg.scan.disabled_roots.iter().any(|disabled| {
+            crate::util::norm_path(disabled).eq_ignore_ascii_case(&crate::util::norm_path(root))
+        }))
+        .cloned()
+        .collect();
+    let hits = crate::search::similar_scoped(
         &ctx.db,
         &ctx.vectors,
         &ctx.media,
@@ -385,6 +405,7 @@ fn cmd_similar(ctx: &Ctx, args: &[String]) -> i32 {
         row.id,
         None,
         10,
+        if ctx.cfg.scan.roots.is_empty() { None } else { Some(&enabled_roots) },
     );
     let ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("与「{}」相似：{} 条，{ms:.0} ms", row.name, hits.len());
@@ -427,7 +448,7 @@ fn cmd_stats(ctx: &Ctx) -> i32 {
 
 fn cmd_index(ctx: &Ctx, args: &[String]) -> i32 {
     let what = parse_flag(args, "--what").unwrap_or_else(|| "auto".into());
-    let Some(emb) = build_embedder(&ctx.cfg.model).ok() else {
+    let Some(emb) = crate::ai::build_embedder_with_batch(&ctx.cfg.model, ctx.cfg.index.batch_size).ok() else {
         println!("错误：模型未加载");
         return 1;
     };
@@ -518,6 +539,8 @@ fn cmd_serve(ctx: &Ctx, args: &[String]) -> i32 {
         clip_vectors: ctx.clip.clone(),
         audio_vectors: ctx.audio.clone(),
         cfg: Arc::new(ctx.cfg.search.clone()),
+        scan_roots: ctx.cfg.scan.roots.clone(),
+        disabled_roots: ctx.cfg.scan.disabled_roots.clone(),
         token: cfg.token.clone(),
         allow_write: cfg.allow_write,
         data_dir: ctx.data_dir.clone(),

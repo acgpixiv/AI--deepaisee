@@ -268,9 +268,96 @@ fn opendocument_text(path: &Path, max: usize) -> String {
 }
 
 fn pdf_text(path: &Path, max: usize) -> String {
-    pdf_extract::extract_text(path)
-        .map(|t| truncate_chars(&t, max))
-        .unwrap_or_default()
+    // Scanned PDFs often contain only image draw operations. Avoid sending
+    // those files through pdf-extract: it walks every embedded font and can
+    // emit thousands of harmless "unknown glyph name" lines for Dingbats and
+    // damaged font maps. A page content stream with a text operator is enough
+    // to justify the more expensive extractor.
+    if !pdf_has_text_operator(path) {
+        return String::new();
+    }
+    // pdf-extract has a few malformed-font assertions. A damaged PDF should
+    // become an empty extraction result, never unwind the index worker.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pdf_extract::extract_text(path)
+            .map(|t| truncate_chars(&t, max))
+            .unwrap_or_default()
+    }))
+    .unwrap_or_default()
+}
+
+fn pdf_has_text_operator(path: &Path) -> bool {
+    let Ok(doc) = lopdf::Document::load(path) else {
+        // Keep the previous best-effort behavior when lopdf cannot parse a
+        // damaged file; pdf-extract may still recover useful text.
+        return true;
+    };
+    for page_id in doc.page_iter() {
+        let Ok(content) = doc.get_page_content(page_id) else { continue };
+        let has = content
+            .split(|byte| byte.is_ascii_whitespace())
+            .any(|token| matches!(token, b"Tj" | b"TJ" | b"'" | b"\""));
+        if has {
+            return true;
+        }
+    }
+    false
+}
+
+/// Decode common embedded PDF raster images for multimodal indexing. JPEG
+/// streams are passed through directly; simple 8-bit RGB/gray Flate streams
+/// are reconstructed from their declared dimensions. Unsupported PDF image
+/// encodings are skipped without failing the document.
+pub fn pdf_images(path: &Path, limit: usize) -> Vec<image::DynamicImage> {
+    pdf_images_with_cancel(path, limit, || false)
+}
+
+/// Same decoder with a cooperative cancellation hook. PDF decompression itself
+/// is library code and cannot be interrupted, but checking between pages and
+/// embedded images keeps a large scanned document from delaying cancellation.
+pub fn pdf_images_with_cancel<F>(path: &Path, limit: usize, cancelled: F) -> Vec<image::DynamicImage>
+where
+    F: Fn() -> bool,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Ok(doc) = lopdf::Document::load(path) else { return Vec::new() };
+        let mut out = Vec::new();
+        for page_id in doc.page_iter() {
+            if cancelled() { return out; }
+            let Ok(images) = doc.get_page_images(page_id) else { continue };
+            for item in images {
+                if cancelled() { return out; }
+                if out.len() >= limit { return out; }
+                let filters = item.filters.clone().unwrap_or_default();
+                let bytes = if filters.iter().any(|f| f.eq_ignore_ascii_case("DCTDecode")) {
+                    item.content.to_vec()
+                } else {
+                    let mut dict = item.origin_dict.clone();
+                    dict.remove(b"Subtype");
+                    let stream = lopdf::Stream::new(dict, item.content.to_vec());
+                    match stream.decompressed_content() { Ok(v) => v, Err(_) => continue }
+                };
+                if filters.iter().any(|f| f.eq_ignore_ascii_case("DCTDecode")) {
+                    if let Ok(img) = image::load_from_memory(&bytes) { out.push(img.thumbnail(1024, 1024)); }
+                    continue;
+                }
+                if item.width <= 0 || item.height <= 0 || item.width > 20_000 || item.height > 20_000
+                    || item.width.saturating_mul(item.height) > 100_000_000 { continue; }
+                let width = item.width.max(1) as u32;
+                let height = item.height.max(1) as u32;
+                let color = item.color_space.as_deref().unwrap_or("").to_ascii_lowercase();
+                let image = if color.contains("gray") && bytes.len() >= (width as usize * height as usize) {
+                    image::GrayImage::from_raw(width, height, bytes[..width as usize * height as usize].to_vec())
+                        .map(image::DynamicImage::ImageLuma8)
+                } else if color.contains("rgb") && bytes.len() >= (width as usize * height as usize * 3) {
+                    image::RgbImage::from_raw(width, height, bytes[..width as usize * height as usize * 3].to_vec())
+                        .map(image::DynamicImage::ImageRgb8)
+                } else { None };
+                if let Some(img) = image { out.push(img.thumbnail(1024, 1024)); }
+            }
+        }
+        out
+    })).unwrap_or_default()
 }
 
 fn epub_text(path: &Path, max: usize) -> String {

@@ -1,8 +1,10 @@
 //! 向量存储：文件 id -> f32 向量，落盘为二进制并常驻内存。
-use parking_lot::RwLock;
-use std::collections::HashMap;
+use parking_lot::{Mutex, RwLock};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 pub struct VectorStore {
     dim: usize,
@@ -10,6 +12,40 @@ pub struct VectorStore {
     data: RwLock<Vec<f32>>,      // slot * dim
     ids: RwLock<Vec<i64>>,       // slot -> file_id（-1 表示空槽）
     index: RwLock<HashMap<i64, usize>>, // file_id -> slot
+    generation: AtomicU64,
+    saved_generation: AtomicU64,
+    save_lock: Mutex<()>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScoredVector {
+    id: i64,
+    score: f32,
+}
+
+impl PartialEq for ScoredVector {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.total_cmp(&other.score) == Ordering::Equal && self.id == other.id
+    }
+}
+
+impl Eq for ScoredVector {}
+
+impl PartialOrd for ScoredVector {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoredVector {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse the natural order so BinaryHeap::peek() is the smallest
+        // retained score, ready to be evicted when a better hit arrives.
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.id.cmp(&other.id))
+    }
 }
 
 impl VectorStore {
@@ -21,6 +57,9 @@ impl VectorStore {
             data: RwLock::new(Vec::new()),
             ids: RwLock::new(Vec::new()),
             index: RwLock::new(HashMap::new()),
+            generation: AtomicU64::new(0),
+            saved_generation: AtomicU64::new(0),
+            save_lock: Mutex::new(()),
         };
         store.load()?;
         Ok(store)
@@ -109,33 +148,47 @@ impl VectorStore {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
+        let _save_guard = self.save_lock.lock();
+        let generation = self.generation.load(AtomicOrdering::Acquire);
+        if generation == self.saved_generation.load(AtomicOrdering::Acquire) {
+            return Ok(());
+        }
         std::fs::create_dir_all(&self.dir)?;
-        let _ = self.write_meta();
         // 原子替换：先写临时文件再 rename（Windows 上 rename 覆盖需要先删）
         let tmp = self.dir.join("vectors.bin.tmp");
+        let data = self.data.read();
+        let ids = self.ids.read();
         {
-            let data = self.data.read();
             let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
-            let mut bytes = Vec::with_capacity(data.len() * 4);
-            for v in data.iter() {
-                bytes.extend_from_slice(&v.to_le_bytes());
+            let mut bytes = Vec::with_capacity(16 * 1024 * 4);
+            for chunk in data.chunks(16 * 1024) {
+                bytes.clear();
+                for v in chunk {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                w.write_all(&bytes)?;
             }
-            w.write_all(&bytes)?;
             w.flush()?;
         }
         let tmp_id = self.dir.join("ids.bin.tmp");
         {
-            let ids = self.ids.read();
             let mut w = BufWriter::new(std::fs::File::create(&tmp_id)?);
-            let mut bytes = Vec::with_capacity(ids.len() * 8);
-            for v in ids.iter() {
-                bytes.extend_from_slice(&v.to_le_bytes());
+            let mut bytes = Vec::with_capacity(8 * 1024 * 8);
+            for chunk in ids.chunks(8 * 1024) {
+                bytes.clear();
+                for v in chunk {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                w.write_all(&bytes)?;
             }
-            w.write_all(&bytes)?;
             w.flush()?;
         }
         replace(&tmp, &self.vec_path())?;
         replace(&tmp_id, &self.id_path())?;
+        drop(ids);
+        drop(data);
+        self.write_meta()?;
+        self.saved_generation.store(generation, AtomicOrdering::Release);
         Ok(())
     }
 
@@ -146,12 +199,14 @@ impl VectorStore {
         let mut ids = self.ids.write();
         if let Some(&slot) = index.get(&file_id) {
             data[slot * self.dim..(slot + 1) * self.dim].copy_from_slice(vec);
+            self.generation.fetch_add(1, AtomicOrdering::Release);
             return;
         }
         let slot = ids.len();
         ids.push(file_id);
         data.extend_from_slice(vec);
         index.insert(file_id, slot);
+        self.generation.fetch_add(1, AtomicOrdering::Release);
     }
 
     pub fn has(&self, file_id: i64) -> bool {
@@ -170,14 +225,20 @@ impl VectorStore {
         if let Some(slot) = index.remove(&file_id) {
             let mut ids = self.ids.write();
             ids[slot] = -1;
+            self.generation.fetch_add(1, AtomicOrdering::Release);
         }
     }
 
     /// 余弦相似检索（向量均已归一化，直接点积）。
     pub fn search(&self, query: &[f32], top_k: usize, allowed: Option<&std::collections::HashSet<i64>>) -> Vec<(i64, f32)> {
+        if top_k == 0 || query.len() != self.dim {
+            return Vec::new();
+        }
         let index = self.index.read();
         let data = self.data.read();
-        let mut scored: Vec<(i64, f32)> = Vec::with_capacity(index.len());
+        // Keep only the requested top-k candidates. This avoids allocating and
+        // sorting a vector proportional to the entire index for every query.
+        let mut top = BinaryHeap::with_capacity(top_k.min(index.len()));
         for (&fid, &slot) in index.iter() {
             if let Some(a) = allowed {
                 if !a.contains(&fid) {
@@ -189,11 +250,21 @@ impl VectorStore {
             for i in 0..self.dim {
                 dot += data[base + i] * query[i];
             }
-            scored.push((fid, dot));
+            let candidate = ScoredVector { id: fid, score: dot };
+            if top.len() < top_k {
+                top.push(candidate);
+            } else if top.peek().is_some_and(|smallest| candidate < *smallest) {
+                top.pop();
+                top.push(candidate);
+            }
         }
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(top_k);
-        scored
+        let mut out: Vec<_> = top.into_iter().collect();
+        out.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        out.into_iter().map(|candidate| (candidate.id, candidate.score)).collect()
     }
 
     pub fn compact(&self) -> std::io::Result<()> {
@@ -258,4 +329,50 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
         dot += a[i] * b[i];
     }
     dot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Mutex, VectorStore};
+    use parking_lot::RwLock;
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+
+    fn fixture() -> VectorStore {
+        let ids = vec![1, 2, 3, 4];
+        VectorStore {
+            dim: 2,
+            dir: PathBuf::new(),
+            data: RwLock::new(vec![
+                1.0, 0.0,
+                0.8, 0.6,
+                0.8, -0.6,
+                0.0, 1.0,
+            ]),
+            ids: RwLock::new(ids.clone()),
+            index: RwLock::new(ids.iter().enumerate().map(|(slot, id)| (*id, slot)).collect::<HashMap<_, _>>()),
+            generation: AtomicU64::new(0),
+            saved_generation: AtomicU64::new(0),
+            save_lock: Mutex::new(()),
+        }
+    }
+
+    #[test]
+    fn search_keeps_exact_top_k_and_stable_ties() {
+        let store = fixture();
+        assert_eq!(store.search(&[1.0, 0.0], 2, None), vec![(1, 1.0), (2, 0.8)]);
+    }
+
+    #[test]
+    fn search_respects_allowlist_and_bad_dimensions() {
+        let store = fixture();
+        let allowed = HashSet::from([2, 3, 4]);
+        assert_eq!(
+            store.search(&[1.0, 0.0], 3, Some(&allowed)),
+            vec![(2, 0.8), (3, 0.8), (4, 0.0)]
+        );
+        assert!(store.search(&[1.0], 2, None).is_empty());
+        assert!(store.search(&[1.0, 0.0], 0, None).is_empty());
+    }
 }

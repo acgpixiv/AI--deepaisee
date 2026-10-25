@@ -72,6 +72,34 @@ pub struct Activity {
     pub msg: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexRoot {
+    pub root: String,
+    pub enabled: bool,
+    pub last_scan: i64,
+    pub files: i64,
+    pub bytes: i64,
+    pub added: i64,
+    pub updated: i64,
+    pub skipped: i64,
+    pub errors: i64,
+    pub missing: i64,
+    pub text_ok: i64,
+    pub embed_ok: i64,
+    pub completed: i64,
+    pub text_pending: i64,
+    pub embed_pending: i64,
+    pub kinds: Vec<IndexKindStat>,
+    pub last_error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexKindStat {
+    pub kind: String,
+    pub count: i64,
+    pub bytes: i64,
+}
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -115,6 +143,7 @@ impl Db {
                 missing INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS ix_files_dir ON files(dir);
+            CREATE INDEX IF NOT EXISTS ix_files_path_nocase ON files(path COLLATE NOCASE);
             CREATE INDEX IF NOT EXISTS ix_files_kind ON files(kind);
             CREATE INDEX IF NOT EXISTS ix_files_mtime ON files(mtime DESC);
             CREATE INDEX IF NOT EXISTS ix_files_size ON files(size DESC);
@@ -141,8 +170,22 @@ impl Db {
                 msg TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS ix_activity_ts ON activity(ts DESC);
+            CREATE TABLE IF NOT EXISTS index_roots(
+                root TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_scan INTEGER NOT NULL DEFAULT 0,
+                files INTEGER NOT NULL DEFAULT 0,
+                bytes INTEGER NOT NULL DEFAULT 0,
+                added INTEGER NOT NULL DEFAULT 0,
+                updated INTEGER NOT NULL DEFAULT 0,
+                skipped INTEGER NOT NULL DEFAULT 0,
+                errors INTEGER NOT NULL DEFAULT 0,
+                missing INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT ''
+            );
             "#,
         )?;
+        let _ = c.execute("ALTER TABLE index_roots ADD COLUMN last_error TEXT NOT NULL DEFAULT ''", []);
         // 历史遗留：早期版本按原始字符串存 path，用户粘贴 C:/a/b 与 walkdir 的 C:\a\b
         // 会被当成两个文件。这里把正斜杠统一成反斜杠；若统一后撞了 UNIQUE，
         // 说明是重复行，直接删掉后来者（保留 id 小的、状态更完整的）。
@@ -202,6 +245,21 @@ impl Db {
         c.execute(
             "INSERT INTO meta(k,v) VALUES('schema_version',?1) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
             params![FTS_SCHEMA_VERSION.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_meta(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        let c = self.conn.lock();
+        c.query_row("SELECT v FROM meta WHERE k=?1", params![key], |row| row.get(0))
+            .optional()
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        let c = self.conn.lock();
+        c.execute(
+            "INSERT INTO meta(k,v) VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            params![key, value],
         )?;
         Ok(())
     }
@@ -284,6 +342,39 @@ impl Db {
         vals.push(old_path.to_string().into());
         let c = self.conn.lock();
         c.execute(&sql, rusqlite::params_from_iter(vals))?;
+        Ok(())
+    }
+
+    /// Update the indexed path after a file is renamed on disk. The FTS name
+    /// column is updated in the same transaction so filename searches remain
+    /// consistent with the files table.
+    pub fn rename_file(&self, old_path: &str, new_path: &str) -> rusqlite::Result<()> {
+        let new = Path::new(new_path);
+        let dir = new
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let name = new
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ext = new
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let id: i64 = tx.query_row(
+            "SELECT id FROM files WHERE path=?1",
+            params![old_path],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "UPDATE files SET path=?1, dir=?2, name=?3, ext=?4 WHERE id=?5",
+            params![new_path, dir, name, ext, id],
+        )?;
+        tx.execute("UPDATE docs SET name=?1 WHERE rowid=?2", params![name, id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -418,6 +509,51 @@ impl Db {
         Ok(n)
     }
 
+    pub fn reset_states_in_roots(&self, what: &str, roots: &[String]) -> rusqlite::Result<usize> {
+        if roots.is_empty() {
+            return Ok(0);
+        }
+        let col = match what {
+            "text" => "text_state",
+            "embed" => "embed_state",
+            _ => return self.reset_states_for_roots(roots),
+        };
+        let mut sql = format!("UPDATE files SET {col}='pending' WHERE missing=0 AND (");
+        let mut args: Vec<rusqlite::types::Value> = Vec::with_capacity(roots.len() * 3);
+        for (i, root) in roots.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" OR ");
+            }
+            let (exact, lower, upper) = index_root_bounds(root);
+            let base = i * 3 + 1;
+            sql.push_str(&format!("(path=?{base} COLLATE NOCASE OR (path COLLATE NOCASE>=?{} AND path COLLATE NOCASE<?{}))", base + 1, base + 2));
+            args.extend([exact.into(), lower.into(), upper.into()]);
+        }
+        sql.push(')');
+        let c = self.conn.lock();
+        c.execute(&sql, rusqlite::params_from_iter(args))
+    }
+
+    fn reset_states_for_roots(&self, roots: &[String]) -> rusqlite::Result<usize> {
+        if roots.is_empty() {
+            return Ok(0);
+        }
+        let mut sql = String::from("UPDATE files SET text_state='pending',embed_state='pending' WHERE missing=0 AND (");
+        let mut args: Vec<rusqlite::types::Value> = Vec::with_capacity(roots.len() * 3);
+        for (i, root) in roots.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" OR ");
+            }
+            let (exact, lower, upper) = index_root_bounds(root);
+            let base = i * 3 + 1;
+            sql.push_str(&format!("(path=?{base} COLLATE NOCASE OR (path COLLATE NOCASE>=?{} AND path COLLATE NOCASE<?{}))", base + 1, base + 2));
+            args.extend([exact.into(), lower.into(), upper.into()]);
+        }
+        sql.push(')');
+        let c = self.conn.lock();
+        c.execute(&sql, rusqlite::params_from_iter(args))
+    }
+
     pub fn set_thumb(&self, file_id: i64, key: &str) -> rusqlite::Result<()> {
         let c = self.conn.lock();
         c.execute("UPDATE files SET thumb_key=?1 WHERE id=?2", params![key, file_id])?;
@@ -441,6 +577,75 @@ impl Db {
         rows.collect()
     }
 
+    pub fn pending_ids_in_roots(
+        &self,
+        what: &str,
+        limit: usize,
+        roots: &[String],
+    ) -> rusqlite::Result<Vec<i64>> {
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cond = match what {
+            "text" => "text_state IN ('pending','fail')",
+            "embed" => "embed_state IN ('pending','fail')",
+            _ => "text_state IN ('pending','fail') OR embed_state IN ('pending','fail')",
+        };
+        let mut sql = format!("SELECT id FROM files WHERE missing=0 AND ({cond}) AND (");
+        let mut args: Vec<rusqlite::types::Value> = Vec::with_capacity(roots.len() * 3 + 1);
+        for (i, root) in roots.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" OR ");
+            }
+            let (exact, lower, upper) = index_root_bounds(root);
+            let base = i * 3 + 1;
+            sql.push_str(&format!("(path=?{base} COLLATE NOCASE OR (path COLLATE NOCASE>=?{} AND path COLLATE NOCASE<?{}))", base + 1, base + 2));
+            args.extend([exact.into(), lower.into(), upper.into()]);
+        }
+        sql.push_str(&format!(") LIMIT ?{}", roots.len() * 3 + 1));
+        args.push((limit as i64).into());
+        let c = self.conn.lock();
+        let mut st = c.prepare(&sql)?;
+        let rows = st.query_map(rusqlite::params_from_iter(args), |r| r.get(0))?;
+        rows.collect()
+    }
+
+    pub fn file_ids_in_roots(&self, roots: &[String]) -> rusqlite::Result<Vec<i64>> {
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sql = String::from("SELECT id FROM files WHERE missing=0 AND (");
+        let mut args: Vec<rusqlite::types::Value> = Vec::with_capacity(roots.len() * 3);
+        for (i, root) in roots.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" OR ");
+            }
+            let (exact, lower, upper) = index_root_bounds(root);
+            let base = i * 3 + 1;
+            sql.push_str(&format!("(path=?{base} COLLATE NOCASE OR (path COLLATE NOCASE>=?{} AND path COLLATE NOCASE<?{}))", base + 1, base + 2));
+            args.extend([exact.into(), lower.into(), upper.into()]);
+        }
+        sql.push(')');
+        let c = self.conn.lock();
+        let mut st = c.prepare(&sql)?;
+        let rows = st.query_map(rusqlite::params_from_iter(args), |r| r.get(0))?;
+        rows.collect()
+    }
+
+    pub fn pending_ids_active(&self, what: &str, limit: usize) -> rusqlite::Result<Vec<i64>> {
+        let (configured, roots) = {
+            let c = self.conn.lock();
+            let configured: i64 = c.query_row("SELECT COUNT(*) FROM index_roots", [], |r| r.get(0))?;
+            let mut st = c.prepare("SELECT root FROM index_roots WHERE enabled=1 ORDER BY root")?;
+            let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+            (configured > 0, rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        };
+        if !configured {
+            return self.pending_ids(what, limit);
+        }
+        self.pending_ids_in_roots(what, limit, &roots)
+    }
+
     pub fn count_state(&self, what: &str, state: &str) -> rusqlite::Result<i64> {
         let col = if what == "text" { "text_state" } else { "embed_state" };
         let c = self.conn.lock();
@@ -449,6 +654,79 @@ impl Db {
             params![state],
             |r| r.get(0),
         )
+    }
+
+    /// Return persisted indexing progress for the requested stage. A file is
+    /// considered processed once its stage was attempted. Failed items count
+    /// toward visible progress, but remain eligible for retry. This lets a
+    /// newly-created Indexer restore its progress after an application restart
+    /// without relying on in-memory counters.
+    pub fn index_progress(&self, what: &str) -> rusqlite::Result<(i64, i64)> {
+        let (total_cond, done_cond) = match what {
+            "text" => ("missing=0", "missing=0 AND text_state!='pending'"),
+            "embed" => ("missing=0", "missing=0 AND embed_state!='pending'"),
+            // A combined auto task is complete for a file only after both
+            // stages have been attempted. `skip` and `fail` are terminal for
+            // progress purposes, while pending remains resumable.
+            _ => ("missing=0", "missing=0 AND text_state!='pending' AND embed_state!='pending'"),
+        };
+        let c = self.conn.lock();
+        let total: i64 = c.query_row(
+            &format!("SELECT COUNT(*) FROM files WHERE {total_cond}"),
+            [],
+            |r| r.get(0),
+        )?;
+        let completed: i64 = c.query_row(
+            &format!("SELECT COUNT(*) FROM files WHERE {done_cond}"),
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((total, completed.min(total)))
+    }
+
+    /// Return progress for only the files below the requested scan roots.
+    pub fn index_progress_in_roots(
+        &self,
+        what: &str,
+        roots: &[String],
+    ) -> rusqlite::Result<(i64, i64)> {
+        if roots.is_empty() {
+            return Ok((0, 0));
+        }
+        let done_expr = match what {
+            "text" => "text_state!='pending'",
+            "embed" => "embed_state!='pending'",
+            _ => "text_state!='pending' AND embed_state!='pending'",
+        };
+        let mut scope = String::from("missing=0 AND (");
+        let mut args: Vec<rusqlite::types::Value> = Vec::with_capacity(roots.len() * 3);
+        for (index, root) in roots.iter().enumerate() {
+            if index > 0 {
+                scope.push_str(" OR ");
+            }
+            let (exact, lower, upper) = index_root_bounds(root);
+            let base = index * 3 + 1;
+            scope.push_str(&format!(
+                "(path=?{base} COLLATE NOCASE OR (path COLLATE NOCASE>=?{} AND path COLLATE NOCASE<?{}))",
+                base + 1,
+                base + 2
+            ));
+            args.extend([exact.into(), lower.into(), upper.into()]);
+        }
+        scope.push(')');
+
+        let c = self.conn.lock();
+        let total: i64 = c.query_row(
+            &format!("SELECT COUNT(*) FROM files WHERE {scope}"),
+            rusqlite::params_from_iter(args.clone()),
+            |row| row.get(0),
+        )?;
+        let completed: i64 = c.query_row(
+            &format!("SELECT COUNT(*) FROM files WHERE {scope} AND {done_expr}"),
+            rusqlite::params_from_iter(args),
+            |row| row.get(0),
+        )?;
+        Ok((total, completed.min(total)))
     }
 
     // ---------------- 规则 / 分类 / 日志
@@ -494,6 +772,146 @@ impl Db {
             params![ts, kind, msg],
         )?;
         Ok(())
+    }
+
+    pub fn upsert_index_root(
+        &self,
+        root: &str,
+        last_scan: i64,
+        files: i64,
+        bytes: i64,
+        added: i64,
+        updated: i64,
+        skipped: i64,
+        errors: i64,
+        missing: i64,
+        last_error: &str,
+    ) -> rusqlite::Result<()> {
+        let root = crate::util::norm_path(root);
+        let c = self.conn.lock();
+        c.execute(
+            "INSERT INTO index_roots(root,last_scan,files,bytes,added,updated,skipped,errors,missing,last_error)\
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)\
+             ON CONFLICT(root) DO UPDATE SET last_scan=excluded.last_scan,files=excluded.files,\
+             bytes=excluded.bytes,added=excluded.added,updated=excluded.updated,skipped=excluded.skipped,\
+             errors=excluded.errors,missing=excluded.missing,last_error=excluded.last_error",
+            params![root, last_scan, files, bytes, added, updated, skipped, errors, missing, last_error],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_index_root_enabled(&self, root: &str, enabled: bool) -> rusqlite::Result<()> {
+        let root = crate::util::norm_path(root);
+        let c = self.conn.lock();
+        c.execute(
+            "INSERT INTO index_roots(root,enabled) VALUES(?1,?2)\
+             ON CONFLICT(root) DO UPDATE SET enabled=excluded.enabled",
+            params![root, if enabled { 1 } else { 0 }],
+        )?;
+        Ok(())
+    }
+
+    pub fn ensure_index_root(&self, root: &str) -> rusqlite::Result<()> {
+        let root = crate::util::norm_path(root);
+        let c = self.conn.lock();
+        c.execute("INSERT OR IGNORE INTO index_roots(root) VALUES(?1)", params![root])?;
+        Ok(())
+    }
+
+    pub fn sync_index_roots(&self, roots: &[String], disabled: &[String]) -> rusqlite::Result<()> {
+        let disabled: std::collections::HashSet<String> = disabled
+            .iter()
+            .map(|root| crate::util::norm_path(root).to_ascii_lowercase())
+            .collect();
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        tx.execute("UPDATE index_roots SET enabled=0", [])?;
+        for root in roots {
+            let normalized = crate::util::norm_path(root);
+            let enabled = !disabled.contains(&normalized.to_ascii_lowercase());
+            tx.execute(
+                "INSERT INTO index_roots(root,enabled) VALUES(?1,?2)\
+                 ON CONFLICT(root) DO UPDATE SET enabled=excluded.enabled",
+                params![normalized, if enabled { 1 } else { 0 }],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn index_roots(&self) -> rusqlite::Result<Vec<IndexRoot>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT root,enabled,last_scan,added,updated,skipped,errors,missing,last_error \
+             FROM index_roots ORDER BY root",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(IndexRoot {
+                root: r.get(0)?, enabled: r.get::<_, i64>(1)? != 0, last_scan: r.get(2)?,
+                files: 0, bytes: 0, added: r.get(3)?, updated: r.get(4)?,
+                skipped: r.get(5)?, errors: r.get(6)?, missing: r.get(7)?, text_ok: 0,
+                last_error: r.get(8)?, embed_ok: 0, completed: 0, text_pending: 0, embed_pending: 0, kinds: Vec::new(),
+            })
+        })?;
+        let mut roots = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(st);
+        drop(c);
+        for root in &mut roots {
+            let (files, bytes, text_ok, embed_ok, completed, text_pending, embed_pending, kinds) =
+                self.index_root_file_stats(&root.root)?;
+            root.files = files;
+            root.bytes = bytes;
+            root.text_ok = text_ok;
+            root.embed_ok = embed_ok;
+            root.completed = completed;
+            root.text_pending = text_pending;
+            root.embed_pending = embed_pending;
+            root.kinds = kinds;
+        }
+        Ok(roots)
+    }
+
+    fn index_root_file_stats(&self, root: &str) -> rusqlite::Result<(i64, i64, i64, i64, i64, i64, i64, Vec<IndexKindStat>)> {
+        let root = crate::util::norm_path(root);
+        let (exact, lower, upper) = index_root_bounds(&root);
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            r#"SELECT kind,COUNT(*),COALESCE(SUM(size),0),
+               COALESCE(SUM(CASE WHEN text_state='ok' THEN 1 ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN embed_state='ok' THEN 1 ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN text_state!='pending' AND embed_state!='pending' THEN 1 ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN text_state IN ('pending','fail') THEN 1 ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN embed_state IN ('pending','fail') THEN 1 ELSE 0 END),0)
+               FROM files
+               WHERE missing=0 AND (path=?1 COLLATE NOCASE OR (path COLLATE NOCASE>=?2 AND path COLLATE NOCASE<?3))
+               GROUP BY kind ORDER BY 2 DESC"#,
+        )?;
+        let rows = st.query_map(params![exact, lower, upper], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+            ))
+        })?;
+        let mut totals = (0, 0, 0, 0, 0, 0, 0);
+        let mut kinds = Vec::new();
+        for row in rows {
+            let (kind, count, bytes, text_ok, embed_ok, completed, text_pending, embed_pending) = row?;
+            totals.0 += count;
+            totals.1 += bytes;
+            totals.2 += text_ok;
+            totals.3 += embed_ok;
+            totals.4 += completed;
+            totals.5 += text_pending;
+            totals.6 += embed_pending;
+            kinds.push(IndexKindStat { kind, count, bytes });
+        }
+        Ok((totals.0, totals.1, totals.2, totals.3, totals.4, totals.5, totals.6, kinds))
     }
 
     pub fn recent_activity(&self, limit: usize, kind: Option<&str>) -> rusqlite::Result<Vec<Activity>> {
@@ -570,6 +988,18 @@ impl Db {
     }
 }
 
+fn index_root_bounds(root: &str) -> (String, String, String) {
+    let exact = crate::util::norm_path(root);
+    let mut lower = exact.clone();
+    if !lower.ends_with('\\') {
+        lower.push('\\');
+    }
+    let mut upper = lower.clone();
+    upper.pop();
+    upper.push(']');
+    (exact, lower, upper)
+}
+
 fn row_to_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileRow> {
     Ok(FileRow {
         id: r.get(0)?,
@@ -588,4 +1018,72 @@ fn row_to_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileRow> {
         category: r.get(13)?,
         tags: r.get(14)?,
     })
+}
+
+#[cfg(test)]
+mod index_progress_tests {
+    use super::*;
+
+    #[test]
+    fn progress_counts_attempted_files_once_and_persists_task_kind() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let first = db.upsert_file(&FileRow::new("C:\\docs\\first.pdf")).unwrap();
+        let second = db.upsert_file(&FileRow::new("C:\\docs\\second.pdf")).unwrap();
+
+        assert_eq!(db.index_progress("auto").unwrap(), (2, 0));
+        db.set_state(first, "text", "ok").unwrap();
+        assert_eq!(db.index_progress("auto").unwrap(), (2, 0));
+        db.set_state(first, "embed", "fail").unwrap();
+        db.set_state(second, "text", "skip").unwrap();
+        db.set_state(second, "embed", "ok").unwrap();
+        assert_eq!(db.index_progress("auto").unwrap(), (2, 2));
+        assert_eq!(db.index_progress("text").unwrap(), (2, 2));
+
+        assert_eq!(
+            db.index_progress_in_roots("auto", &["C:\\docs".to_string()])
+                .unwrap(),
+            (2, 2)
+        );
+        assert_eq!(
+            db.index_progress_in_roots("auto", &["C:\\other".to_string()])
+                .unwrap(),
+            (0, 0)
+        );
+
+        db.set_meta("index_progress_what", "embed").unwrap();
+        assert_eq!(db.get_meta("index_progress_what").unwrap().as_deref(), Some("embed"));
+    }
+
+    #[test]
+    fn index_root_stats_are_isolated_for_similar_roots() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let roots = vec!["C:\\docs-a\\".to_string(), "C:\\docs-b".to_string()];
+        db.sync_index_roots(&roots, &[]).unwrap();
+
+        let mut first = FileRow::new("C:\\docs-a\\one.txt");
+        first.size = 11;
+        first.kind = "text".into();
+        db.upsert_file(&first).unwrap();
+        let mut second = FileRow::new("C:\\docs-a\\two.txt");
+        second.size = 13;
+        second.kind = "text".into();
+        db.upsert_file(&second).unwrap();
+        let mut other = FileRow::new("C:\\docs-b\\three.txt");
+        other.size = 17;
+        other.kind = "text".into();
+        db.upsert_file(&other).unwrap();
+        let mut sibling = FileRow::new("C:\\docs-ab\\outside.txt");
+        sibling.size = 23;
+        sibling.kind = "text".into();
+        db.upsert_file(&sibling).unwrap();
+
+        let stats = db.index_roots().unwrap();
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].root, "C:\\docs-a\\");
+        assert_eq!(stats[0].files, 2);
+        assert_eq!(stats[0].bytes, 24);
+        assert_eq!(stats[1].root, "C:\\docs-b");
+        assert_eq!(stats[1].files, 1);
+        assert_eq!(stats[1].bytes, 17);
+    }
 }

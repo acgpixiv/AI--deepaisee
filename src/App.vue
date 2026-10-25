@@ -1,219 +1,155 @@
 <script setup lang="ts">
-// deepaisee 主界面：搜索 / 树状图 / 扫描索引 / 模型 四模式 + 设置抽屉 + 状态栏
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
+import { Database, Search, Settings2 } from "lucide-vue-next";
 import { api } from "./api";
-import { refreshInfo, refreshModel, refreshStats, store } from "./store";
+import { refreshInfo, refreshStats, store } from "./store";
 import SearchView from "./views/SearchView.vue";
 import TreeView from "./views/TreeView.vue";
-import ScanView from "./views/ScanView.vue";
-import ModelsView from "./views/ModelsView.vue";
 import SettingsDrawer from "./components/SettingsDrawer.vue";
 
-const mode = ref<"search" | "tree" | "scan" | "models">("search");
-const drawer = ref(false);
-const drawerTab = ref("settings");
+type Page = "home" | "tree" | "settings";
+const page = ref<Page>("home");
+const settingsTab = ref("index");
 const thumbDir = ref("");
-const indexLabel = ref("");
+let statsTimer: number | undefined;
 
-const searchRef = ref<InstanceType<typeof SearchView> | null>(null);
-
-const MODES = [
-  { k: "search", t: "搜索 / 相似", icon: "⌕" },
-  { k: "tree", t: "树状图", icon: "▦" },
-  { k: "scan", t: "扫描 / 索引", icon: "⟳" },
-  { k: "models", t: "模型", icon: "◆" },
-] as const;
-
-function openDrawer(tab = "settings") {
-  drawerTab.value = tab;
-  drawer.value = true;
+function showSettings(tab = "index") {
+  settingsTab.value = tab;
+  page.value = "settings";
 }
 
-let tick: number | undefined;
-
 onMounted(async () => {
-  await refreshInfo();
-  await refreshModel();
-  await refreshStats();
+  await Promise.all([refreshInfo(), refreshStats()]);
   try {
-    const dir = await api.dataDir();
-    thumbDir.value = `${dir}\\thumbs`;
+    thumbDir.value = `${await api.dataDir()}\\thumbs`;
   } catch {}
-  tick = window.setInterval(async () => {
-    await refreshStats();
-    await refreshModel(); // 后端是异步加载模型的，加载完成后要自动反映到状态栏
-    const s = store.stats;
-    indexLabel.value = s ? `索引 ${s.files.toLocaleString()} 个文件 · ${s.bytes_label}` : "";
-  }, 3000);
+  statsTimer = window.setInterval(refreshStats, 5000);
 });
 
 onBeforeUnmount(() => {
-  if (tick) window.clearInterval(tick);
+  if (statsTimer) window.clearInterval(statsTimer);
 });
-
-const modelText = computed(() => {
-  const m = store.model;
-  if (!m) return "模型未就绪";
-  if (!m.ready) return "模型未加载";
-  return `${m.backend} · ${m.dim} 维 · ${m.device}`;
-});
-
-const modelOk = computed(() => !!store.model?.ready);
 </script>
 
 <template>
-  <div class="app">
-    <!-- 顶栏 -->
-    <header class="top">
-      <div class="brand">
-        <span class="logo">deepaisee</span>
-        <span class="ver">v{{ store.info?.display_version || "0.01" }}</span>
-      </div>
-      <nav class="modes">
-        <button
-          v-for="m in MODES"
-          :key="m.k"
-          class="mode"
-          :class="{ active: mode === m.k }"
-          @click="mode = m.k as any"
-        >
-          <span class="ic">{{ m.icon }}</span>{{ m.t }}
-        </button>
-      </nav>
-      <span class="grow"></span>
-      <span class="stat muted">{{ indexLabel }}</span>
-      <button class="ghost" @click="openDrawer('lan')">局域网</button>
-      <button class="ghost" @click="openDrawer('log')">日志</button>
-      <button class="ghost" @click="mode = 'models'">模型</button>
-      <button class="primary" @click="openDrawer('settings')">设置</button>
+  <div class="app-shell">
+    <header class="topbar">
+      <button
+        v-if="page === 'settings'"
+        class="search-link"
+        aria-label="文件搜索"
+        @click="page = 'home'"
+      >
+        <Search :size="18" aria-hidden="true" />
+        <span>文件搜索</span>
+      </button>
+      <button
+        class="index-link"
+        :class="{ current: page === 'tree' }"
+        :title="page === 'tree' ? '返回搜索主页' : '查看目录树状图'"
+        @click="page = page === 'tree' ? 'home' : 'tree'"
+      >
+        <Database :size="15" aria-hidden="true" />
+        <span>
+          {{ (store.stats?.files ?? 0).toLocaleString() }} 个文件
+          <span class="index-divider">·</span>
+          {{ store.stats?.bytes_label ?? "0 B" }}
+        </span>
+      </button>
+      <button class="icon-button settings-button" title="设置" aria-label="设置" @click="page === 'settings' ? (page = 'home') : showSettings()">
+        <Settings2 :size="19" aria-hidden="true" />
+      </button>
     </header>
 
-    <!-- 主体 -->
-    <main class="body">
-      <div class="pane">
-        <SearchView v-show="mode === 'search'" ref="searchRef" :thumb-dir="thumbDir" />
-        <TreeView v-if="mode === 'tree'" />
-        <ScanView v-if="mode === 'scan'" />
-        <ModelsView v-if="mode === 'models'" />
-      </div>
+    <main class="app-content">
+      <SearchView v-if="page === 'home'" :thumb-dir="thumbDir" />
+      <TreeView v-else-if="page === 'tree'" />
       <SettingsDrawer
-        :open="drawer"
-        :tab="drawerTab"
-        @close="drawer = false"
-        @tab="drawerTab = $event"
+        v-else
+        :open="true"
+        :tab="settingsTab"
+        @tab="settingsTab = $event"
       />
     </main>
 
-    <!-- 状态栏 -->
-    <footer class="foot">
-      <span class="dot" :class="{ on: modelOk }"></span>
-      <span class="mono">{{ modelText }}</span>
-      <span class="sep">|</span>
-      <span class="muted" v-if="store.stats">
-        {{ store.stats.files.toLocaleString() }} 个文件 ·
-        {{ store.stats.bytes_label }} ·
-        正文 {{ store.stats.text_ok }} · 向量 {{ store.stats.embed_ok }}
-      </span>
-      <span class="grow"></span>
-      <span class="muted tiny">本地离线 · 数据不出机器</span>
-    </footer>
-
-    <!-- 提示条 -->
-    <div class="toasts">
-      <div v-for="t in store.toasts" :key="t.id" class="toast" :class="t.level">
-        {{ t.text }}
+    <div class="toasts" aria-live="polite">
+      <div v-for="item in store.toasts" :key="item.id" class="toast" :class="item.level">
+        {{ item.text }}
       </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.app {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-.top {
+.app-shell { height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.topbar {
+  height: 54px;
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 10px 16px;
+  gap: 12px;
+  padding: 0 22px;
   border-bottom: 1px solid var(--border);
-  background: linear-gradient(180deg, #131b2b, #0e1420);
+  background: var(--bg);
   flex: none;
 }
-.brand { display: flex; align-items: baseline; gap: 8px; }
-.logo {
-  font-size: 19px;
-  font-weight: 700;
-  letter-spacing: .5px;
-  background: linear-gradient(90deg, #6ea8ff, #22c55e);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-.ver { font-size: 11px; color: var(--muted); }
-.modes { display: flex; gap: 4px; }
-.mode {
+.search-link {
+  width: 36px;
+  height: 36px;
+  flex: none;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  background: transparent;
-  border: 1px solid transparent;
-  padding: 6px 14px;
-  border-radius: 8px;
-  color: var(--muted);
-  font-size: 13px;
-}
-.mode:hover { background: rgba(79, 140, 255, .08); color: var(--text); }
-.mode.active {
-  background: rgba(79, 140, 255, .16);
-  border-color: rgba(79, 140, 255, .45);
-  color: #dce8ff;
-}
-.ic { font-size: 14px; }
-.grow { flex: 1; }
-.stat { font-size: 12px; }
-.body { flex: 1; position: relative; min-height: 0; display: flex; }
-.pane { flex: 1; padding: 10px 12px; min-width: 0; min-height: 0; }
-.pane > * { height: 100%; }
-.foot {
-  display: flex;
-  align-items: center;
+  justify-content: flex-start;
   gap: 8px;
-  padding: 5px 14px;
-  border-top: 1px solid var(--border);
-  background: #0d131e;
-  font-size: 11px;
+  padding: 0 8px;
+  overflow: hidden;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text);
+  white-space: nowrap;
+  transition: width .16s ease, border-color .16s ease, background .16s ease;
+}
+.search-link :deep(svg) { width: 18px; height: 18px; flex: none; }
+.search-link span { width: 0; overflow: hidden; opacity: 0; transition: width .16s ease, opacity .16s ease; }
+.search-link:hover, .search-link:focus-visible { width: 112px; border-color: var(--border); background: var(--panel); }
+.search-link:hover span, .search-link:focus-visible span { width: 56px; opacity: 1; }
+.index-link {
+  min-width: 210px;
+  margin-left: auto;
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  background: transparent;
   color: var(--muted);
-  flex: none;
-}
-.dot { width: 7px; height: 7px; border-radius: 50%; background: #64748b; }
-.dot.on { background: #22c55e; box-shadow: 0 0 8px rgba(34, 197, 94, .7); }
-.sep { color: #33415c; }
-.tiny { font-size: 11px; }
-.toasts {
-  position: fixed;
-  right: 16px;
-  bottom: 40px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  z-index: 90;
-  pointer-events: none;
-}
-.toast {
-  background: #1b2436;
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--accent);
-  border-radius: 8px;
-  padding: 8px 14px;
   font-size: 12px;
-  max-width: 460px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, .5);
+  font-variant-numeric: tabular-nums;
 }
-.toast.ok { border-left-color: #22c55e; }
-.toast.warn { border-left-color: #f59e0b; }
-.toast.error { border-left-color: #ef4444; }
+.index-link:hover, .index-link.current { background: var(--panel); border-color: var(--border); color: var(--text); }
+.index-divider { padding: 0 3px; color: #59615d; }
+.index-link :deep(svg:last-child) { color: #707a73; }
+.icon-button {
+  width: 36px;
+  height: 36px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+}
+.icon-button:hover { background: var(--panel); border-color: var(--border); color: var(--text); }
+.settings-button { margin-left: 4px; }
+.app-content { flex: 1; min-height: 0; min-width: 0; overflow: hidden; }
+.toasts { position: fixed; right: 18px; bottom: 18px; z-index: 100; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; pointer-events: none; }
+.toast { max-width: min(420px, calc(100vw - 36px)); padding: 9px 12px; border: 1px solid var(--border); border-radius: 4px; background: #fff; color: var(--text); box-shadow: 0 5px 18px rgba(0, 0, 0, .12); font-size: 12px; }
+.toast.ok { border-color: #85b894; background: #f1faf3; color: #245a32; }
+.toast.warn { border-color: #cfad6b; background: #fffaf0; color: #715414; }
+.toast.error { border-color: #d58b86; background: #fff5f4; color: #7b2b27; }
+@media (max-width: 560px) {
+  .topbar { padding: 0 12px; }
+  .index-link { min-width: 0; gap: 6px; padding-inline: 7px; }
+  .index-link span { max-width: 175px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}
 </style>

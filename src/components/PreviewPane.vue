@@ -201,4 +201,10 @@ dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; 
   padding: 1px 6px;
 }
 .tip { font-size: 12px; color: var(--muted); line-height: 1.6; }
+.t { color: #111; }
+.mini { border-radius: 2px; background: #fff; border-color: #111; color: #111; }
+.mini:hover { background: #f0f0f0; }
+.thumb { background: #f2f2f2; border-radius: 2px; }
+.snippet { color: #333; }
+.tag { color: #222; background: #f7f7f7; border-color: #aaa; border-radius: 2px; }
 </style>

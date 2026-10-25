@@ -7,7 +7,9 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
-    watch: { ignored: ["**/src-tauri/**"] },
+    watch: {
+      ignored: ["**/src-tauri/**", "**/.tools/**", "**/data/**", "**/models/**"],
+    },
   },
   build: {
     target: "chrome105",

@@ -89,7 +89,12 @@ impl ClipModel {
 
     /// 图片 → 512 维向量（已归一化）。
     pub fn image_vec(&self, path: &Path) -> Result<Vec<f32>, String> {
-        let pixels = self.prepare_image(path)?;
+        let image = image::open(path).map_err(|e| format!("读图失败：{e}"))?;
+        self.image_data_vec(&image)
+    }
+
+    pub fn image_data_vec(&self, image: &image::DynamicImage) -> Result<Vec<f32>, String> {
+        let pixels = self.prepare_image(image)?;
         let ids = vec![101i64; MAX_TOKENS];
         let mask = vec![1i64; MAX_TOKENS];
         let ids_shape = [1i64, MAX_TOKENS as i64];
@@ -110,9 +115,8 @@ impl ClipModel {
     }
 
     /// 等比缩放 + 中心裁剪到 224×224，转 CHW 并归一化。
-    fn prepare_image(&self, path: &Path) -> Result<Vec<f32>, String> {
-        let img = image::open(path).map_err(|e| format!("读图失败：{e}"))?;
-        let img = img.to_rgb8();
+    fn prepare_image(&self, image: &image::DynamicImage) -> Result<Vec<f32>, String> {
+        let img = image.to_rgb8();
         let (w, h) = (img.width() as usize, img.height() as usize);
         if w == 0 || h == 0 {
             return Err("图片尺寸为 0".into());
@@ -255,13 +259,30 @@ pub fn resolve_dir(cfg: &crate::config::ModelConfig, app_dir: &Path, data_dir: &
 
 pub fn find_dll() -> Option<PathBuf> {
     let mut cands: Vec<PathBuf> = Vec::new();
+    // An explicit path is useful for portable installs and keeps the runtime
+    // inside the project directory instead of relying on PATH or C:\Windows.
+    if let Ok(path) = std::env::var("DEEPAISEE_ORT_DLL") {
+        if !path.trim().is_empty() {
+            cands.push(PathBuf::from(path));
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             cands.push(dir.join("onnxruntime.dll"));
+            cands.push(dir.join("resources").join("onnxruntime.dll"));
+            cands.push(dir.join("resources").join(".tools").join("onnxruntime").join("onnxruntime.dll"));
+            // Tauri's debug runner stages resources below `_up_`; keep this
+            // path for local smoke tests as well as portable debug builds.
+            cands.push(dir.join("_up_").join("onnxruntime.dll"));
+            cands.push(dir.join("_up_").join(".tools").join("onnxruntime").join("onnxruntime.dll"));
+            cands.push(dir.join("tools").join("onnxruntime").join("onnxruntime.dll"));
+            cands.push(dir.join(".tools").join("onnxruntime").join("onnxruntime.dll"));
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
         cands.push(cwd.join("onnxruntime.dll"));
+        cands.push(cwd.join("tools").join("onnxruntime").join("onnxruntime.dll"));
+        cands.push(cwd.join(".tools").join("onnxruntime").join("onnxruntime.dll"));
     }
     // 开发时 dll 放在 src-tauri 下。
     cands.push(PathBuf::from("onnxruntime.dll"));

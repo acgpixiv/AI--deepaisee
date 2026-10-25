@@ -189,6 +189,16 @@ function click(c: Cell) {
         <div class="sz" v-if="c.rect.w > 64 && c.rect.h > 44">
           {{ humanSize(c.node.size) }}
         </div>
+        <div v-if="c.node.children?.length && c.rect.w > 110 && c.rect.h > 90" class="nested-boxes">
+          <div
+            v-for="child in c.node.children.slice(0, 8)"
+            :key="child.path"
+            class="nested-box"
+            :title="`${child.name} ${humanSize(child.size)}`"
+            :style="{ flex: `${Math.max(1, child.size)} 1 0` }"
+            @click.stop="child.children?.length && emit('drill', child)"
+          >{{ child.name }}</div>
+        </div>
       </div>
     </template>
     <div class="legend">
@@ -240,6 +250,9 @@ function click(c: Cell) {
   text-shadow: 0 1px 2px #000;
 }
 .sz { font-size: 11px; color: #a9b8cf; margin-top: 2px; }
+.nested-boxes { position: absolute; left: 4px; right: 4px; bottom: 4px; height: 34%; display: flex; gap: 2px; align-items: stretch; }
+.nested-box { min-width: 0; overflow: hidden; display: flex; align-items: flex-end; padding: 3px 4px; border: 1px solid rgba(17,17,17,.42); background: rgba(255,255,255,.42); color: #333; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.nested-box:hover { background: rgba(17,17,17,.13); color: #111; }
 .legend {
   position: absolute;
   right: 8px;
@@ -256,4 +269,11 @@ function click(c: Cell) {
 .lg { display: inline-flex; align-items: center; gap: 4px; }
 .lg i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
 .sum { color: #c4d0e3; }
+/* Preserve type-color coding while keeping text and controls monochrome. */
+.cell { border-radius: 2px; }
+.cell.hot { background: rgba(17, 17, 17, .12) !important; }
+.nm { color: #111; text-shadow: none; }
+.sz { color: #444; }
+.legend { color: #333; background: rgba(255, 255, 255, .94); border: 1px solid #111; border-radius: 2px; }
+.sum { color: #111; }
 </style>

@@ -84,17 +84,35 @@ GitHub 单文件硬上限 100MB，下面这些放不进 Git，**需要自己补*
 **先把 llama.cpp 源码放到 `vendor/llama.cpp`**（不入库，需 clone）：
 
 ```bat
-git clone --depth 1 https://github.com/ggml-org/llama.cpp vendor/llama.cpp
+git clone --depth 1 --branch b9999 https://github.com/ggml-org/llama.cpp vendor/llama.cpp
 ```
 
-`--features llama` 会通过 `src-tauri/native/CMakeLists.txt` 把 `vendor/llama.cpp` 编成静态库。
+本项目按 `b9999` 验证 llama.cpp C ABI；不要直接跟随上游默认分支，否则 `llama.h` 变动可能导致原生构建失败。
+
+Windows 开发机可运行一次性依赖脚本安装 Rust MSVC 工具链、CMake、Ninja，拉取固定版本并恢复 npm/Cargo 依赖：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/bootstrap-windows.ps1
+. .\scripts\activate-local.ps1
+```
+
+便携开发依赖和缓存默认位于项目 `.tools/`，Rust 构建输出位于 `src-tauri/target/`；`.tools/` 已加入忽略规则，不会提交工具二进制。Visual Studio C++ Build Tools、Windows SDK 和 NVIDIA 驱动仍需系统安装；CUDA Toolkit 可放在 `.tools/cuda/`，也可使用已有系统安装。新开的 PowerShell 窗口需再次执行第二条激活命令。
+
+ONNX Runtime 也可以安装到项目目录（不会写入系统目录）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/install-onnxruntime.ps1
+```
+
+脚本优先复用项目根目录已有的 `onnxruntime.dll`，否则下载 CPU 版 NuGet 包到 `.tools/onnxruntime/`。也可以用 `DEEPAISEE_ORT_DLL` 指定便携版 DLL。ONNX Runtime 执行的是 `.onnx` 模型，不能直接读取 `.safetensors` 权重；后者需要先导出 ONNX 或使用 Python/Candle 后端。
+
+`--features llama` 会通过 `src-tauri/native/CMakeLists.txt` 把 `vendor/llama.cpp` 编成静态库。源码构建默认启用轻量的 llama.cpp；需要加载 safetensors 时加上 `candle`，发布给带 NVIDIA CUDA 的用户时把 Candle CUDA 一起编进同一个 exe（见下方发布命令）。CUDA 不是运行时下载的插件：Candle 的 CUDA kernel 在构建期需要 CUDA Toolkit/nvcc，应用运行时只负责选择具体 GPU。
 如果只想跑「不含本地推理」的部分，可以加 `--no-default-features`，此时会退化成哈希基线。
 
-```bat
-:: 前端依赖
-npm install
-
-:: 开发模式（先起 Vite，再起 Rust）
+```powershell
+# 每个新终端先激活项目内工具和缓存路径
+. .\scripts\activate-local.ps1
+npm ci
 npm run tauri dev
 ```
 
@@ -102,12 +120,12 @@ npm run tauri dev
 
 | 组件 | 版本 | 说明 |
 | --- | --- | --- |
-| Rust | 1.77.2+ | 目标 `x86_64-pc-windows-gnu`（MSVC 也可） |
-| MSYS2 UCRT64 | gcc 16.2 | `build.rs` 会按 `DEEPAISEE_UCRT64_BIN` → PATH → `C:\msys64\ucrt64\bin` 顺序找 |
+| Rust | 1.77.2+ | 推荐目标 `x86_64-pc-windows-msvc` |
+| Visual Studio C++ Build Tools | 2022 | MSVC 编译器和 Windows SDK |
 | Node.js | 20+ | 前端构建 |
 | CMake + Ninja | 3.20+ | 编 llama.cpp |
 
-若 MSYS2 装在非默认路径，设环境变量：
+MSYS2 UCRT64/GCC 仅用于非 CUDA 的 GNU 构建；CUDA 需要 MSVC。若 MSYS2 装在非默认路径，设环境变量：
 
 ```bat
 set DEEPAISEE_UCRT64_BIN=D:\your\msys64\ucrt64\bin
@@ -115,26 +133,41 @@ set DEEPAISEE_UCRT64_BIN=D:\your\msys64\ucrt64\bin
 
 ### 3. 构建发布版
 
-```bat
-npm run build
-cd src-tauri && cargo build --release --features llama,custom-protocol
+常规发布直接运行项目内脚本即可。它会自动检测 `.tools/cuda/` 或系统 CUDA Toolkit：找到时生成包含 llama.cpp CUDA 与 Candle CUDA 的单一 exe，运行时再由设置页选择具体显卡；找不到时生成不含 CUDA kernel 的原生 Candle/llama.cpp 版本。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1
 ```
+
+也可以直接运行 `npm run tauri:release`；脚本会在项目目录或系统中找到 CUDA Toolkit 时自动把 Candle CUDA 集成进同一个 exe，并在没有 Toolkit 时生成不含 CUDA kernel 的原生版本。
+
+需要额外传给 Tauri 的参数可以继续放在脚本后面，例如 `--bundles nsis`。
+
+也可以显式使用 CUDA feature 构建：
+
+```powershell
+npm run tauri build -- --features llama,candle,candle-cuda,custom-protocol
+```
+
+上面的发布命令会把 llama.cpp、Candle 和 Candle CUDA 后端编译进同一个安装包。它不要求用户在安装后选择 Cargo feature；用户只在设置页选择系统中可用的显卡，运行时按所选设备建立 Candle/llama.cpp 上下文。NVIDIA CUDA 版的构建机需要兼容的 CUDA Toolkit，并从 MSVC 开发终端构建。Toolkit 可解压/安装在项目 `.tools/cuda/`，或使用系统安装；先激活本地环境会自动探测两者：
+
+```powershell
+. .\scripts\activate-local.ps1
+$env:DEEPAISEE_CUDA = '1'
+npm run tauri build -- --features llama,candle,candle-cuda,custom-protocol
+```
+
+验证记录：本项目已在 CUDA Toolkit 13.1 + Visual Studio 2022/MSVC 下完成 CUDA Release 编译和链接。直接运行 Cargo 构建时，可执行文件位于 `src-tauri/target/release/deepaisee.exe`；发布包可用上面的 Tauri 命令生成。CUDA 运行仍需要驱动和 CUDA/cuBLAS 运行时 DLL，应用会优先从项目 `.tools/cuda/` 或安装目录加载，不会替用户改系统磁盘布局。没有 NVIDIA CUDA 的机器仍可使用同一个 exe 的 llama.cpp/Vulkan 路径；Candle 模型会报告当前设备不可用，而不会悄悄回退到 CPU。
 
 **`custom-protocol` 这个 feature 不能漏**。它由 `tauri-build` 在构建脚本里读到，决定前端资源是「从磁盘内嵌协议加载」还是「连 `http://localhost:1420` 的开发服务器」；漏了这个 feature 也能编过，但打出来的 exe 双击后是**白屏**（只在 debug 下连 dev server，release 下没有服务器可连）。
 
 ---
 
-## 二、四模式界面
+## 二、界面结构
 
-顶栏模式按钮切换：
+首页默认显示打字机标题和胶囊搜索框；输入后搜索栏收缩到顶部，结果以按相关度排序的图库卡片显示，并保留类型筛选、全文/拼音/模糊/语义/跨模态开关、相似检索、预览、定位和导出。顶栏只显示索引文件数与占用大小，点击它进入树状图，右侧齿轮进入设置。
 
-| 视图 | 做什么 |
-| --- | --- |
-| **搜索 / 相似** | 输入框搜文件名、正文、拼音、或一句话做语义搜索；选中文件点「找相似」进入相似模式 |
-| **树状图** | 按目录体积的 treemap，双击下钻，右侧列出各目录占比 |
-| **扫描 / 索引** | 添加扫描目录、勾选文件类型、开始/取消扫描、查看索引进度、重建索引 |
-| **模型** | 列出模型目录里的 GGUF，一键切换嵌入模型、导入、删除、切回哈希基线 |
-| **设置抽屉** | 分类规则、局域网、日志、设置四个分页（模型已独立成页） |
+设置页的左栏固定分为四个标签：**文件索引**（扫描、索引参数、规则和数据库维护）、**模型配置**（GGUF、GPU 设备、上下文、CLIP/CLAP）、**局域网配置**（服务与实时监控）和**日志**（活动记录）。每个标签只提交自身的配置片段，避免修改一项覆盖其它设置。
 
 搜索页的细节：
 - 四个开关控制检索通道：**全文**（文档正文）、**拼音**（`huiyijilu` / `hyjl` → 会议记录）、**找图找声**（一句话找图片/音频/视频）、**语义**（一句话找意思相近的文件）
@@ -338,10 +371,10 @@ data\
 
 | 操作 | 说明 |
 | --- | --- |
-| **查看** | 列出 `<exe>\models\`（没有则用 `data\models\`）里所有 `.gguf`，显示大小、修改时间、类型、是否为当前模型 |
+| **查看** | 列出 `<exe>\models\`（没有则用 `data\models\`）里所有 `.gguf` 与 `.safetensors`，显示大小、修改时间、格式、候选后端和是否为当前模型 |
 | **筛选** | 全部 / 嵌入 / 对话 / 投影 四类；按文件名关键字自动归类 |
-| **切换** | 点「设为嵌入模型」即时加载，状态栏立刻变成 `llama.cpp · 768 维 · cpu` |
-| **导入** | 从任意位置复制 GGUF 进模型目录，重名自动加序号 |
+| **切换** | 点「设为嵌入模型」即时加载，状态栏显示实际 GPU 名称和向量维度 |
+| **导入** | 从任意位置选择模型文件夹，自动识别 GGUF、EmbeddingGemma2 safetensors 及配套配置，重名自动加序号 |
 | **删除** | 删除模型文件；**正在使用的模型不允许删除** |
 | **切回哈希基线** | 不加载任何模型文件，秒启动，用于验证「是不是模型的问题」 |
 
@@ -351,9 +384,13 @@ data\
 
 ## 八、调优
 
-**模型路径**：`data\config.json` 的 `model.embed_model` 指向 `.gguf` 文件；留空则回退「哈希基线」（不需要模型，256 维，只适合演示）。
+**模型路径**：`data\config.json` 的 `model.embed_model` 指向 `.gguf` 或兼容目录中的 `model.safetensors`；留空则回退「哈希基线」（不需要模型，256 维，只适合演示）。EmbeddingGemma2 safetensors 由 Candle 原生适配器加载，未知架构只标记为 Python 候选，需在设置页安装可选 sidecar。
 
-**显存**：`model.n_gpu_layers` 设为 0 是纯 CPU；改成 99 会把全部层放到 GPU（需要自己编译带 CUDA 的 llama.cpp 后端）。
+**GPU**：模型设置页会列出当前构建实际支持的 GPU/核显，显示完整名称、总显存和空闲显存，并按显存从大到小排列。`model.gpu_device = "auto"` 默认选择显存最大的设备。llama.cpp 文本模型会将全部模型层放到所选 GPU；没有可用加速后端、所选设备失效或显存不足时会直接显示错误，不会退回 CPU。当前仓库附带的 `deepaisee.exe` 是旧 CPU 构建，不能代表源码构建的 GPU 能力。
+
+构建脚本会自动探测项目 `.tools/cuda/` 或系统 CUDA Toolkit 并为 llama.cpp 启用 CUDA；包含 Candle CUDA 的发布构建请使用上一节的 `--features llama,candle,candle-cuda,custom-protocol`。这会生成一个同时包含两种原生后端的 exe，运行时通过设置页选择具体 GPU。运行时需要 CUDA Runtime/cuBLAS DLL 在 `PATH` 或应用目录，Windows GNU 工具链不支持该 CUDA 路径。设置 `DEEPAISEE_CUDA=0` 可显式关闭 llama.cpp 的 CUDA 构建；Candle CUDA 编译仍需要构建时存在 Toolkit。
+
+要让设置页列出 Intel/AMD 核显，需要把 Vulkan SDK（必须含 `Include/vulkan/vulkan.h` 和 `Bin/glslc.exe`）放到项目 `.tools/vulkan`；构建脚本会自动探测，也可显式设置 `$env:DEEPAISEE_VULKAN='1'`。项目会通过 GGML Vulkan 枚举离散 GPU 和集成 GPU；没有 Vulkan SDK 时不会伪造核显条目。设置 `DEEPAISEE_VULKAN=0` 可显式关闭自动探测。CLIP/CLAP 的 ONNX 路径目前使用 CPU Execution Provider，与 llama.cpp 文本模型的 GPU 选择相互独立。
 
 **索引参数**：`index.max_text_chars`（单文件正文字符上限，默认 20 万）、`index.video_frames`（抽帧数）、`index.audio_seconds`（音频取样秒数）。
 

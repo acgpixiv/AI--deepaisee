@@ -46,6 +46,12 @@ const children = computed(() => {
 
 const totalSize = computed(() => children.value.reduce((a, c) => a + c.size, 0));
 const totalCount = computed(() => children.value.reduce((a, c) => a + c.count, 0));
+const kindRows = computed(() => {
+  const source = hovered.value || node.value;
+  return Object.entries(source?.kinds || {})
+    .map(([kind, count]) => ({ kind, count }))
+    .sort((a, b) => b.count - a.count);
+});
 
 function share(s: number): string {
   if (!totalSize.value) return "0%";
@@ -89,6 +95,13 @@ onMounted(() => load());
         <div class="sh">
           {{ hovered ? hovered.name : "目录占比" }}
         </div>
+        <div v-if="kindRows.length" class="kind-cards">
+          <div v-for="row in kindRows" :key="row.kind" class="kind-card">
+            <span class="dot" :style="{ background: kindColor(row.kind) }"></span>
+            <span>{{ row.kind }}</span>
+            <b class="mono">{{ row.count }}</b>
+          </div>
+        </div>
         <div class="list">
           <div
             v-for="c in children.slice(0, 60)"
@@ -126,6 +139,10 @@ onMounted(() => load());
 .side { display: flex; flex-direction: column; overflow: hidden; }
 .sh { padding: 10px 12px; font-size: 13px; color: #b7c4da; border-bottom: 1px solid var(--border); }
 .list { flex: 1; overflow: auto; min-height: 0; }
+.kind-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; padding: 8px; border-bottom: 1px solid #111; }
+.kind-card { min-width: 0; display: flex; align-items: center; gap: 5px; padding: 6px 7px; border: 1px solid #aaa; background: #fafafa; font-size: 10px; }
+.kind-card > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kind-card b { margin-left: auto; font-weight: 500; }
 .item {
   display: grid;
   grid-template-columns: 10px 1fr 78px 52px;
@@ -143,4 +160,14 @@ onMounted(() => load());
 .none { padding: 20px; text-align: center; color: var(--muted); font-size: 12px; }
 .foot { padding: 8px 12px; border-top: 1px solid var(--border); }
 .tiny { font-size: 11px; }
+/* Flat white/black tree surface. */
+.view { color: #111; }
+.bar { border-bottom: 1px solid #111; padding-bottom: 8px; }
+.crumb .c, .crumb .c.last, .sh, .num, .pct { color: #111; }
+.sep { color: #777; }
+.chart, .side { border: 1px solid #111; border-radius: 2px; background: #fff; }
+.sh { border-color: #111; }
+.item { border-bottom-color: #ddd; }
+.item:hover { background: #f0f0f0; }
+.sel { border-color: #111; border-radius: 2px; background: #fff; color: #111; }
 </style>

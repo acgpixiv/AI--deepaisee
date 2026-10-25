@@ -20,6 +20,12 @@ tools/
 
 # 依赖源码：按 README 的 clone 说明获取
 vendor/llama.cpp/
+vendor/llama-archive/
+vendor/llama-b9999.zip
+src-tauri/target-cuda-ninja/
+src-tauri/cmake-check/
+target-candle-check/
+.tools/
 
 # ───────── 系统与编辑器 ─────────
 Thumbs.db

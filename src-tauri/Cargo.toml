@@ -21,8 +21,13 @@ cmake = "0.1"
 [features]
 # 默认就带上 llama.cpp：否则 `tauri build` 不带 --features llama 时会编译出
 # 一个没有本地推理能力的版本，运行时悄悄退回哈希基线（表现为状态栏 hash · 256 维）。
-default = ["llama"]
+default = ["llama", "candle-cuda"]
 llama = []
+candle = ["dep:embeddinggemma2"]
+candle-cuda = ["candle", "embeddinggemma2/cuda"]
+# 发布构建的便捷别名：把 Candle CUDA 与原生 Candle 一起放入同一个 exe。
+# 设备编号不在 Cargo feature 中固定，运行时由设置页传入。
+cuda = ["candle-cuda"]
 # 打包版必须开：tauri 的 build.rs 用 tauri/custom-protocol 决定 `cfg(dev)`。
 # 没有它时窗口会去连 http://localhost:1420（Vite 开发服务器），双击 exe 直接白屏。
 custom-protocol = ["tauri/custom-protocol"]
@@ -42,14 +47,17 @@ chrono = { version = "0.4", features = ["serde"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 encoding_rs = "0.8"
-pdf-extract = "0.7"
+pdf-extract = { version = "0.7", path = "../vendor/pdf-extract" }
+lopdf = { version = "0.34", default-features = false }
 pinyin = "0.10"
 base64 = "0.22"
 parking_lot = "0.12"
+rayon = "1.10"
 dirs = "5"
 open = "5"
 strsim = "0.11"
 libc = "0.2"
+embeddinggemma2 = { package = "embeddinggemma-2", path = "../vendor/embeddinggemma-2-candle", optional = true }
 
 [profile.release]
 codegen-units = 1

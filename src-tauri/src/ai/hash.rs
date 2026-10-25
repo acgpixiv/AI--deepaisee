@@ -62,6 +62,10 @@ impl HashEmbedder {
 
     fn image_vec(&self, path: &Path) -> Result<Vec<f32>, String> {
         let img = image::open(path).map_err(|e| format!("图片读取失败: {e}"))?;
+        Ok(self.image_vec_from(&img))
+    }
+
+    fn image_vec_from(&self, img: &image::DynamicImage) -> Vec<f32> {
         let small = img.resize_exact(8, 8, image::imageops::FilterType::Triangle).to_rgb8();
         let mut v = vec![0.0f32; DIM];
         let mut i = 0;
@@ -100,7 +104,7 @@ impl HashEmbedder {
         v[0] += mean;
         v[1] += (sq - mean * mean).max(0.0).sqrt();
         l2_normalize(&mut v);
-        Ok(v)
+        v
     }
 
     fn audio_vec(&self, path: &Path) -> Result<Vec<f32>, String> {
@@ -144,7 +148,9 @@ impl Embedder for HashEmbedder {
             model: "内置哈希基线".into(),
             dim: DIM,
             device: "cpu".into(),
-            modalities: vec!["text".into(), "image".into(), "audio".into(), "video".into()],
+            // Hash media features are only a fallback for similarity; they do
+            // not place media in the model's shared text space.
+            modalities: vec!["text".into()],
             ready: true,
             detail: "无需模型即可使用的确定性特征，仅用于兜底/自检".into(),
         }
@@ -157,6 +163,9 @@ impl Embedder for HashEmbedder {
     }
     fn embed_image(&self, path: &Path) -> Result<Vec<f32>, String> {
         self.image_vec(path)
+    }
+    fn embed_image_data(&self, image: &image::DynamicImage) -> Result<Vec<f32>, String> {
+        Ok(self.image_vec_from(image))
     }
     fn embed_audio(&self, path: &Path) -> Result<Vec<f32>, String> {
         self.audio_vec(path)
