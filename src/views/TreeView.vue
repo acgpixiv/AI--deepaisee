@@ -20,7 +20,7 @@ async function load(path = "", push = false) {
     if (push) trail.value.push(n);
     else if (!path) trail.value = [n];
   } catch (e) {
-    toast(`读取目录树失败：${e}`, "error");
+    toast(`${t("读取目录树失败：")}${e}`, "error");
   } finally {
     loading.value = false;
   }
@@ -69,22 +69,22 @@ onMounted(() => load());
 <template>
   <div class="view">
     <div class="bar">
-      <button class="ghost" :disabled="trail.length <= 1" @click="up">↑ 上一级</button>
+      <button class="ghost" :disabled="trail.length <= 1" @click="up">↑ {{ t("上一级") }}</button>
       <div class="crumb">
         <template v-for="(t, i) in trail" :key="t.path + i">
           <span class="sep" v-if="i">/</span>
-          <span class="c" :class="{ last: i === trail.length - 1 }">{{ t.name || "全部" }}</span>
+          <span class="c" :class="{ last: i === trail.length - 1 }">{{ t.name || t("全部") }}</span>
         </template>
       </div>
       <span class="grow"></span>
-      <span class="muted tiny">{{ totalCount.toLocaleString() }} 个文件 · {{ humanSize(totalSize) }}</span>
+      <span class="muted tiny">{{ totalCount.toLocaleString() }} {{ t("个文件") }} · {{ humanSize(totalSize) }}</span>
       <select v-model.number="depth" class="sel" @change="load(node?.path || '', false)">
-        <option :value="2">2 层</option>
-        <option :value="3">3 层</option>
-        <option :value="4">4 层</option>
-        <option :value="5">5 层</option>
+        <option :value="2">2 {{ t("层") }}</option>
+        <option :value="3">3 {{ t("层") }}</option>
+        <option :value="4">4 {{ t("层") }}</option>
+        <option :value="5">5 {{ t("层") }}</option>
       </select>
-      <button @click="load(node?.path || '', false)" :disabled="loading">刷新</button>
+      <button @click="load(node?.path || '', false)" :disabled="loading">{{ t("刷新") }}</button>
     </div>
 
     <div class="body">
@@ -93,7 +93,7 @@ onMounted(() => load());
       </div>
       <div class="side card">
         <div class="sh">
-          {{ hovered ? hovered.name : "目录占比" }}
+          {{ hovered ? hovered.name : t("目录占比") }}
         </div>
         <div v-if="kindRows.length" class="kind-cards">
           <div v-for="row in kindRows" :key="row.kind" class="kind-card">

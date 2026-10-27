@@ -344,6 +344,33 @@ pub fn scan(cfg: &ModelConfig, extra_dirs: &[PathBuf]) -> Vec<ModelEntry> {
     out
 }
 
+/// 便携版 / 安装版首次运行时 `model.embed_model` 是空的。这里在
+/// exe 同级的 `models\` 与数据目录的 `models\` 里挑一个能直接加载的嵌入模型，
+/// 让「装完就能用」成立，而不是逼用户先去设置页填路径。
+///
+/// 优先多模态 safetensors（自带视觉/音频塔），其次任意可直接加载的嵌入 GGUF。
+/// 只返回路径，是否落盘由调用方决定。
+pub fn autodetect_embed_model(cfg: &ModelConfig, app_dir: &Path, data_dir: &Path) -> Option<String> {
+    for dir in [app_dir.join("models"), data_dir.join("models")] {
+        if !dir.is_dir() {
+            continue;
+        }
+        let entries = scan(cfg, std::slice::from_ref(&dir));
+        let found = entries
+            .iter()
+            .find(|m| {
+                m.kind == "embed"
+                    && m.format == "safetensors"
+                    && m.modalities.iter().any(|x| matches!(x.as_str(), "image" | "audio" | "video"))
+            })
+            .or_else(|| entries.iter().find(|m| m.direct_loadable && m.kind == "embed"));
+        if let Some(found) = found {
+            return Some(found.path.clone());
+        }
+    }
+    None
+}
+
 fn norm(p: &str) -> String {
     p.replace('/', "\\").to_lowercase()
 }

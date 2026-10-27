@@ -2,6 +2,7 @@
 import { computed } from "vue";
 import { RefreshCw } from "lucide-vue-next";
 import type { Activity } from "../api";
+import { t } from "../i18n";
 
 const props = defineProps<{
   logs: Activity[];
@@ -22,19 +23,19 @@ const kind = computed({
 <template>
   <section class="settings-section log-section settings-log-tab">
     <div class="section-head">
-      <div><h2>活动日志</h2><p>记录扫描、索引、模型和服务状态。</p></div>
-      <button class="secondary-button" @click="props.refreshLogs"><RefreshCw :size="14" />刷新</button>
+      <div><h2>{{ t("活动日志") }}</h2><p>{{ t("记录扫描、索引、模型和服务状态。") }}</p></div>
+      <button class="secondary-button" @click="props.refreshLogs"><RefreshCw :size="14" />{{ t("刷新") }}</button>
     </div>
     <div class="log-toolbar">
       <select v-model="kind" @change="props.refreshLogs">
-        <option value="">全部</option>
-        <option value="scan">扫描</option>
-        <option value="index">索引</option>
-        <option value="model">模型</option>
-        <option value="op">文件操作</option>
-        <option value="watch">监控</option>
-        <option value="server">局域网</option>
-        <option value="error">错误</option>
+        <option value="">{{ t("全部") }}</option>
+        <option value="scan">{{ t("扫描") }}</option>
+        <option value="index">{{ t("索引") }}</option>
+        <option value="model">{{ t("模型") }}</option>
+        <option value="op">{{ t("文件操作") }}</option>
+        <option value="watch">{{ t("监控") }}</option>
+        <option value="server">{{ t("局域网") }}</option>
+        <option value="error">{{ t("错误") }}</option>
       </select>
     </div>
     <div class="logs">
@@ -43,7 +44,7 @@ const kind = computed({
         <span class="log-kind" :class="entry.kind">{{ entry.kind }}</span>
         <span>{{ entry.msg }}</span>
       </div>
-      <div v-if="!props.logs.length" class="empty-line">暂无日志</div>
+      <div v-if="!props.logs.length" class="empty-line">{{ t("暂无日志") }}</div>
     </div>
   </section>
 </template>

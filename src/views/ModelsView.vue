@@ -5,6 +5,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { AudioLines, FileText, Film, FolderOpen, Image as ImageIcon, Power, Save, SlidersHorizontal } from "lucide-vue-next";
 import { api, type AppConfig, type GpuDevice, type ModelEntry, type ModelInfo, type ModelImportResult } from "../api";
 import { refreshStats, store, toast, humanSize } from "../store";
+import { t } from "../i18n";
 
 const props = defineProps<{
   cfg?: AppConfig;
@@ -29,10 +30,10 @@ const PARALLEL_MODES = [
 ];
 
 const FILTERS = [
-  { v: "all", t: "全部" },
-  { v: "embed", t: "嵌入" },
-  { v: "chat", t: "对话" },
-  { v: "projector", t: "投影" },
+  { v: "all", label: "全部" },
+  { v: "embed", label: "嵌入" },
+  { v: "chat", label: "对话" },
+  { v: "projector", label: "投影" },
 ];
 
 async function load() {
@@ -44,7 +45,7 @@ async function load() {
     store.model = m;
     dir.value = d;
   } catch (e) {
-    toast(`读取模型列表失败：${e}`, "error");
+    toast(`${t("读取模型列表失败：")}${e}`, "error");
   } finally {
     loading.value = false;
   }
@@ -87,36 +88,36 @@ const integratedGpuNote = computed(() => {
   );
   if (!hasVulkanIntegrated) return "";
   if (activeModelFormat.value === "safetensors") {
-    return "当前 safetensors 模型仅使用 NVIDIA GPU；切换到配套 GGUF 后可尝试核显与独显协同。";
+    return t("当前 safetensors 模型仅使用 NVIDIA GPU；切换到配套 GGUF 后可尝试核显与独显协同。");
   }
   if (activeModelFormat.value === "gguf") {
-    return "当前 GGUF 模型可尝试由核显与独显共同处理索引批次；核显会共享系统内存。";
+    return t("当前 GGUF 模型可尝试由核显与独显共同处理索引批次；核显会共享系统内存。");
   }
-  return "核显与独显协同取决于当前模型格式和设备可用资源。";
+  return t("核显与独显协同取决于当前模型格式和设备可用资源。");
 });
 
 function activationLabel(model: ModelEntry): string {
-  if (busy.value === model.path) return "加载中…";
-  if (model.active) return "当前使用";
-  if (model.kind === "projector") return "配套文件";
-  return canActivate(model) ? "设为当前模型" : "缺少完整文件";
+  if (busy.value === model.path) return t("加载中…");
+  if (model.active) return t("当前使用");
+  if (model.kind === "projector") return t("配套文件");
+  return canActivate(model) ? t("设为当前模型") : t("缺少完整文件");
 }
 
 /** 把某个 GGUF 设为当前嵌入模型 */
 async function activate(m: ModelEntry) {
-  if (m.kind === "projector") return toast("这是模型配套投影文件，不能单独作为嵌入模型加载", "warn");
-  if (!canActivate(m)) return toast("此模型缺少可识别的完整配套文件，暂时不能加载", "warn");
+  if (m.kind === "projector") return toast(t("这是模型配套投影文件，不能单独作为嵌入模型加载"), "warn");
+  if (!canActivate(m)) return toast(t("此模型缺少可识别的完整配套文件，暂时不能加载"), "warn");
   busy.value = m.path;
   try {
     const out = await api.modelLoad("auto", m.path);
     info.value = out;
     store.model = out;
-    if (out.ready) toast(`已切换到 ${m.file}（${out.dim} 维）`, "ok");
-    else toast(out.detail || "模型加载失败", "warn");
+    if (out.ready) toast(`${t("已切换到")} ${m.file}（${out.dim} ${t("维")}）`, "ok");
+    else toast(out.detail || t("模型加载失败"), "warn");
     await load();
     await refreshStats();
   } catch (e) {
-    toast(`切换失败：${e}`, "error");
+    toast(`${t("切换失败：")}${e}`, "error");
   } finally {
     busy.value = "";
   }
@@ -129,11 +130,11 @@ async function useHash() {
     const out = await api.modelDeactivate();
     info.value = out;
     store.model = out;
-    toast("已停用当前模型，改用基础检索", "ok");
+    toast(t("已停用当前模型，改用基础检索"), "ok");
     await load();
     await refreshStats();
   } catch (e) {
-    toast(`切换失败：${e}`, "error");
+    toast(`${t("切换失败：")}${e}`, "error");
   } finally {
     busy.value = "";
   }
@@ -144,37 +145,37 @@ async function importFile() {
     const picked = await openDialog({
       directory: true,
       multiple: false,
-      title: "选择模型文件夹（自动识别 GGUF / safetensors）",
+      title: t("选择模型文件夹（自动识别 GGUF / safetensors）"),
     });
     if (typeof picked !== "string") return;
     busy.value = "import";
     const result: ModelImportResult = await api.modelImportFolder(picked);
     importedDir.value = result.destination;
     const loadState = result.direct_loadable || result.candidate_backends?.length
-      ? "已识别，可尝试加载"
-      : "已识别，但缺少可用的完整模型文件";
+      ? t("已识别，可尝试加载")
+      : t("已识别，但缺少可用的完整模型文件");
     const components = result.components.length ? `（${result.components.join(" + ")}）` : "";
-    const architecture = result.architecture ? `架构：${result.architecture}${components}` : `分类：${result.primary_kind}`;
-    toast(`已导入 ${result.copied_files} 个配套文件（${humanSize(result.total_bytes)}），${architecture}；${loadState}`, result.direct_loadable || result.candidate_backends?.length ? "ok" : "warn");
+    const architecture = result.architecture ? `${t("架构：")}${result.architecture}${components}` : `${t("分类：")}${result.primary_kind}`;
+    toast(`${t("已导入")} ${result.copied_files} ${t("个配套文件")}（${humanSize(result.total_bytes)}），${architecture}；${loadState}`, result.direct_loadable || result.candidate_backends?.length ? "ok" : "warn");
     for (const warning of result.warnings) toast(warning, "warn");
     await load();
   } catch (e) {
-    toast(`导入失败：${e}`, "error");
+    toast(`${t("导入失败：")}${e}`, "error");
   } finally {
     busy.value = "";
   }
 }
 
 async function remove(m: ModelEntry) {
-  if (m.active) return toast("正在使用的模型不能删除，先切换到其它模型", "warn");
-  if (!confirm(`确定删除模型文件？\n\n${m.file}\n${m.size_label}\n\n删除后不可恢复。`)) return;
+  if (m.active) return toast(t("正在使用的模型不能删除，先切换到其它模型"), "warn");
+  if (!confirm(`${t("确定删除模型文件？")}\n\n${m.file}\n${m.size_label}\n\n${t("删除后不可恢复。")}`)) return;
   busy.value = m.path;
   try {
     await api.modelDelete(m.path);
-    toast(`已删除 ${m.file}`, "ok");
+    toast(`${t("已删除")} ${m.file}`, "ok");
     await load();
   } catch (e) {
-    toast(`删除失败：${e}`, "error");
+    toast(`${t("删除失败：")}${e}`, "error");
   } finally {
     busy.value = "";
   }
@@ -184,7 +185,7 @@ async function openModelDir(m: ModelEntry) {
   try {
     await api.openPath(m.model_dir);
   } catch (e) {
-    toast(`打开模型目录失败：${e}`, "error");
+    toast(`${t("打开模型目录失败：")}${e}`, "error");
   }
 }
 
@@ -192,7 +193,7 @@ async function openImportedDir() {
   try {
     await api.openPath(importedDir.value);
   } catch (e) {
-    toast(`打开导入目录失败：${e}`, "error");
+    toast(`${t("打开导入目录失败：")}${e}`, "error");
   }
 }
 
@@ -202,15 +203,15 @@ function selectModel(model: ModelEntry) {
 
 async function saveParams() {
   if (!props.cfg || !props.saveModelConfig) {
-    toast("当前页面没有可保存的配置上下文", "warn");
+    toast(t("当前页面没有可保存的配置上下文"), "warn");
     return;
   }
   const ok = await props.saveModelConfig();
-  if (ok) toast("推理参数已保存；重新加载模型后生效", "ok");
+  if (ok) toast(t("推理参数已保存；重新加载模型后生效"), "ok");
 }
 
 function formatMemory(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "显存未知";
+  if (!Number.isFinite(bytes) || bytes <= 0) return t("显存未知");
   const gib = bytes / 1024 ** 3;
   return `${gib.toFixed(gib >= 10 ? 0 : 1)} GiB`;
 }
@@ -222,7 +223,7 @@ async function setParallelMode(mode: string) {
   if (!saved) return;
   const modelPath = props.cfg.model.embed_model.trim();
   if (!modelPath || !info.value?.ready) {
-    toast("并行策略已保存；加载嵌入模型后生效", "ok");
+    toast(t("并行策略已保存；加载嵌入模型后生效"), "ok");
     return;
   }
   busy.value = "parallel-mode";
@@ -231,9 +232,9 @@ async function setParallelMode(mode: string) {
     info.value = out;
     store.model = out;
     await load();
-    toast(out.ready ? `并行策略已应用：${out.detail}` : out.detail, out.ready ? "ok" : "warn");
+    toast(out.ready ? `${t("并行策略已应用：")}${out.detail}` : out.detail, out.ready ? "ok" : "warn");
   } catch (error) {
-    toast(`策略已保存，但模型重载失败：${error}`, "error");
+    toast(`${t("策略已保存，但模型重载失败：")}${error}`, "error");
   } finally {
     busy.value = "";
   }
@@ -255,7 +256,7 @@ const modalityCards = computed(() => {
       status: activeSupports("text") || selectedReady ? "可用" : (selected.value?.format === "safetensors" && declared("text") ? "声明" : "未配置"),
       detail: declared("text") && !selectedReady && selected.value?.format === "safetensors"
         ? "模型声明 · 需配套组件"
-        : info.value?.ready ? `${info.value.dim} 维` : "未加载",
+        : info.value?.ready ? `${info.value.dim} ${t("维")}` : "未加载",
     },
     {
       key: "image",
@@ -292,37 +293,38 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
     <!-- 第一行：GPU 选择 -->
     <div class="gpu-row card">
       <div>
-        <div class="sec">GPU 推理设备</div>
-        <div class="muted tiny">所选设备作为主推理设备；并行模式会按后端兼容性使用其他可用设备。</div>
+        <div class="sec">{{ t("GPU 推理设备") }}</div>
+        <div class="muted tiny">{{ t("所选设备作为主推理设备；并行模式会按后端兼容性使用其他可用设备。没有可用加速后端时自动退回 CPU。") }}</div>
         <div v-if="integratedGpuNote" class="muted tiny gpu-note">{{ integratedGpuNote }}</div>
       </div>
       <div class="gpu-controls">
-        <select v-if="props.cfg" v-model="props.cfg.model.gpu_device" aria-label="GPU 推理设备">
-          <option value="auto">自动选择（按显存）</option>
+        <select v-if="props.cfg" v-model="props.cfg.model.gpu_device" :aria-label="t('GPU 推理设备')">
+          <option value="auto">{{ t("自动选择（按显存）") }}</option>
+          <option value="cpu">{{ t("CPU（无可用加速设备时）") }}</option>
           <option v-for="device in gpuOptions" :key="device.id" :value="device.id">
-            {{ device.name }} · {{ formatMemory(device.total_memory) }}{{ device.integrated ? " · 核显" : "" }}
+            {{ device.name }} · {{ formatMemory(device.total_memory) }}{{ device.integrated ? t(" · 核显") : "" }}
           </option>
         </select>
-        <span v-if="gpuLoadError" class="tiny warn-text">GPU 列表加载失败：{{ gpuLoadError }}</span>
-        <span v-else-if="!gpuOptions.length" class="tiny muted">未检测到可用图形设备</span>
-        <button v-if="props.saveModelConfig" class="ghost icon-action" title="保存 GPU 设置" @click="saveParams"><Save :size="15" /></button>
+        <span v-if="gpuLoadError" class="tiny warn-text">{{ t("GPU 列表加载失败：") }}{{ gpuLoadError }}</span>
+        <span v-else-if="!gpuOptions.length" class="tiny muted">{{ t("未检测到可用加速设备，将使用 CPU 推理") }}</span>
+        <button v-if="props.saveModelConfig" class="ghost icon-action" :title="t('保存 GPU 设置')" @click="saveParams"><Save :size="15" /></button>
       </div>
     </div>
 
     <div class="parallel-row card">
       <div>
-        <div class="sec">模型并行策略</div>
-        <div class="muted tiny">按当前设备状态动态调节后台工作负载；模型实例会按后端能力安全复用</div>
+        <div class="sec">{{ t("模型并行策略") }}</div>
+        <div class="muted tiny">{{ t("按当前设备状态动态调节后台工作负载；模型实例会按后端能力安全复用") }}</div>
       </div>
-      <div class="parallel-buttons" role="group" aria-label="模型并行策略">
+      <div class="parallel-buttons" role="group" :aria-label="t('模型并行策略')">
         <button
           v-for="mode in PARALLEL_MODES"
           :key="mode.key"
           class="parallel-button"
           :class="[mode.className, { active: (props.cfg?.model?.parallel_mode || 'auto') === mode.key }]"
-          :title="`${mode.label}：${mode.hint}`"
+          :title="`${t(mode.label)}：${t(mode.hint)}`"
           @click="setParallelMode(mode.key)"
-        >{{ mode.label }}</button>
+        >{{ t(mode.label) }}</button>
       </div>
     </div>
 
@@ -330,8 +332,8 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
     <div class="modality-grid">
       <div v-for="card in modalityCards" :key="card.key" class="modality-card card" :class="{ supported: card.ok }">
         <component :is="card.icon" :size="18" aria-hidden="true" />
-        <div class="modality-copy"><strong>{{ card.label }}</strong><span>{{ card.detail }}</span></div>
-        <span class="modality-state">{{ card.status }}</span>
+        <div class="modality-copy"><strong>{{ t(card.label) }}</strong><span>{{ t(card.detail) }}</span></div>
+        <span class="modality-state">{{ t(card.status) }}</span>
       </div>
     </div>
 
@@ -345,7 +347,7 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
           :class="{ active: filter === f.v }"
           @click="filter = f.v"
         >
-          {{ f.t }}
+          {{ t(f.label) }}
           <template v-if="f.v !== 'all'">
             ({{ list.filter((m) => m.kind === f.v).length }})
           </template>
@@ -353,21 +355,21 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
       </div>
       <span class="grow"></span>
       <span class="muted tiny">
-        {{ list.length }} 个模型 · 共 {{ humanSize(totalSize) }} · {{ dir }}
+        {{ list.length }} {{ t("个模型") }} · {{ t("共") }} {{ humanSize(totalSize) }} · {{ dir }}
       </span>
-      <button v-if="importedDir" class="ghost" @click="openImportedDir">打开导入目录</button>
-      <button v-if="info?.ready" class="ghost danger" :disabled="!!busy" title="停用当前模型" @click="useHash">
-        <Power :size="14" />停用模型
+      <button v-if="importedDir" class="ghost" @click="openImportedDir">{{ t("打开导入目录") }}</button>
+      <button v-if="info?.ready" class="ghost danger" :disabled="!!busy" :title="t('停用当前模型')" @click="useHash">
+        <Power :size="14" />{{ t("停用模型") }}
       </button>
-      <button class="ghost" :disabled="loading" @click="load">刷新</button>
-      <button class="primary" :disabled="!!busy" @click="importFile">导入模型</button>
+      <button class="ghost" :disabled="loading" @click="load">{{ t("刷新") }}</button>
+      <button class="primary" :disabled="!!busy" @click="importFile">{{ t("导入模型") }}</button>
     </div>
 
     <div class="list card">
-      <div v-if="loading" class="none">扫描中…</div>
+      <div v-if="loading" class="none">{{ t("扫描中…") }}</div>
       <div v-else-if="!shown.length" class="empty">
-        <div class="big">模型目录里还没有 GGUF 或 safetensors 权重</div>
-        <div class="muted tiny">选择模型文件夹后，程序会自动识别权重及 tokenizer、配置等配套文件</div>
+        <div class="big">{{ t("模型目录里还没有 GGUF 或 safetensors 权重") }}</div>
+        <div class="muted tiny">{{ t("选择模型文件夹后，程序会自动识别权重及 tokenizer、配置等配套文件") }}</div>
       </div>
       <div v-for="m in shown" :key="m.path" class="item" :class="{ active: m.active, selected: selected?.path === m.path }" @click="selectModel(m)">
         <div class="left">
@@ -375,7 +377,7 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
             <span class="nm" :title="m.name">{{ m.name }}</span>
             <span class="kind" :class="m.kind">{{ m.kind_label }}</span>
             <span class="kind format">{{ m.format.toUpperCase() }}</span>
-            <span v-if="m.active" class="inuse">使用中</span>
+            <span v-if="m.active" class="inuse">{{ t("使用中") }}</span>
           </div>
           <div class="file mono" :title="m.path">{{ m.file }} · {{ m.size_label }}</div>
           <div class="meta muted tiny">{{ m.mtime_label }} · {{ m.path }}</div>
@@ -389,11 +391,11 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
           >
             {{ activationLabel(m) }}
           </button>
-          <button class="ghost" :title="`打开模型文件夹：${m.model_dir}`" @click.stop="openModelDir(m)">
+          <button class="ghost" :title="`${t('打开模型文件夹：')}${m.model_dir}`" @click.stop="openModelDir(m)">
             <FolderOpen :size="14" />
           </button>
           <button class="ghost danger" :disabled="m.active || !!busy" @click.stop="remove(m)">
-            删除
+            {{ t("删除") }}
           </button>
         </div>
       </div>
@@ -406,18 +408,18 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
         <SlidersHorizontal :size="16" aria-hidden="true" />
       </div>
       <div class="params-grid">
-        <label>上下文长度<input type="number" min="512" step="256" v-model.number="props.cfg.model.context_size" /></label>
-        <label class="param-path">模型路径<input :value="selected.path" readonly /></label>
+        <label>{{ t("上下文长度") }}<input type="number" min="512" step="256" v-model.number="props.cfg.model.context_size" /></label>
+        <label class="param-path">{{ t("模型路径") }}<input :value="selected.path" readonly /></label>
       </div>
       <p v-if="selected.format === 'safetensors'" class="params-warning">
-        safetensors 是权重容器；请确保配置文件、分片权重和 tokenizer 等配套文件位于同一目录。
+        {{ t("safetensors 是权重容器；请确保配置文件、分片权重和 tokenizer 等配套文件位于同一目录。") }}
       </p>
-      <div class="params-actions"><span class="muted tiny">0 表示由运行时自动选择线程数。</span><button class="primary" @click="saveParams"><Save :size="14" />保存推理参数</button></div>
+      <div class="params-actions"><span class="muted tiny">{{ t("0 表示由运行时自动选择线程数。") }}</span><button class="primary" @click="saveParams"><Save :size="14" />{{ t("保存推理参数") }}</button></div>
     </section>
 
     <p class="muted tiny foot">
-      嵌入模型用于语义检索；切换模型后已有向量会按新维度重建（可能提示重新索引）。
-      程序会自动选择匹配的加载方式；当前可加载状态以列表中的按钮为准。
+      {{ t("嵌入模型用于语义检索；切换模型后已有向量会按新维度重建（可能提示重新索引）。") }}
+      {{ t("程序会自动选择匹配的加载方式；当前可加载状态以列表中的按钮为准。") }}
     </p>
   </div>
 </template>

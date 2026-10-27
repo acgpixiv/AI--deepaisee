@@ -113,6 +113,292 @@ pub fn sample_video_frames(path: &Path, count: usize, max_side: u32) -> Vec<Path
     out
 }
 
+/// 智能抽帧参数。需求：按时间间隔抽帧（默认至少 4 秒一帧）、I 帧优先、
+/// 场景切换优先、图像指纹去重、总帧数封顶。
+#[derive(Debug, Clone, Copy)]
+pub struct FramePlan {
+    /// 相邻采样点的最小时间间隔（秒），内部强制不低于 4 秒。
+    pub interval: f32,
+    /// 单个视频最多保留多少帧。
+    pub max_frames: u32,
+    /// 输出图片的最长边。
+    pub max_side: u32,
+    /// dHash 汉明距离小于等于该值时视为同一画面丢弃。
+    pub dedup_distance: u32,
+}
+
+impl Default for FramePlan {
+    fn default() -> Self {
+        Self { interval: 4.0, max_frames: 64, max_side: 256, dedup_distance: 6 }
+    }
+}
+
+/// 从 ffmpeg 的 showinfo 输出里抓所有 `pts_time:` 后面的秒数。
+fn parse_showinfo_times(text: &str) -> Vec<f64> {
+    let mut times = Vec::new();
+    for line in text.lines() {
+        // [Parsed_showinfo_1 @ ...] n:   0 pts:      0 pts_time:0       duration:...
+        let Some(pos) = line.find("pts_time:") else { continue };
+        let rest = &line[pos + 9..];
+        let value: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+            .collect();
+        if let Ok(seconds) = value.parse::<f64>() {
+            if seconds.is_finite() && seconds >= 0.0 {
+                times.push(seconds);
+            }
+        }
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    times.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+    times
+}
+
+/// 视频关键帧（I 帧）时间戳列表，秒。
+///
+/// 用 `-skip_frame nokey` 只解码关键帧，长视频也能在一两秒内跑完；
+/// 关键帧天然落在场景切换处，既满足「I 帧优先」，又顺带拿到场景变化点。
+/// 失败时返回空列表，调用方退回均匀采样（不能因为探测失败就不抽帧）。
+fn video_keyframe_times(path: &Path) -> Vec<f64> {
+    let Some(ff) = ffmpeg_path() else { return vec![] };
+    let out = hidden(
+        Command::new(&ff)
+            .args(["-hide_banner", "-nostats", "-loglevel", "info", "-skip_frame", "nokey", "-i"])
+            .arg(path)
+            .args([
+                "-vf",
+                "select=eq(pict_type\\,I),showinfo",
+                "-an",
+                "-f",
+                "null",
+                "-",
+            ]),
+    )
+    .output();
+    let Ok(out) = out else { return vec![] };
+    parse_showinfo_times(&String::from_utf8_lossy(&out.stderr))
+}
+
+/// 场景切换时间戳（Scene Change Detection），秒。
+///
+/// 需求里的「动作片提高采样率、PPT/网课降采样」就靠它判断：
+/// ffmpeg 的 `scene` 分数是相邻帧的直方图差异，超过阈值即视为换镜头。
+///
+/// 为控制开销做了三件事：先 `fps=2` 降到每秒 2 帧再算（scene 分数只看相邻帧，
+/// 降帧后差异只会更明显，阈值相应取 0.4）；缩到 160 宽；超过 40 分钟直接跳过
+/// （长视频仍然有 I 帧可以挑，不影响「I 帧优先」）。
+fn video_scene_change_times(path: &Path, dur: f64) -> Vec<f64> {
+    if dur > 2400.0 {
+        return vec![];
+    }
+    let Some(ff) = ffmpeg_path() else { return vec![] };
+    let out = hidden(
+        Command::new(&ff)
+            .args(["-hide_banner", "-nostats", "-loglevel", "info", "-i"])
+            .arg(path)
+            .args([
+                "-vf",
+                "fps=2,scale=160:-2,select='gt(scene\\,0.4)',showinfo",
+                "-an",
+                "-f",
+                "null",
+                "-",
+            ]),
+    )
+    .output();
+    let Ok(out) = out else { return vec![] };
+    parse_showinfo_times(&String::from_utf8_lossy(&out.stderr))
+}
+
+/// 按场景切换密度自适应调整采样间隔（秒）。
+///
+/// - 几乎不换镜头（PPT / 网课 / 录屏）：放稀到 1.5 倍，省 CLIP 计算量与磁盘；
+/// - 换镜头很频繁（动作片 / 体育）：缩到 0.5 倍，尽量不漏关键画面；
+/// - 中间档保持配置值。
+///
+/// 需求要求「至少每 4 秒一帧」，所以任何情况下都不低于 4 秒。
+fn adaptive_interval(base: f64, dur: f64, scene_count: usize) -> f64 {
+    if dur < 1.0 {
+        return base.max(4.0);
+    }
+    if scene_count == 0 {
+        return (base * 1.5).max(4.0);
+    }
+    let per_minute = scene_count as f64 * 60.0 / dur;
+    if per_minute >= 8.0 {
+        return (base * 0.5).max(4.0);
+    }
+    base.max(4.0)
+}
+
+/// 在指定时间点抽一帧到 `dest`。
+fn grab_frame(ff: &Path, src: &Path, seconds: f64, max_side: u32, dest: &Path) -> bool {
+    let scale = format!(
+        "scale='min({m},iw)':'min({m},ih)':force_original_aspect_ratio=decrease",
+        m = max_side
+    );
+    hidden(
+        Command::new(ff)
+            .args(["-y", "-ss", &format!("{seconds:.3}"), "-i"])
+            .arg(src)
+            .args(["-frames:v", "1", "-vf", &scale, "-q:v", "4"])
+            .arg(dest)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false)
+        && dest.is_file()
+}
+
+/// 图像指纹（dHash）：缩到 9x8 灰度，比较相邻像素亮度，得到 64 位指纹。
+///
+/// 不用 phash 是为了零依赖、零调参：dHash 对缩放/轻微压缩不敏感，
+/// 对画面变化敏感，正好用来丢弃「同一镜头里的连续帧」。
+pub fn dhash(path: &Path) -> Option<u64> {
+    frame_signature(path).map(|sig| sig.0)
+}
+
+/// 帧特征：dHash 指纹 + 平均颜色。
+///
+/// 只用 dHash 时，纯色 / 极低对比的画面（幻灯片白底、黑屏、纯色转场）
+/// 几乎都会得到同一个指纹，"红底切绿底" 会被误判成同一帧直接丢掉。
+/// 带上平均颜色就能区分这类切换 —— 两帧既要求结构相近、又要求颜色相近
+/// 才算重复。
+fn frame_signature(path: &Path) -> Option<(u64, [u8; 3])> {
+    let img = image::open(path).ok()?;
+    let small = img
+        .resize_exact(9, 8, image::imageops::FilterType::Triangle)
+        .to_luma8();
+    let mut hash = 0u64;
+    let mut bit = 0;
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            let left = small.get_pixel(x, y).0[0];
+            let right = small.get_pixel(x + 1, y).0[0];
+            if left > right {
+                hash |= 1u64 << bit;
+            }
+            bit += 1;
+        }
+    }
+    let mean = img
+        .resize_exact(1, 1, image::imageops::FilterType::Triangle)
+        .to_rgb8();
+    let rgb = mean.get_pixel(0, 0).0;
+    Some((hash, rgb))
+}
+
+fn hamming(a: u64, b: u64) -> u32 {
+    (a ^ b).count_ones()
+}
+
+/// 两帧平均颜色的距离（RGB 三分量差的平方和，满值 195075）。
+/// 阈值取 300 相当于每通道平均差 ~10/255，轻微偏色不算换画面。
+fn color_distance(a: [u8; 3], b: [u8; 3]) -> u32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = *x as i32 - *y as i32;
+            (d * d) as u32
+        })
+        .sum()
+}
+
+/// 智能抽帧：自适应间隔 + 场景切换/I 帧优先 + 图像指纹去重 + 帧数封顶。
+///
+/// 和旧版「按 index 均匀切 N 份」的区别：
+/// 1. 采样点按**时间间隔**给，长视频不会因为 `video_frames` 太小而只抽到几帧；
+/// 2. 间隔本身按**镜头切换密度**自适应：PPT/网课这类几乎不换镜头的视频放稀，
+///    动作片/体育这类高频换镜头的视频加密（下限仍是 4 秒）；
+/// 3. 每个采样窗口内优先落在**场景切换点**上，其次才是 I 帧
+///    （画面最清晰、最可能是镜头切换点）；
+/// 4. 抽出来的帧算 dHash，和上一张几乎一样的直接丢掉 —— 一段静止镜头
+///    只会留一张，省掉大量重复的 CLIP 计算和缩略图；
+/// 5. 总帧数按 `max_frames` 封顶，超出时自动放稀采样间隔。
+pub fn sample_video_frames_smart(path: &Path, plan: FramePlan) -> Vec<PathBuf> {
+    let Some(ff) = ffmpeg_path() else { return vec![] };
+    let base = work_dir();
+    sweep_old_frames(&base);
+    let tmp = base.join(format!("frames-{}", std::process::id()));
+    if std::fs::create_dir_all(&tmp).is_err() {
+        return vec![];
+    }
+
+    let dur = video_duration(path).unwrap_or(4.0).max(0.1);
+    // 关键帧与场景切换时间戳（探测失败就是空表，下面自然退回窗口中心点）
+    let keys = video_keyframe_times(path);
+    let scenes = video_scene_change_times(path, dur);
+
+    // 需求明确「至少每 4 秒一帧」，这里兜住配置里填了 0/负数的情况。
+    let interval = adaptive_interval((plan.interval as f64).max(4.0), dur, scenes.len());
+    // 排障开关：设了 DEEPAISEE_DEBUG_FRAMES 就把探测结果打到 stderr。
+    if std::env::var_os("DEEPAISEE_DEBUG_FRAMES").is_some() {
+        eprintln!(
+            "[frames] {} dur={dur:.2}s dhash_dedup={} scenes={} keys={} interval={interval:.2}s",
+            path.display(),
+            plan.dedup_distance,
+            scenes.len(),
+            keys.len()
+        );
+    }
+    let max_frames = plan.max_frames.clamp(1, 512) as usize;
+    let wanted = ((dur / interval).ceil() as usize).clamp(1, max_frames);
+    // 帧数封顶后实际间隔会被拉大，避免长视频仍然按 4 秒切出几万帧。
+    let step = (dur / wanted as f64).max(interval);
+
+    // 窗口内挑一个最靠近中心的候选时间点：场景切换点 > I 帧 > 窗口中心。
+    let pick_in = |candidates: &[f64], start: f64, end: f64, center: f64| -> Option<f64> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|t| *t >= start && *t < end)
+            .min_by(|a, b| {
+                (a - center)
+                    .abs()
+                    .partial_cmp(&(b - center).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    };
+
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut last_sig: Option<(u64, [u8; 3])> = None;
+    for i in 0..wanted {
+        let start = i as f64 * step;
+        let end = ((i + 1) as f64 * step).min(dur);
+        let center = (start + end) / 2.0;
+        let pick = pick_in(&scenes, start, end, center)
+            .or_else(|| pick_in(&keys, start, end, center))
+            .unwrap_or(center);
+        let dest = tmp.join(format!("f{i}.jpg"));
+        if !grab_frame(&ff, path, pick, plan.max_side, &dest) {
+            continue;
+        }
+        match frame_signature(&dest) {
+            Some((hash, rgb)) => {
+                if let Some((prev_hash, prev_rgb)) = last_sig {
+                    // 结构相近 + 颜色也相近才算「同一画面」，纯色切换不会误丢。
+                    if hamming(prev_hash, hash) <= plan.dedup_distance
+                        && color_distance(prev_rgb, rgb) <= 300
+                    {
+                        let _ = std::fs::remove_file(&dest);
+                        continue;
+                    }
+                }
+                last_sig = Some((hash, rgb));
+                out.push(dest);
+            }
+            // 算不出指纹（解码异常）就保守保留，宁多勿漏。
+            None => out.push(dest),
+        }
+    }
+    if out.is_empty() {
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    out
+}
 /// 清掉上次运行残留的 `frames-<pid>` 目录。
 ///
 /// 每个进程只用自己的 pid 目录，正常结束会删；但程序被强杀 / 崩溃时

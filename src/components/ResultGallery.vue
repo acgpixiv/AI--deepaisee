@@ -4,6 +4,7 @@ import { FileArchive, FileText, Film, Image as ImageIcon, Music2, PackageOpen } 
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { api, type Hit } from "../api";
 import { fmtTime, humanSize, kindColor, toast } from "../store";
+import { t } from "../i18n";
 
 const props = defineProps<{
   hits: Hit[];
@@ -125,8 +126,8 @@ function openContext(hit: Hit, event: MouseEvent) {
 }
 function closeContext() { contextHit.value = null; }
 async function copyPath(hit: Hit) {
-  try { await navigator.clipboard.writeText(hit.path); toast("已复制文件路径", "ok"); }
-  catch (error) { toast(`复制失败：${error}`, "error"); }
+  try { await navigator.clipboard.writeText(hit.path); toast(t("已复制文件路径"), "ok"); }
+  catch (error) { toast(`${t("复制失败：")}${error}`, "error"); }
   closeContext();
 }
 function menuRename(hit: Hit) { emit("rename", hit); closeContext(); }
@@ -160,7 +161,7 @@ onBeforeUnmount(() => { clearTimeout(hoverTimer); clearTimeout(closeTimer); wind
           <video v-else-if="isVideo(hit)" class="video-card" :src="sourceUrl(hit)" muted preload="metadata"></video>
           <component :is="iconFor[hit.kind] || PackageOpen" v-else :size="30" stroke-width="1.5" />
           <span class="score" :class="scoreClass(hit)" @click.stop @dblclick.stop>{{ displayScore(hit) }}</span>
-          <input class="check" type="checkbox" :aria-label="`选择 ${hit.name} 用于导出`" :checked="selectedIds.has(hit.id)" @click.stop @change="emit('toggle', hit.id)" />
+          <input class="check" type="checkbox" :aria-label="`${t('选择')} ${hit.name} ${t('用于导出')}`" :checked="selectedIds.has(hit.id)" @click.stop @change="emit('toggle', hit.id)" />
         </div>
         <div class="details">
           <div class="title-line"><span class="name" :title="hit.name">{{ hit.name }}</span><span class="kind">{{ hit.kind_label }}</span></div>
@@ -171,7 +172,7 @@ onBeforeUnmount(() => { clearTimeout(hoverTimer); clearTimeout(closeTimer); wind
       </article>
     </div>
     <div v-if="hoverHit" class="preview-popover" :style="hoverStyle" @mouseenter="popoverEnter" @mouseleave="popoverLeave">
-      <iframe v-if="isPdf(hoverHit)" class="pdf-popover" :src="pdfUrl(hoverHit)" title="PDF放大预览"></iframe>
+      <iframe v-if="isPdf(hoverHit)" class="pdf-popover" :src="pdfUrl(hoverHit)" :title="t('PDF 放大预览')"></iframe>
       <img v-else-if="thumbnail(hoverHit)" :src="thumbnail(hoverHit)" alt="" @error="markThumbFailed(hoverHit.id)" />
         <video v-else-if="isVideo(hoverHit)" :src="sourceUrl(hoverHit)" controls></video>
         <div v-if="isPdf(hoverHit)" class="page-indicator">1 / {{ previewPageCount ?? "?" }}</div>
@@ -185,7 +186,9 @@ onBeforeUnmount(() => { clearTimeout(hoverTimer); clearTimeout(closeTimer); wind
 <style scoped>
 .gallery { position: relative; min-height: 0; height: 100%; overflow: auto; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); align-content: start; gap: 12px; padding: 2px 2px 18px; }
-.result { min-width: 0; overflow: hidden; border: 1px solid transparent; border-radius: 2px; background: #fff; cursor: pointer; transition: border-color .15s, background .15s; }
+.result { min-width: 0; overflow: hidden; border: 1px solid transparent; border-radius: 2px; background: #fff; cursor: pointer; transition: border-color .15s, background .15s; animation: result-in .24s ease both; }
+.result:nth-child(2) { animation-delay: 18ms; }.result:nth-child(3) { animation-delay: 36ms; }.result:nth-child(4) { animation-delay: 54ms; }.result:nth-child(5) { animation-delay: 72ms; }.result:nth-child(6) { animation-delay: 90ms; }.result:nth-child(7) { animation-delay: 108ms; }.result:nth-child(8) { animation-delay: 126ms; }
+@keyframes result-in { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
 .result:hover { border-color: #111; background: #f5f5f5; }.result.active { border-color: #111; background: #f0f0f0; }
 .media { position: relative; aspect-ratio: 4 / 3; display: grid; place-items: center; overflow: hidden; color: var(--kind-color); background: #f2f2f2; }
 .media img, .video-card, .pdf-card { width: 100%; height: 100%; object-fit: cover; border: 0; }.pdf-card { background: #fff; pointer-events: none; }.video-card { object-fit: contain; }
@@ -195,4 +198,5 @@ onBeforeUnmount(() => { clearTimeout(hoverTimer); clearTimeout(closeTimer); wind
 .context-menu { position: fixed; z-index: 120; width: 170px; padding: 4px; border: 1px solid #111; border-radius: 2px; background: #fff; box-shadow: 0 8px 24px rgba(0,0,0,.18); }.context-menu button { display: block; width: 100%; padding: 8px 10px; border: 0; background: transparent; color: #111; text-align: left; font-size: 12px; cursor: pointer; }.context-menu button:hover { background: #eee; }
 .gallery-state { min-height: 240px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: #666; font-size: 12px; }.empty-title { color: #111; font-size: 14px; }
 @media (max-width: 700px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; } .preview-popover { width: min(430px, calc(100vw - 16px)); height: min(520px, calc(100vh - 16px)); } }
+@media (prefers-reduced-motion: reduce) { .result, .result:nth-child(n) { animation: none; } }
 </style>

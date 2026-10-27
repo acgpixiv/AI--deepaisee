@@ -51,12 +51,17 @@ pub fn save_config(
     let new_cfg: AppConfig =
         serde_json::from_value(merged).map_err(|e| format!("配置格式错误：{e}"))?;
 
+    let autostart_before = state.cfg.read().ui.autostart;
+
     // 注意：save() 要的是**配置文件路径**，不是目录。
     // 传目录会得到 "拒绝访问 (os error 5)"，而界面只看到一句看不懂的错误。
     let path = crate::config::config_path(Some(&state.app_dir));
     new_cfg
         .save(&path)
         .map_err(|e| format!("保存配置失败：{e}"))?;
+    if autostart_before != new_cfg.ui.autostart {
+        apply_autostart(new_cfg.ui.autostart, &state.app_dir);
+    }
     *state.cfg.write() = new_cfg;
     if let Some(indexer) = state.indexer() {
         let cfg = state.cfg.read();
@@ -68,6 +73,39 @@ pub fn save_config(
         indexer.set_batch_size(batch_size);
     }
     Ok(())
+}
+
+/// 把「开机自启」写进 HKCU 的 Run 键（或从中删除）。
+///
+/// 用 `reg.exe` 而不是引入 winreg 依赖：这里只需要一次简单写入，
+/// 且失败不影响配置保存（受限会话里注册表可能不可写，属于可接受降级）。
+fn apply_autostart(enabled: bool, app_dir: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+        const VALUE: &str = "deepaisee";
+
+        let mut cmd = std::process::Command::new("reg.exe");
+        if enabled {
+            let exe = app_dir.join("deepaisee.exe");
+            if !exe.is_file() {
+                return;
+            }
+            let value = format!("\"{}\"", exe.display());
+            cmd.args([
+                "add", RUN_KEY, "/v", VALUE, "/t", "REG_SZ", "/d", &value, "/f",
+            ]);
+        } else {
+            cmd.args(["delete", RUN_KEY, "/v", VALUE, "/f"]);
+        }
+        let _ = cmd.creation_flags(CREATE_NO_WINDOW).output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (enabled, app_dir);
+    }
 }
 
 /// 递归深合并：`src` 里的对象逐键并入 `dst`，数组与标量直接覆盖。
@@ -290,9 +328,12 @@ pub struct ScanProgress {
     pub cancelled: bool,
 }
 
-#[tauri::command]
-pub fn scan_start(
-    state: State<'_, Arc<AppState>>,
+/// 扫描 + 增量索引的共用入口。
+///
+/// 之所以把 scan_start 拆成「命令壳 + 这个函数」，是因为启动时的自动扫描
+/// （需求：启动时自动扫描）没有前端 State，只能在 lib.rs 里直接调。
+pub fn start_scan(
+    state: &Arc<AppState>,
     roots: Option<Vec<String>>,
     index_what: Option<String>,
 ) -> Result<(), String> {
@@ -318,7 +359,7 @@ pub fn scan_start(
     state.scan_cancel.store(false, Ordering::Relaxed);
     state.scan_busy.store(true, Ordering::Relaxed);
     let db = Arc::clone(&state.db);
-    let app_state = Arc::clone(&state);
+    let app_state = Arc::clone(state);
     let cancel = Arc::clone(&state.scan_cancel);
     let busy = Arc::clone(&state.scan_busy);
     let stats_shared = Arc::clone(&state.scan_stats);
@@ -379,6 +420,15 @@ pub fn scan_start(
         busy.store(false, Ordering::Relaxed);
     });
     Ok(())
+}
+
+#[tauri::command]
+pub fn scan_start(
+    state: State<'_, Arc<AppState>>,
+    roots: Option<Vec<String>>,
+    index_what: Option<String>,
+) -> Result<(), String> {
+    start_scan(state.inner(), roots, index_what)
 }
 
 #[tauri::command]
@@ -1198,7 +1248,15 @@ pub fn extension_status(state: State<'_, Arc<AppState>>) -> ExtensionStatusOut {
 
 fn extension_status_for(state: &AppState) -> ExtensionStatusOut {
     let root = extension_root(state);
-    let ort = root.join(".tools").join("onnxruntime").join("onnxruntime.dll");
+    // 安装版把 onnxruntime.dll 直接放在 exe 同级（NSIS 资源映射），
+    // 便携/开发版则放在 .tools\onnxruntime 下，两种布局都要认。
+    let mut ort = root.join(".tools").join("onnxruntime").join("onnxruntime.dll");
+    if !ort.is_file() {
+        let beside = state.app_dir.join("onnxruntime.dll");
+        if beside.is_file() {
+            ort = beside;
+        }
+    }
     let python = root.join(".tools").join("python").join("python.exe");
     ExtensionStatusOut {
         onnxruntime: ort.is_file(),

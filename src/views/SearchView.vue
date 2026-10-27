@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ArrowDownUp, Check, ChevronRight, Download, Search, X } from "lucide-vue-next";
 import { api, type Hit, type SearchQuery } from "../api";
+import { langState, t } from "../i18n";
 import { toast } from "../store";
 import ResultGallery from "../components/ResultGallery.vue";
 
@@ -13,6 +14,7 @@ const fulltext = ref(true);
 const pinyin = ref(true);
 const fuzzy = ref(true);
 const visual = ref(true);
+const workspaceMode = ref(true);
 const debounceMs = ref(260);
 const pageSize = ref(1000);
 const kind = ref("all");
@@ -30,31 +32,37 @@ const selectedIds = ref<Set<number>>(new Set());
 const typedPrompt = ref("");
 const recentOpen = ref(false);
 
+// 界面文案在模板里用 t() 翻译，这里保留中文原文作为词条 key。
 const KINDS = [
-  { v: "all", t: "全部" },
-  { v: "image", t: "图片" },
-  { v: "video", t: "视频" },
-  { v: "audio", t: "音频" },
-  { v: "document", t: "文档" },
-  { v: "text", t: "文本" },
-  { v: "archive", t: "压缩包" },
+  { v: "all", label: "全部" },
+  { v: "image", label: "图片" },
+  { v: "video", label: "视频" },
+  { v: "audio", label: "音频" },
+  { v: "document", label: "文档" },
+  { v: "text", label: "文本" },
+  { v: "archive", label: "压缩包" },
 ];
 const SORTS = [
-  { v: "relevance", t: "相关度" },
-  { v: "mtime", t: "修改时间" },
-  { v: "size", t: "大小" },
-  { v: "name", t: "名称" },
-  { v: "kind", t: "类型" },
+  { v: "relevance", label: "相关度" },
+  { v: "mtime", label: "修改时间" },
+  { v: "size", label: "大小" },
+  { v: "name", label: "名称" },
+  { v: "kind", label: "类型" },
 ];
 
 let searchTimer: number | undefined;
 let typeTimer: number | undefined;
 let promptIndex = 0;
 let deleting = false;
-const prompts = ["今天想要搜索什么？", "找一份文件，或描述一张图片", "用一句话找到硬盘里的内容"];
+// 打字机文案跟随界面语言：词条走 i18n，切换语言时重置动画。
+const prompts = computed(() => [
+  t("今天想要搜索什么？"),
+  t("找一份文件，或描述一张图片"),
+  t("用一句话找到硬盘里的内容"),
+]);
 
 function typePrompt() {
-  const target = prompts[promptIndex];
+  const target = prompts.value[promptIndex] ?? "";
   if (!deleting) {
     typedPrompt.value = target.slice(0, typedPrompt.value.length + 1);
     if (typedPrompt.value === target) {
@@ -66,7 +74,7 @@ function typePrompt() {
     typedPrompt.value = target.slice(0, Math.max(0, typedPrompt.value.length - 1));
     if (!typedPrompt.value) {
       deleting = false;
-      promptIndex = (promptIndex + 1) % prompts.length;
+      promptIndex = (promptIndex + 1) % prompts.value.length;
     }
   }
   typeTimer = window.setTimeout(typePrompt, deleting ? 45 : 85);
@@ -87,6 +95,7 @@ function buildQuery(): SearchQuery {
     use_fuzzy: fuzzy.value,
     use_semantic: semantic.value,
     cross_modal: visual.value,
+    workspace: workspaceMode.value,
   };
 }
 
@@ -108,7 +117,7 @@ async function run() {
     if (selected.value) selected.value = res.find((hit) => hit.id === selected.value?.id) || null;
   } catch (e) {
     hits.value = [];
-    toast(`搜索失败：${e}`, "error");
+    toast(`${t("搜索失败：")}${e}`, "error");
   } finally {
     loading.value = false;
   }
@@ -123,7 +132,7 @@ async function runSimilar() {
     hits.value = await api.similar(similarSource.value.id, kind.value === "all" ? undefined : kind.value, 1000);
     elapsed.value = performance.now() - started;
   } catch (e) {
-    toast(`相似检索失败：${e}`, "error");
+    toast(`${t("相似检索失败：")}${e}`, "error");
   } finally {
     loading.value = false;
   }
@@ -160,23 +169,23 @@ function openRecent(hit: Hit) {
 }
 
 async function open(hit: Hit) {
-  try { await api.openPath(hit.path); } catch (e) { toast(`打开失败：${e}`, "error"); }
+  try { await api.openPath(hit.path); } catch (e) { toast(`${t("打开失败：")}${e}`, "error"); }
 }
 
 async function reveal(hit: Hit) {
-  try { await api.revealPath(hit.path); } catch (e) { toast(`定位失败：${e}`, "error"); }
+  try { await api.revealPath(hit.path); } catch (e) { toast(`${t("定位失败：")}${e}`, "error"); }
 }
 
 async function rename(hit: Hit) {
   const current = hit.name;
-  const name = window.prompt("输入新的文件名", current);
+  const name = window.prompt(t("输入新的文件名"), current);
   if (!name || name === current) return;
   try {
     await api.renamePath(hit.path, name);
-    toast("文件已重命名，请重新扫描目录以更新索引", "ok");
+    toast(t("文件已重命名，请重新扫描目录以更新索引"), "ok");
     await run();
   } catch (e) {
-    toast(`重命名失败：${e}`, "error");
+    toast(`${t("重命名失败：")}${e}`, "error");
   }
 }
 
@@ -194,17 +203,17 @@ function toggleAll() {
 
 async function doExport() {
   const paths = hits.value.filter((hit) => selectedIds.value.has(hit.id)).map((hit) => hit.path);
-  if (!paths.length) return toast("请先勾选文件", "warn");
+  if (!paths.length) return toast(t("请先勾选文件"), "warn");
   try {
     const out = `${await api.dataDir()}\\export-${Date.now()}.csv`;
     const count = await api.opExport(paths, out, "csv");
-    toast(`已导出 ${count} 条到 ${out}`, "ok");
+    toast(`${t("已导出")} ${count} ${t("条到")} ${out}`, "ok");
   } catch (e) {
-    toast(`导出失败：${e}`, "error");
+    toast(`${t("导出失败：")}${e}`, "error");
   }
 }
 
-watch([text, semantic, fulltext, pinyin, fuzzy, visual, kind, sort, desc], schedule);
+watch([text, semantic, fulltext, pinyin, fuzzy, visual, workspaceMode, kind, sort, desc], schedule);
 watch(similarMode, (value) => { if (value) runSimilar(); else if (searched.value) run(); });
 
 onMounted(async () => {
@@ -216,6 +225,12 @@ onMounted(async () => {
     pinyin.value = config.search.use_pinyin !== false;
     fuzzy.value = config.search.use_fuzzy !== false;
     visual.value = config.model.clip_enabled !== false || config.model.clap_enabled !== false;
+    // 默认搜索模式（通用配置）：fulltext / semantic / hybrid
+    const mode = config.ui?.default_search_mode;
+    if (mode === "fulltext") { semantic.value = false; fulltext.value = true; }
+    else if (mode === "semantic") { semantic.value = true; fulltext.value = false; }
+    else if (mode === "hybrid") { semantic.value = true; fulltext.value = true; }
+    workspaceMode.value = Boolean(config.workspace?.enabled) && ((config.workspace?.dirs as string[] | undefined)?.length ?? 0) > 0;
     // Migrate the old 200-result default so an existing config cannot keep
     // the previous practical ceiling. The backend still caps a single page
     // at 10,000 and supports offset pagination for larger collections.
@@ -227,14 +242,29 @@ onMounted(async () => {
   }
 });
 
+// 切换界面语言时重启打字机动画，让首屏文案立刻变成对应语言。
+watch(
+  () => langState.current,
+  () => {
+    if (searched.value) return;
+    window.clearTimeout(typeTimer);
+    promptIndex = 0;
+    deleting = false;
+    typedPrompt.value = "";
+    typePrompt();
+  }
+);
+
 onBeforeUnmount(() => {
   window.clearTimeout(searchTimer);
   window.clearTimeout(typeTimer);
 });
 
 const resultLabel = computed(() => {
-  if (similarMode.value) return `相似于 ${similarSource.value?.name || "当前文件"}`;
-  return `${hits.value.length.toLocaleString()} 个结果`;
+  if (similarMode.value) {
+    return `${t("相似于")} ${similarSource.value?.name || t("当前文件")}`;
+  }
+  return `${hits.value.length.toLocaleString()} ${t("个结果")}`;
 });
 
 defineExpose({ run, enterSimilar });
@@ -261,19 +291,19 @@ defineExpose({ run, enterSimilar });
             v-model="text"
             autofocus
             :disabled="similarMode"
-            :placeholder="similarMode ? '相似检索中：按内容距离排序' : '搜索文件名、正文、拼音或一句话描述…'"
+            :placeholder="similarMode ? t('相似检索中：按内容距离排序') : t('搜索文件名、正文、拼音或一句话描述…')"
             @focus="recentOpen = true"
             @keyup.enter="run"
           />
-          <button v-if="text" class="query-action clear-action" title="清空" aria-label="清空搜索" @click="text = ''">
+          <button v-if="text" class="query-action clear-action" :title="t('清空')" :aria-label="t('清空')" @click="text = ''">
             <X :size="17" />
           </button>
-          <button class="query-action run-action" title="搜索" aria-label="搜索" @click="run">
+          <button class="query-action run-action" :title="t('搜索')" :aria-label="t('搜索')" @click="run">
             <ChevronRight :size="20" />
           </button>
         </div>
         <div v-if="!searched && recentOpen && recentHits.length" class="recent-panel">
-          <div class="recent-title">最近文件</div>
+          <div class="recent-title">{{ t("最近文件") }}</div>
           <button v-for="hit in recentHits.slice(0, 6)" :key="hit.id" class="recent-item" @mousedown.prevent="openRecent(hit)">
             <span class="recent-name">{{ hit.name }}</span><span>{{ hit.size_label }}</span>
           </button>
@@ -290,39 +320,40 @@ defineExpose({ run, enterSimilar });
             class="filter-pill"
             :class="{ active: kind === item.v }"
             @click="kind = item.v"
-          >{{ item.t }}</button>
+          >{{ t(item.label) }}</button>
         </div>
         <div class="toolbar-spacer"></div>
-        <button class="tool-button" :class="{ active: fulltext }" title="全文检索" @click="fulltext = !fulltext">全文</button>
-        <button class="tool-button" :class="{ active: pinyin }" title="拼音检索" @click="pinyin = !pinyin">拼音</button>
-        <button class="tool-button" :class="{ active: semantic }" title="语义检索" @click="semantic = !semantic">语义</button>
-        <button class="tool-button" :class="{ active: fuzzy }" title="模糊匹配" @click="fuzzy = !fuzzy">模糊</button>
-        <button class="tool-button" :class="{ active: visual }" title="跨模态检索" @click="visual = !visual">找图声</button>
-        <select v-model="sort" class="sort-select" :disabled="similarMode" aria-label="排序方式">
-          <option v-for="item in SORTS" :key="item.v" :value="item.v">{{ item.t }}</option>
+        <button class="tool-button" :class="{ active: fulltext }" :title="t('全文检索')" @click="fulltext = !fulltext">{{ t("全文") }}</button>
+        <button class="tool-button" :class="{ active: pinyin }" :title="t('拼音检索')" @click="pinyin = !pinyin">{{ t("拼音") }}</button>
+        <button class="tool-button" :class="{ active: semantic }" :title="t('语义检索')" @click="semantic = !semantic">{{ t("语义") }}</button>
+        <button class="tool-button" :class="{ active: fuzzy }" :title="t('模糊匹配')" @click="fuzzy = !fuzzy">{{ t("模糊") }}</button>
+        <button class="tool-button" :class="{ active: visual }" :title="t('跨模态检索')" @click="visual = !visual">{{ t("找图声") }}</button>
+        <button class="tool-button" :class="{ active: workspaceMode }" :title="t('同时检索工作区目录中尚未入库的文件')" @click="workspaceMode = !workspaceMode">{{ t("工作区") }}</button>
+        <select v-model="sort" class="sort-select" :disabled="similarMode" :aria-label="t('排序方式')">
+          <option v-for="item in SORTS" :key="item.v" :value="item.v">{{ t(item.label) }}</option>
         </select>
-        <button class="icon-button compact" :title="desc ? '降序' : '升序'" :aria-label="desc ? '降序' : '升序'" @click="desc = !desc">
+        <button class="icon-button compact" :title="desc ? t('降序') : t('升序')" :aria-label="desc ? t('降序') : t('升序')" @click="desc = !desc">
           <ArrowDownUp :size="16" />
         </button>
-        <button v-if="similarMode" class="tool-button" @click="exitSimilar">退出相似</button>
+        <button v-if="similarMode" class="tool-button" @click="exitSimilar">{{ t("退出相似") }}</button>
       </div>
 
       <div class="result-meta">
         <span class="meta-primary">{{ resultLabel }}</span>
         <span class="muted">{{ elapsed.toFixed(0) }} ms</span>
-        <span v-if="selectedIds.size" class="muted">已选 {{ selectedIds.size }}</span>
+        <span v-if="selectedIds.size" class="muted">{{ t("已选") }} {{ selectedIds.size }}</span>
         <span class="toolbar-spacer"></span>
         <button class="meta-button" @click="toggleAll">
-          <Check :size="14" /> {{ selectedIds.size === hits.length && hits.length ? "取消全选" : "全选" }}
+          <Check :size="14" /> {{ selectedIds.size === hits.length && hits.length ? t("取消全选") : t("全选") }}
         </button>
         <button class="meta-button" @click="doExport">
-          <Download :size="14" /> 导出
+          <Download :size="14" /> {{ t("导出") }}
         </button>
       </div>
 
       <div class="results-layout">
         <section class="gallery-panel">
-          <div v-if="similarMode" class="similar-note">相似于：{{ similarSource?.name }}</div>
+          <div v-if="similarMode" class="similar-note">{{ t("相似于") }}：{{ similarSource?.name }}</div>
           <ResultGallery
             :hits="hits"
             :selected-id="selected?.id ?? null"
@@ -358,9 +389,11 @@ defineExpose({ run, enterSimilar });
   57% { opacity: .09; }
   78%, 100% { opacity: 0; transform: translate3d(0, -22vh, var(--depth)) rotateX(var(--rx-end)) rotateY(var(--ry-end)) rotateZ(var(--rz-end)) scale(1.12); }
 }
-@media (prefers-reduced-motion: reduce) { .triangle { animation-duration: 1ms; animation-iteration-count: 1; } }
+@media (prefers-reduced-motion: reduce) { .triangle { animation-duration: 1ms; animation-iteration-count: 1; } .toolbar, .result-meta { animation: none; } .query-shell, .hero-search { transition: none; } }
 .hero-search, .toolbar, .result-meta, .results-layout { position: relative; z-index: 1; }
-.hero-search { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 34px; padding: 24px; }
+.toolbar, .result-meta { animation: fade-down .22s ease both; }
+@keyframes fade-down { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+.hero-search { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 34px; padding: 24px; transition: padding .26s ease, gap .26s ease; }
 .searched .hero-search { flex: none; align-items: stretch; gap: 0; padding: 26px clamp(16px, 8vw, 140px) 15px; }
 .hero-copy { text-align: center; }
 .hero-kicker { display: none; }
@@ -370,7 +403,7 @@ h1 { min-height: 1.4em; margin: 0; color: #111; font-size: 42px; font-weight: 45
 @keyframes blink { 50% { opacity: 0; } }
 .query-wrap { position: relative; width: min(680px, 100%); }
 .searched .query-wrap { width: 100%; }
-.query-shell { width: 100%; height: 62px; display: flex; align-items: center; gap: 12px; padding: 0 12px 0 22px; border: 1px solid #111; border-radius: 32px; background: #fff; box-shadow: 0 12px 30px rgba(0,0,0,.08); transition: border-color .15s, box-shadow .15s; }
+.query-shell { width: 100%; height: 62px; display: flex; align-items: center; gap: 12px; padding: 0 12px 0 22px; border: 1px solid #111; border-radius: 32px; background: #fff; box-shadow: 0 12px 30px rgba(0,0,0,.08); transition: height .24s cubic-bezier(.2,.7,.3,1), border-radius .24s cubic-bezier(.2,.7,.3,1), padding .24s ease, border-color .15s, box-shadow .15s; }
 .query-shell.focused { width: 100%; height: 50px; border-radius: 25px; background: #fff; box-shadow: none; }
 .query-shell:focus-within { border-color: #111; box-shadow: 0 0 0 3px rgba(17, 17, 17, .08); }
 .query-icon { flex: none; color: #111; }
@@ -388,7 +421,8 @@ h1 { min-height: 1.4em; margin: 0; color: #111; font-size: 42px; font-weight: 45
 .run-action:hover { background: #333; }
 .toolbar { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; padding: 0 clamp(16px, 8vw, 140px) 11px; }
 .filter-group { display: flex; gap: 5px; overflow-x: auto; }
-.filter-pill, .tool-button, .meta-button { padding: 5px 10px; border: 1px solid transparent; border-radius: 2px; background: transparent; color: #555; font-size: 11px; white-space: nowrap; }
+.filter-pill, .tool-button, .meta-button { padding: 5px 10px; border: 1px solid transparent; border-radius: 2px; background: transparent; color: #555; font-size: 11px; white-space: nowrap; transition: background .14s ease, color .14s ease, transform .1s ease; }
+.filter-pill:active, .tool-button:active, .meta-button:active { transform: scale(.95); }
 .filter-pill:hover, .tool-button:hover, .meta-button:hover { background: #f0f0f0; color: #111; }
 .filter-pill.active, .tool-button.active { color: #fff; background: #111; border-color: #111; }
 .toolbar-spacer { flex: 1; }

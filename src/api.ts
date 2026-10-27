@@ -54,6 +54,8 @@ export interface SearchQuery {
   use_semantic?: boolean;
   /** 用文字描述找图片/声音（需要装了 CLIP/CLAP 模型），三态：不传=跟随界面开关 */
   cross_modal?: boolean | null;
+  /** 是否把「工作区目录」里尚未入库的文件也一起检索（正文现场抽取），不传=开启 */
+  workspace?: boolean | null;
 }
 
 export interface StatsOut {
@@ -231,6 +233,7 @@ export interface AppConfig {
   search: any;
   watch: any;
   ui: any;
+  workspace: any;
   server: any;
 }
 

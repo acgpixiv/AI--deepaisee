@@ -3,6 +3,7 @@ import { onMounted, ref } from "vue";
 import { Download, FolderOpen, RefreshCw } from "lucide-vue-next";
 import { api, type ExtensionStatus } from "../api";
 import { toast } from "../store";
+import { t } from "../i18n";
 
 const status = ref<ExtensionStatus | null>(null);
 const loading = ref(false);
@@ -13,7 +14,7 @@ async function refresh() {
   try {
     status.value = await api.extensionStatus();
   } catch (error) {
-    toast(`读取扩展状态失败：${error}`, "error");
+    toast(`${t("读取扩展状态失败：")}${error}`, "error");
   } finally {
     loading.value = false;
   }
@@ -23,9 +24,9 @@ async function install(kind: "onnxruntime" | "python") {
   installing.value = kind;
   try {
     status.value = await api.extensionInstall(kind);
-    toast(kind === "onnxruntime" ? "ONNX Runtime 已安装到项目目录" : "Python sidecar 运行时已安装到项目目录", "ok");
+    toast(kind === "onnxruntime" ? t("ONNX Runtime 已安装到项目目录") : t("Python sidecar 运行时已安装到项目目录"), "ok");
   } catch (error) {
-    toast(`扩展安装失败：${error}`, "error");
+    toast(`${t("扩展安装失败：")}${error}`, "error");
   } finally {
     installing.value = "";
   }
@@ -42,31 +43,31 @@ onMounted(refresh);
   <section class="settings-section extension-section">
     <div class="section-head">
       <div>
-        <h2>可选扩展</h2>
-        <p>内置模型支持保持轻量；按需安装兼容性扩展，文件保存在项目目录。</p>
+        <h2>{{ t("可选扩展") }}</h2>
+        <p>{{ t("内置模型支持保持轻量；按需安装兼容性扩展，文件保存在项目目录。") }}</p>
       </div>
       <div class="extension-actions">
-        <button class="secondary-button" :disabled="loading || !!installing" @click="refresh"><RefreshCw :size="14" />刷新</button>
-        <button class="secondary-button" :disabled="!status?.root" @click="openRoot"><FolderOpen :size="14" />打开扩展目录</button>
+        <button class="secondary-button" :disabled="loading || !!installing" @click="refresh"><RefreshCw :size="14" />{{ t("刷新") }}</button>
+        <button class="secondary-button" :disabled="!status?.root" @click="openRoot"><FolderOpen :size="14" />{{ t("打开扩展目录") }}</button>
       </div>
     </div>
 
     <div class="extension-grid">
       <article class="extension-card">
-        <div class="extension-card-head"><strong>ONNX Runtime</strong><span class="extension-state" :class="{ on: status?.onnxruntime }">{{ status?.onnxruntime ? "已安装" : "未安装" }}</span></div>
-        <p>用于运行标准 ONNX 模型，例如 CLIP、CLAP。不能直接读取 safetensors。</p>
-        <div class="extension-path mono">{{ status?.onnxruntime_path || "项目/.tools/onnxruntime/onnxruntime.dll" }}</div>
-        <button class="primary" :disabled="!!installing" @click="install('onnxruntime')"><Download :size="14" />{{ installing === "onnxruntime" ? "安装中…" : status?.onnxruntime ? "重新检查" : "下载并安装" }}</button>
+        <div class="extension-card-head"><strong>ONNX Runtime</strong><span class="extension-state" :class="{ on: status?.onnxruntime }">{{ status?.onnxruntime ? t("已安装") : t("未安装") }}</span></div>
+        <p>{{ t("用于运行标准 ONNX 模型，例如 CLIP、CLAP。不能直接读取 safetensors。") }}</p>
+        <div class="extension-path mono">{{ status?.onnxruntime_path || t("项目/.tools/onnxruntime/onnxruntime.dll") }}</div>
+        <button class="primary" :disabled="!!installing" @click="install('onnxruntime')"><Download :size="14" />{{ installing === "onnxruntime" ? t("安装中…") : status?.onnxruntime ? t("重新检查") : t("下载并安装") }}</button>
       </article>
 
       <article class="extension-card">
-        <div class="extension-card-head"><strong>Python sidecar</strong><span class="extension-state" :class="{ on: status?.python }">{{ status?.python ? "已安装" : "未安装" }}</span></div>
-        <p>可选的 Python 运行时入口，用于尚未被内置模型支持的格式；不会自动安装 PyTorch。</p>
-        <div class="extension-path mono">{{ status?.python_path || "项目/.tools/python/python.exe" }}</div>
-        <button class="primary" :disabled="!!installing" @click="install('python')"><Download :size="14" />{{ installing === "python" ? "安装中…" : status?.python ? "重新检查" : "下载运行时" }}</button>
+        <div class="extension-card-head"><strong>Python sidecar</strong><span class="extension-state" :class="{ on: status?.python }">{{ status?.python ? t("已安装") : t("未安装") }}</span></div>
+        <p>{{ t("可选的 Python 运行时入口，用于尚未被内置模型支持的格式；不会自动安装 PyTorch。") }}</p>
+        <div class="extension-path mono">{{ status?.python_path || t("项目/.tools/python/python.exe") }}</div>
+        <button class="primary" :disabled="!!installing" @click="install('python')"><Download :size="14" />{{ installing === "python" ? t("安装中…") : status?.python ? t("重新检查") : t("下载运行时") }}</button>
       </article>
     </div>
-    <p class="extension-note">扩展不会写入系统目录，也不会删除已有文件。Python 运行时本身不包含模型和 PyTorch，具体模型适配器可按需另行安装。</p>
+    <p class="extension-note">{{ t("扩展不会写入系统目录，也不会删除已有文件。Python 运行时本身不包含模型和 PyTorch，具体模型适配器可按需另行安装。") }}</p>
   </section>
 </template>
 

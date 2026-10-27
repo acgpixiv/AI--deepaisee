@@ -1,7 +1,7 @@
 {
   "name": "deepaisee",
   "private": true,
-  "version": "0.0.20",
+  "version": "0.0.21",
   "type": "module",
   "description": "deepaisee — AI 磁盘智能检索（Tauri 2 + Vue 3 + llama.cpp）",
   "scripts": {

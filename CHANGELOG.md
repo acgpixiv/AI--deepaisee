@@ -5,6 +5,89 @@
 
 ---
 
+## v0.21 — 2026-10-26
+
+**工作区检索 + 视频智能抽帧 / 音轨识别 + 通用配置页 + 界面动效 + 启动自动扫描 + NSIS 安装包**
+
+### 一、工作区目录（不用建索引也能搜正文）
+
+- 设置页新增「通用配置 → 工作区」：可添加**多个**目录，配置上限体积与遍历深度。
+- 搜索时工具栏多了「工作区」开关（默认按配置启用）。开启后，除索引库结果外还会遍历工作区目录里**尚未入库**的文件，现场抽取正文参与匹配，两类结果合并排序。
+- 实现：新增 `src-tauri/src/workspace.rs`（`WorkspaceSearch`），持有目录列表缓存（4 秒）与正文缓存（按 mtime+size 校验）、已索引路径集合缓存（10 秒），单次搜索最多现场抽取 **160 个文件 / 8M 字符**，仅在 `offset == 0` 时工作，避免翻页时重复抽全文。
+- 工作区命中用**负数 id**（-1 递减）区分「不在索引库里」，`tags` 带「工作区」、`reason` 为「工作区正文匹配」，缩略图字段为 false，前端不会去请求不存在的缩略图。
+- 新增 `db.rs::paths_under(root)` 用索引库前缀查询排除已入库文件，避免同一文件被算两次。
+
+### 二、视频抽帧：从「固定 4 帧」改成「智能采样」
+
+- 新增 4 个索引参数：`video_frame_interval`（最小抽帧间隔，**下限强制 4 秒**）、`video_max_frames`（单视频帧数上限，默认 64）、`video_dedup_distance`（帧指纹去重阈值，默认 6）、`video_frames` 默认值从 4 提到 16。
+- `media.rs` 新增 `sample_video_frames_smart()`：按时长与间隔算出目标帧数 → 分时间窗 → 每窗按「**场景切换点 > I 帧 > 窗口中心**」的优先级挑一帧 → 抽帧后用 **64 位 dHash**（9×8 灰度图逐点左右比较）**加上平均颜色**与上一张比对：只有结构相近（汉明距离 ≤ 阈值）且颜色也相近（RGB 差的平方和 ≤ 300，约每通道 10/255）才丢弃。只比结构的话，纯色/低对比画面（幻灯片白底、黑屏、纯色转场）指纹几乎一样，「红底切绿底」会被误判成同一帧。
+- I 帧探测：`ffmpeg -skip_frame nokey -vf select=eq(pict_type\,I),showinfo` 解析 `pts_time`，只解码关键帧，长视频也很快。
+- **Scene Change Detection**：`video_scene_change_times()` 用 `fps=2,scale=160:-2,select='gt(scene,0.4)',showinfo` 取镜头切换时间戳（降帧 + 缩图控制开销，超过 40 分钟的片子跳过该探测，改用 I 帧兜底）；场景切换点比 I 帧更贴近「内容真的变了」的位置，作为首选候选。
+- **自适应采样**：`adaptive_interval()` 按镜头切换密度调间隔 —— 几乎不换镜头（PPT / 网课 / 录屏）放稀到 1.5 倍，换镜头频繁（动作片 / 体育）加密到 0.5 倍，中间档保持配置值；任何情况下都不低于需求的 4 秒。
+- 帧数封顶：`wanted = ceil(duration / interval)` 再夹到 `[1, max_frames]`，窗口步长 = `max(duration/wanted, interval)` —— 长视频不会切出几万帧。
+- **只存特征向量与压缩缩略图**：抽出的帧只用于即时计算 CLIP / 媒体向量，算完立刻 `remove_file`，库里不留原始帧，索引体积不随时长线性膨胀。
+- `ai/hash.rs::video_vec` 也切到智能抽帧（间隔 4 秒、最多 6 帧、最大边 128），兜底向量同样受益；`ai/candle_backend.rs::embed_video`（candle 多模态视频塔）同步从「均匀切 32 帧」改成智能抽帧（间隔 4 秒、最多 32 帧、最大边 1024），三条编码路径策略一致。
+
+### 三、视频音轨语义识别（CLAP）
+
+- 新增 `index.video_index_audio`（默认开）+ 设置页「索引视频音轨（说话声/环境声）」开关。
+- `index.rs::embed_cross_modal` 的 `"video"` 分支重写：CLIP 部分逐帧编码后**求和再平均 + L2 归一化**（原来只取中间一帧）；音轨部分在开关打开且 CLAP 已装载时调 `clap.audio_vec(path)` 产出音频向量。
+- 失败静默：无声视频、解不出音轨都属正常，不写入错误计数、不刷日志。
+
+### 四、通用配置页（设置页左栏第一项）
+
+- 新增 `src/components/SettingsGeneralTab.vue`，设置页左栏从 5 项变 6 项，第一项为**通用配置**。
+- **语言**：中文 / English，**真正的前端 i18n**。新增 `src/i18n.ts`：以「中文原文」为词条 key，英文查表替换，未收录的文案自然回落中文（不会出现 `settings.general.title` 这类占位符）。词表约 400 条，覆盖顶栏、搜索页（含打字机标题、类型/排序、工具栏、结果计数、导出/重命名等提示）、六个设置标签全部静态文案与报错前缀、树状图、模型页、扩展页。语言状态是 `reactive` 的，保存后 `applyLanguage()` 立刻切全站文案，重启沿用；`applyAppearance(ui)` 会按新配置重新应用，避免保存后被默认值覆盖。
+- **主题**：明亮 / 暗色 / **跟随系统**（默认 system）。新增 `src/theme.ts` + `styles.css` 的一整段 `html[data-theme="dark"]` 变量覆盖；`system` 用 `matchMedia("(prefers-color-scheme: dark)")` 实时跟随；启动前先读 localStorage 预应用，避免首帧闪白。
+- **启动行为**：开机自启、启动时自动扫描、文件变化提示三个开关。
+- **默认搜索模式**：全文 / 语义 / 综合（影响搜索页初始开关状态）。
+- **工作区**：目录列表 + 上限体积 + 遍历深度 + 启用/实时抽取开关。
+- 配置层：`UiConfig` 新增 `language` / `autostart` / `auto_scan_on_start` / `notify_file_changes` / `default_search_mode`，默认 `theme` 从 "dark" 改为 **"system"**；`AppConfig` 新增 `workspace` 段（全部 `#[serde(default)]`，旧配置可直接加载）。
+
+### 五、界面动效
+
+- 页面切换用 `<Transition name="page" mode="out-in">`（透明度 + 6px 上移，0.18s）；toast 改 `<TransitionGroup>`，自带进出与位置移动过渡。
+- 按钮加 `:active` 缩放反馈；搜索框原有高度/圆角过渡保留。
+- 尊重系统设置：`@media (prefers-reduced-motion: reduce)` 下关闭所有过渡。
+
+### 六、启动自动扫描与文件变化提醒
+
+- `lib.rs` 新增 `schedule_startup_scan()`：启动 2.5 秒后（`ui.auto_scan_on_start` 且已配置扫描根时）在后台线程跑一次增量扫描，只对比修改时间同步新增/修改/删除，不重算已有向量；「已在进行中」不当作错误。
+- `App.vue` 每 3 秒轮询扫描进度，一次扫描结束时统计 `新增/更新/移除`，有变化且 `notify_file_changes` 打开时在右下角弹一条轻量提示（6 秒），并刷新顶部统计。
+
+### 七、NSIS 安装包
+
+- `bundle.targets` 改为 `["nsis"]`，并提供**自定义模板** `src-tauri/nsis/installer.nsi`（基于 tauri-cli v2.12.3 官方模板）与 `installer-hooks.nsh`。
+- **安装路径可选、默认不落 C 盘**：`installMode = currentUser`（不需要管理员），默认目录顺序为「上次安装位置 → `D:\Apps\deepaisee` → `E:\Apps\deepaisee` → `%LOCALAPPDATA%\deepaisee`」，用户仍可在目录页自选。
+- **DLL 依赖**：`bundle.resources` 改成 map 形式，把 `onnxruntime.dll` / `WebView2Loader.dll` / `libstdc++-6.dll` / `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` / `models\` / `tools\bin\ffmpeg.exe` 直接平铺进安装目录；CUDA 运行时 DLL 若存在，由 `NSIS_HOOK_POSTINSTALL` 拷到根目录。
+- **快捷方式与卸载**：开始菜单 + 桌面快捷方式（官方模板自带），注册表写入 `DisplayName/DisplayVersion/InstallLocation/UninstallString`，卸载时清理运行时 DLL、保留用户数据（除非勾选删除）。
+- **插件扩展预留**：安装时创建 `$INSTDIR\plugins` 并写说明文件，注册表记 `InstallDir` / `PluginsDir` / `Layout=nsis`；卸载时只在目录为空时移除 `plugins`。
+- `config.rs::data_dir` 改造：exe 同级 `data\` 不可写时自动回退 `%LOCALAPPDATA%\deepaisee\data` → `%APPDATA%\deepaisee\data` → `%TEMP%\deepaisee\data`，并用 `.write-probe` 探针验证可写（结果缓存在 `OnceLock`）。**这是装到受保护目录后仍能建索引的前提。**
+- 新增 `config.rs::plugins_dir()`，为后续插件加载留出入口。
+- `cmd.rs::extension_status_for` 改为双布局探测：优先 `.tools\onnxruntime\onnxruntime.dll`，找不到再看安装根目录。
+- **WebView2 用户数据目录可写性**：`tauri.conf.json` 的窗口改为 `create: false`，由 `lib.rs::create_main_window()` 手动 `WebviewWindowBuilder` 建窗并指定 `data_directory`（`webview_data_dir()` 依次尝试 exe 同级 `webview-data\` → `<数据目录>\webview\` → `%LOCALAPPDATA%\deepaisee\webview`，优先非 C 盘可写目录，可用 `WEBVIEW2_USER_DATA_FOLDER` 覆盖）。这样安装到 `D:\Apps` 或 `Program Files` 后不会因为默认的 `%LOCALAPPDATA%\<bundle-id>\EBWebView` 被占用/拒绝而启动失败（本机曾复现 `HRESULT(0x800700AA) 请求的资源在使用中`）。
+- **首次运行自动探测模型（自检不再误报哈希基线）**：新增 `models.rs::autodetect_embed_model()`，主程序后台线程、`--selftest`、`--cli` 三条入口共用同一套规则（优先多模态 safetensors，其次可直接加载的嵌入 GGUF，依次看 exe 同级 `models\` 与数据目录 `models\`）。此前自动探测只写在 `lib.rs` 的 GUI 后台线程里，`--selftest` / `--cli` 拿到的是空 `embed_model`，会报「未配置模型，改用哈希基线」——安装包验证时正是因此误判。
+- **CPU 推理回退（语义检索不再整体降级）**：本机没有 CUDA toolkit，发布构建的 llama.cpp 只带 CPU 后端，而旧代码在 `gpu_devices()` 为空时直接返回错误（`当前 llama.cpp 构建或驱动没有可用 GPU`），上层只能退回 256/512 维哈希基线 —— 装好的程序看起来「能跑」，实际语义检索失效。`ai/llama.rs::LlamaEmbedder::load` 改为：显式选 `cpu` 或枚举不到加速设备时 `selected = None`，`create_handle` 传空 `device_name` 走 llama.cpp 的 CPU 默认路径；错误 target 与 `Embedder::info()` 的 detail 同步显示「CPU 推理（没有可用加速后端）」。模型设置页的 GPU 下拉新增「CPU（无可用加速设备时）」选项，空态文案改为「未检测到可用加速设备，将使用 CPU 推理」。
+- **发布包不再夹带开发探针**：`claptest` / `crossprobe` / `melprobe` / `smoke` / `visdemo` 五个源码从 `src-tauri/src/bin/` 移到 `src-tauri/examples/`。tauri-bundler 会把 `src/bin/` 下每个 bin 都当外部二进制塞进安装包（上一版安装目录里多出 5 个探针 exe，约 13 MB），移到 `examples/` 后由 `cargo run --example <名字>` 运行，不会进分发包。
+
+### 八、清理与文档
+
+- 根目录的 `启动 deepaisee.bat`（与启动器功能重复）删除；`launcher.ps1` 保留并修正：
+  - 数据目录改为按「exe 同级 → LOCALAPPDATA → APPDATA」探测，兼容安装版；
+  - 版本兜底文案更新到 0.21，标题栏版本号按宽度自适应。
+- 删除本次改造留下的一次性脚本与临时文件（`_do_backup.ps1`、`_do_replace.ps1`、`_tmp_*`），README 全面更新：安装包用法、默认安装路径、六个设置标签、工作区开关、视频抽帧参数、音轨识别、数据目录回退规则。
+- **交付产物归档 + 大目录清理**：最终安装包与便携版 exe 复制到根目录 `release\`（`deepaisee_0.0.21_x64-setup.exe` 650.85 MiB + `deepaisee.exe`），方便直接取用；随后把 `build-target\`（13 GB 构建缓存）、`_backup_old_20261026\`（1.7 GB）、`dist-app\`（998 MB 旧便携包）、`AI--deepaisee-main\`（32 MB 旧源码副本）四个目录整体移入回收站（不是永久删除，可从回收站还原），项目体积 **约 20.7 GB → 4.7 GB**。`.gitignore` 补 `release/`、`dist-app/`、`AI--deepaisee-main/`；README 的安装包路径同步改为 `release\`。重新构建时 `cargo` 会重新生成目标目录（首次编译约 3 分钟）。
+- `scripts/build-release.ps1` 增加发布前置检查：`src-tauri\src\bin` 下若还有 `*.rs` 就中止构建，避免 tauri-bundler 把开发探针当外部二进制打进安装包（本次曾多出 `claptest/crossprobe/melprobe/smoke/visdemo` 五个 exe，约 13 MB）。
+- 界面文案国际化（见第四节「语言」）：新增 `src/i18n.ts`（约 380 条词条），顶栏、搜索页、六个设置标签、树状图、模型页、扩展页与各类提示/报错前缀全部走 `t()`；`main.ts` 启动前调 `primeAppearance()` 预应用主题与语言，避免首帧闪烁。
+
+### 九、构建与版本
+
+- 版本号同步到 **0.0.21 / 显示 0.21**（`Cargo.toml`、`tauri.conf.json`、`package.json`、`lib.rs`）。
+- `Cargo.toml` 的默认 feature 从 `["llama", "candle-cuda"]` 改为 `["llama"]`：本机没有 CUDA toolkit 时 `cudarc` 的 build script 会因 `nvcc` 缺失直接失败，发布构建改用 `--features llama,candle,custom-protocol` 显式指定。
+- `scripts/activate-local.ps1` 兼容两套工具链布局（`.tools` 与 `tools`）并补上 `msys64\ucrt64\bin`；`CARGO_TARGET_DIR` 不再硬编码，外部指定优先。
+
+---
+
 ## v0.20 — 2026-10-24
 
 **跨模态检索：用一句话找图片 / 音频 / 视频 + 同模态找相似**

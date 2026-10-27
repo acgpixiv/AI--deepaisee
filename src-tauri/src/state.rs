@@ -37,6 +37,8 @@ pub struct AppState {
     pub scan_stats: Arc<crate::scan::ScanStatsShared>,
     pub scan_cancel: Arc<std::sync::atomic::AtomicBool>,
     pub scan_busy: Arc<std::sync::atomic::AtomicBool>,
+    /// 工作区实时检索（未入库文件的现场抽取 + 缓存）
+    pub workspace: crate::workspace::WorkspaceSearch,
 }
 
 pub struct EngineParts {
@@ -124,6 +126,7 @@ impl AppState {
             scan_stats: Arc::new(crate::scan::ScanStatsShared::new()),
             scan_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             scan_busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            workspace: crate::workspace::WorkspaceSearch::new(),
         })
     }
 
@@ -168,10 +171,22 @@ impl AppState {
             audio_vectors: &p.audio,
             cfg: &p.cfg,
         };
-        engine.search(q)
+        let mut hits = engine.search(q);
+
+        // 工作区实时检索：把「工作区目录里有、索引库里没有」的文件也算进来。
+        // 开关由前端传（默认开），只有首页搜索要，其他调用方（相似检索、服务端 API）不需要。
+        if q.workspace.unwrap_or(true) {
+            let ws_cfg = self.cfg.read().workspace.clone();
+            if ws_cfg.enabled && !ws_cfg.dirs.is_empty() {
+                let extra = self.workspace.search(&self.db, &ws_cfg, q, &hits);
+                if !extra.is_empty() {
+                    merge_workspace_hits(&mut hits, extra, q);
+                }
+            }
+        }
+        hits
     }
 
-    /// 重建 Indexer（切换 embedding 后端后调用）。
     pub fn rebuild_indexer(&self) -> Arc<Indexer> {
         let app_cfg = self.cfg.read().clone();
         let cfg = app_cfg.index.clone();
@@ -217,3 +232,26 @@ impl AppState {
         self.indexer.read().clone()
     }
 }
+
+/// 把工作区命中并入索引结果：按分数降序，保留原来的分页语义。
+///
+/// 工作区命中没有真实 id（负数），排序键用分数而不是 id，避免两批结果
+/// 混在一起时顺序错乱。offset 已经在 workspace 侧过滤过（只处理首页），
+/// 这里只需要把总数截断到 limit。
+fn merge_workspace_hits(
+    hits: &mut Vec<crate::search::Hit>,
+    extra: Vec<crate::search::Hit>,
+    q: &crate::search::SearchQuery,
+) {
+    hits.extend(extra);
+    let sort = q.sort.as_deref().unwrap_or("relevance");
+    if sort == "relevance" || sort.is_empty() {
+        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    let limit = q.limit.unwrap_or(1000).max(1);
+    let offset = q.offset.unwrap_or(0);
+    if hits.len() > offset + limit {
+        hits.truncate(offset + limit);
+    }
+}
+

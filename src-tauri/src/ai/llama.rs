@@ -260,21 +260,28 @@ impl LlamaEmbedder {
             return Err(format!("GGUF 模型不存在：{model_path}"));
         }
         let c_path = CString::new(model_path).map_err(|_| "路径含 NUL 字节".to_string())?;
-        if selected_device.eq_ignore_ascii_case("cpu") {
-            return Err("CPU 推理已禁用，请选择可用 GPU 设备".into());
-        }
-        let selected = {
+        // CPU 也是合法的后端：llama.cpp 的 CPU 构建（构建时没有 CUDA/Vulkan
+        // 工具链）以及没有可用显卡的机器，如果这里直接报错，调用方就会悄悄退回
+        // 哈希基线，语义检索等于废掉。显式选 CPU 或枚举不到加速设备时都走 CPU。
+        let selected = if selected_device.eq_ignore_ascii_case("cpu") {
+            None
+        } else {
             let devices = gpu_devices();
             if devices.is_empty() {
-                return Err("当前 llama.cpp 构建或驱动没有可用 GPU；请使用 CUDA/Vulkan 后端重新构建并安装对应驱动".into());
-            }
-            let device = if selected_device.trim().is_empty() || selected_device.eq_ignore_ascii_case("auto") {
-                devices.first()
+                None
             } else {
-                devices.iter().find(|d| d.id == selected_device)
+                let device = if selected_device.trim().is_empty()
+                    || selected_device.eq_ignore_ascii_case("auto")
+                {
+                    devices.first()
+                } else {
+                    devices.iter().find(|d| d.id == selected_device)
+                }
+                .ok_or_else(|| {
+                    format!("所选 GPU 不可用或已断开：{selected_device}；请重新选择设备")
+                })?;
+                Some(device.clone())
             }
-            .ok_or_else(|| format!("所选 GPU 不可用或已断开：{selected_device}；请重新选择设备"))?;
-            Some(device.clone())
         };
         let device_name = selected
             .as_ref()
@@ -302,7 +309,10 @@ impl LlamaEmbedder {
         );
         if raw.is_null() {
             let msg = error_message(&err);
-            let target = selected.as_ref().map(|d| format!("GPU {} ({})", d.name, d.backend)).unwrap_or_else(|| "GPU".into());
+            let target = selected
+                .as_ref()
+                .map(|d| format!("GPU {} ({})", d.name, d.backend))
+                .unwrap_or_else(|| "CPU".into());
             return Err(format!("在 {target} 上加载 GGUF 失败：{msg}"));
         }
         let dim = unsafe { ds_llama_dim(raw) };
@@ -319,7 +329,7 @@ impl LlamaEmbedder {
             dim: dim as usize,
             context_tokens: n_ctx.max(256) as usize,
             model_name: name,
-            device: selected.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| "GPU".into()),
+            device: selected.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| "CPU".into()),
         })
     }
 
@@ -361,7 +371,11 @@ impl Embedder for LlamaEmbedder {
             // llama.cpp 只处理文本；图片/音频/视频由 hash 兜底
             modalities: vec!["text".into()],
             ready: true,
-            detail: format!("llama.cpp GGUF · {} · 全部模型层运行于 GPU", self.device),
+            detail: if self.device.eq_ignore_ascii_case("cpu") {
+                "llama.cpp GGUF · CPU 推理（没有可用加速后端）".to_string()
+            } else {
+                format!("llama.cpp GGUF · {} · 全部模型层运行于 GPU", self.device)
+            },
         }
     }
 

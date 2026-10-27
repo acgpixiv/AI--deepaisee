@@ -46,6 +46,8 @@ pub struct SearchQuery {
     /// 文字 → 声音空间（CLAP）。
     #[serde(skip)]
     pub audio_query: Option<Vec<f32>>,
+    /// 是否把「工作区目录」里尚未入库的文件也算进来（实时抽取正文）。
+    pub workspace: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

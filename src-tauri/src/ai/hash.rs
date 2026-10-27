@@ -123,7 +123,12 @@ impl HashEmbedder {
     }
 
     fn video_vec(&self, path: &Path) -> Result<Vec<f32>, String> {
-        let frames = crate::media::sample_video_frames(path, 4, 128);
+        // 兜底特征用智能抽帧（去重后帧数更少也更代表画面），
+        // 尺寸压到 128 够算颜色直方图，速度优先。
+        let frames = crate::media::sample_video_frames_smart(
+            path,
+            crate::media::FramePlan { interval: 4.0, max_frames: 6, max_side: 128, dedup_distance: 6 },
+        );
         if frames.is_empty() {
             return Err("视频抽帧失败（需要 ffmpeg）".into());
         }

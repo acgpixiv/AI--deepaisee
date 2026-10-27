@@ -1,33 +1,80 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Database, Search, Settings2 } from "lucide-vue-next";
-import { api } from "./api";
-import { refreshInfo, refreshStats, store } from "./store";
+import { api, type ScanProgress } from "./api";
+import { refreshInfo, refreshStats, store, toast } from "./store";
+import { applyAppearance } from "./theme";
+import { langState, t } from "./i18n";
 import SearchView from "./views/SearchView.vue";
 import TreeView from "./views/TreeView.vue";
 import SettingsDrawer from "./components/SettingsDrawer.vue";
 
 type Page = "home" | "tree" | "settings";
 const page = ref<Page>("home");
-const settingsTab = ref("index");
+const settingsTab = ref("general");
 const thumbDir = ref("");
+const notifyChanges = ref(true);
 let statsTimer: number | undefined;
+let scanTimer: number | undefined;
+let lastScanRunning = false;
+let lastScan: ScanProgress | null = null;
 
-function showSettings(tab = "index") {
+function showSettings(tab = "general") {
   settingsTab.value = tab;
   page.value = "settings";
 }
 
+/** 读取配置并应用外观（主题 / 字号 / 语言）。 */
+async function syncAppearance() {
+  try {
+    const cfg = await api.getConfig();
+    applyAppearance(cfg.ui);
+    notifyChanges.value = cfg.ui?.notify_file_changes !== false;
+  } catch {
+    /* 配置读不到时用默认外观 */
+  }
+}
+
+/** 轮询扫描进度：从「运行中」变成「已结束」时在底部给一条轻量提示。 */
+async function pollScan() {
+  try {
+    const p = await api.scanProgress();
+    if (lastScanRunning && !p.running && lastScan) {
+      const changed = (p.added || 0) + (p.updated || 0) + (p.missing || 0);
+      if (changed > 0 && notifyChanges.value) {
+        const parts: string[] = [];
+        if (p.added) parts.push(`${t("新增")} ${p.added}`);
+        if (p.updated) parts.push(`${t("更新")} ${p.updated}`);
+        if (p.missing) parts.push(`${t("移除")} ${p.missing}`);
+        toast(`${t("文件变化：")}${parts.join(" · ")}`, "info", 6000);
+      }
+      await refreshStats();
+    }
+    lastScanRunning = p.running;
+    lastScan = p;
+  } catch {
+    /* 后端未就绪时忽略 */
+  }
+}
+
 onMounted(async () => {
-  await Promise.all([refreshInfo(), refreshStats()]);
+  await Promise.all([refreshInfo(), refreshStats(), syncAppearance()]);
   try {
     thumbDir.value = `${await api.dataDir()}\\thumbs`;
   } catch {}
   statsTimer = window.setInterval(refreshStats, 5000);
+  scanTimer = window.setInterval(pollScan, 3000);
+  void pollScan();
 });
 
 onBeforeUnmount(() => {
   if (statsTimer) window.clearInterval(statsTimer);
+  if (scanTimer) window.clearInterval(scanTimer);
+});
+
+// 从设置页返回时重新同步一次外观（用户可能刚改过主题）
+watch(page, (next) => {
+  if (next === "home") void syncAppearance();
 });
 </script>
 
@@ -37,46 +84,49 @@ onBeforeUnmount(() => {
       <button
         v-if="page === 'settings'"
         class="search-link"
-        aria-label="文件搜索"
+        :aria-label="t('文件搜索')"
         @click="page = 'home'"
       >
         <Search :size="18" aria-hidden="true" />
-        <span>文件搜索</span>
+        <span>{{ t("文件搜索") }}</span>
       </button>
       <button
         class="index-link"
         :class="{ current: page === 'tree' }"
-        :title="page === 'tree' ? '返回搜索主页' : '查看目录树状图'"
+        :title="page === 'tree' ? t('返回搜索主页') : t('查看目录树状图')"
         @click="page = page === 'tree' ? 'home' : 'tree'"
       >
         <Database :size="15" aria-hidden="true" />
         <span>
-          {{ (store.stats?.files ?? 0).toLocaleString() }} 个文件
+          {{ (store.stats?.files ?? 0).toLocaleString() }} {{ langState.current === "en" ? "files" : "个文件" }}
           <span class="index-divider">·</span>
           {{ store.stats?.bytes_label ?? "0 B" }}
         </span>
       </button>
-      <button class="icon-button settings-button" title="设置" aria-label="设置" @click="page === 'settings' ? (page = 'home') : showSettings()">
+      <button class="icon-button settings-button" :title="t('设置')" :aria-label="t('设置')" @click="page === 'settings' ? (page = 'home') : showSettings()">
         <Settings2 :size="19" aria-hidden="true" />
       </button>
     </header>
 
     <main class="app-content">
-      <SearchView v-if="page === 'home'" :thumb-dir="thumbDir" />
-      <TreeView v-else-if="page === 'tree'" />
-      <SettingsDrawer
-        v-else
-        :open="true"
-        :tab="settingsTab"
-        @tab="settingsTab = $event"
-      />
+      <Transition name="page" mode="out-in">
+        <SearchView v-if="page === 'home'" key="home" :thumb-dir="thumbDir" />
+        <TreeView v-else-if="page === 'tree'" key="tree" />
+        <SettingsDrawer
+          v-else
+          key="settings"
+          :open="true"
+          :tab="settingsTab"
+          @tab="settingsTab = $event"
+        />
+      </Transition>
     </main>
 
-    <div class="toasts" aria-live="polite">
+    <TransitionGroup tag="div" name="toast" class="toasts" aria-live="polite">
       <div v-for="item in store.toasts" :key="item.id" class="toast" :class="item.level">
         {{ item.text }}
       </div>
-    </div>
+    </TransitionGroup>
   </div>
 </template>
 
@@ -91,6 +141,7 @@ onBeforeUnmount(() => {
   border-bottom: 1px solid var(--border);
   background: var(--bg);
   flex: none;
+  transition: background .18s ease, border-color .18s ease;
 }
 .search-link {
   width: 36px;
@@ -125,6 +176,7 @@ onBeforeUnmount(() => {
   color: var(--muted);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+  transition: background .16s ease, border-color .16s ease, color .16s ease;
 }
 .index-link:hover, .index-link.current { background: var(--panel); border-color: var(--border); color: var(--text); }
 .index-divider { padding: 0 3px; color: #59615d; }
@@ -138,18 +190,33 @@ onBeforeUnmount(() => {
   border: 1px solid transparent;
   background: transparent;
   color: var(--muted);
+  transition: background .16s ease, border-color .16s ease, color .16s ease, transform .1s ease;
 }
 .icon-button:hover { background: var(--panel); border-color: var(--border); color: var(--text); }
+.icon-button:active { transform: scale(.94); }
 .settings-button { margin-left: 4px; }
 .app-content { flex: 1; min-height: 0; min-width: 0; overflow: hidden; }
+
+/* 页面切换：淡入 + 轻微上移，避免整块界面硬切。 */
+.page-enter-active, .page-leave-active { transition: opacity .18s ease, transform .18s ease; }
+.page-enter-from { opacity: 0; transform: translateY(6px); }
+.page-leave-to { opacity: 0; transform: translateY(-4px); }
+
 .toasts { position: fixed; right: 18px; bottom: 18px; z-index: 100; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; pointer-events: none; }
-.toast { max-width: min(420px, calc(100vw - 36px)); padding: 9px 12px; border: 1px solid var(--border); border-radius: 4px; background: #fff; color: var(--text); box-shadow: 0 5px 18px rgba(0, 0, 0, .12); font-size: 12px; }
+.toast { max-width: min(420px, calc(100vw - 36px)); padding: 9px 12px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel); color: var(--text); box-shadow: 0 5px 18px rgba(0, 0, 0, .12); font-size: 12px; }
 .toast.ok { border-color: #85b894; background: #f1faf3; color: #245a32; }
 .toast.warn { border-color: #cfad6b; background: #fffaf0; color: #715414; }
 .toast.error { border-color: #d58b86; background: #fff5f4; color: #7b2b27; }
+.toast-enter-active, .toast-leave-active { transition: opacity .2s ease, transform .2s ease; }
+.toast-enter-from, .toast-leave-to { opacity: 0; transform: translateX(18px); }
+.toast-move { transition: transform .2s ease; }
+
 @media (max-width: 560px) {
   .topbar { padding: 0 12px; }
   .index-link { min-width: 0; gap: 6px; padding-inline: 7px; }
   .index-link span { max-width: 175px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .page-enter-active, .page-leave-active, .toast-enter-active, .toast-leave-active { transition: none; }
 }
 </style>

@@ -67,6 +67,15 @@ pub struct IndexConfig {
     pub auto_embed: bool,
     pub image_max_side: u32,
     pub video_frames: u32,
+    /// 视频抽帧的最小时间间隔（秒）。间隔越小越密，下限 4 秒，
+    /// 避免长视频抽出成千上万张几乎相同的画面。
+    pub video_frame_interval: f32,
+    /// 单个视频最多保留多少帧（安全上限，超过时自动放稀采样）。
+    pub video_max_frames: u32,
+    /// 相邻两帧的图像指纹（dHash）汉明距离小于该值即视为重复画面丢弃。
+    pub video_dedup_distance: u32,
+    /// 是否对视频音轨做语义（CLAP）索引，用于「用文字描述找声音」。
+    pub video_index_audio: bool,
     pub audio_seconds: f32,
     pub batch_size: usize,
 }
@@ -78,7 +87,11 @@ impl Default for IndexConfig {
             auto_fulltext: true,
             auto_embed: true,
             image_max_side: 448,
-            video_frames: 4,
+            video_frames: 16,
+            video_frame_interval: 4.0,
+            video_max_frames: 64,
+            video_dedup_distance: 6,
+            video_index_audio: true,
             audio_seconds: 8.0,
             batch_size: 8,
         }
@@ -196,13 +209,55 @@ impl Default for WatchConfig {
 #[serde(default)]
 pub struct UiConfig {
     pub font_size: u32,
+    /// light | dark | system
     pub theme: String,
+    /// zh | en
+    pub language: String,
     pub remember_window: bool,
+    /// 开机自启（写入当前用户的 Run 注册表项）
+    pub autostart: bool,
+    /// 启动时自动扫描索引根目录的增量变化
+    pub auto_scan_on_start: bool,
+    /// 启动扫描发现变化时是否在底部给出提示条
+    pub notify_file_changes: bool,
+    /// 默认搜索模式：fulltext | semantic | hybrid
+    pub default_search_mode: String,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
-        Self { font_size: 14, theme: "dark".into(), remember_window: true }
+        Self {
+            font_size: 14,
+            theme: "system".into(),
+            language: "zh".into(),
+            remember_window: true,
+            autostart: false,
+            auto_scan_on_start: true,
+            notify_file_changes: true,
+            default_search_mode: "hybrid".into(),
+        }
+    }
+}
+
+/// 工作区：主页可以直接指定一个目录，搜索时把该目录里**尚未入库**的文件
+/// 实时抽取正文一起参与检索，不影响索引数据库。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceConfig {
+    /// 工作区根目录列表，空表示未启用（可同时指定多个目录）
+    pub dirs: Vec<String>,
+    pub enabled: bool,
+    /// 是否对未入库文件做实时正文抽取（否则只按文件名匹配）
+    pub live_extract: bool,
+    /// 实时抽取时跳过的超大文件（MB）
+    pub max_file_mb: u64,
+    /// 递归深度上限，0 = 不递归
+    pub depth: u32,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self { dirs: vec![], enabled: true, live_extract: true, max_file_mb: 64, depth: 4 }
     }
 }
 
@@ -235,6 +290,7 @@ pub struct AppConfig {
     pub search: SearchConfig,
     pub watch: WatchConfig,
     pub ui: UiConfig,
+    pub workspace: WorkspaceConfig,
     pub server: ServerConfig,
 }
 
@@ -258,14 +314,48 @@ impl AppConfig {
     }
 }
 
-/// 数据目录：exe 同级 data/（便携模式），开发时为项目根 data/。
+/// 数据目录解析：优先 exe 同级 data/（便携模式）；如果该位置不可写
+/// （典型场景：NSIS 安装到 Program Files），回退到用户可写目录
+/// %LOCALAPPDATA%\deepaisee\data，保证索引库/配置/模型缓存总能落盘。
+static DATA_DIR_CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 pub fn data_dir(app_dir: Option<&Path>) -> PathBuf {
-    match app_dir {
+    DATA_DIR_CACHE.get_or_init(|| resolve_data_dir(app_dir)).clone()
+}
+
+fn resolve_data_dir(app_dir: Option<&Path>) -> PathBuf {
+    let portable = match app_dir {
         Some(d) => d.join("data"),
         None => PathBuf::from("data"),
+    };
+    if portable.is_dir() {
+        return portable;
     }
+    // 目录还不存在：试着建一次并写探针，判断这个位置是否可写。
+    if std::fs::create_dir_all(&portable).is_ok() {
+        let probe = portable.join(".write-probe");
+        let ok = std::fs::write(&probe, b"ok").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        if ok {
+            return portable;
+        }
+    }
+    let fallback = std::env::var_os("LOCALAPPDATA")
+        .map(|p| PathBuf::from(p).join("deepaisee").join("data"))
+        .or_else(|| std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("deepaisee").join("data")))
+        .unwrap_or_else(|| std::env::temp_dir().join("deepaisee").join("data"));
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
 }
 
 pub fn config_path(app_dir: Option<&Path>) -> PathBuf {
     data_dir(app_dir).join("config.json")
+}
+
+/// 插件扩展预留目录：exe 同级 plugins/。安装版卸载时会保留该目录，
+/// 后续插件只需把目录（或 zip）放进去即可被发现。
+pub fn plugins_dir(app_dir: &Path) -> PathBuf {
+    let dir = app_dir.join("plugins");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }

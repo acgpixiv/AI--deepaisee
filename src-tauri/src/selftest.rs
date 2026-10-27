@@ -65,10 +65,28 @@ pub fn run() -> i32 {
 
     // 1. 配置
     let cfg_path = config_path(Some(&app_dir));
-    let cfg = AppConfig::load(&cfg_path);
+    let mut cfg = AppConfig::load(&cfg_path);
+    // 安装版/便携版首次运行时 embed_model 是空的，主程序会在后台自动探测
+    // models\ 下的模型。自检必须用同一套规则，否则会误报「改用哈希基线」。
+    let mut autodetected = false;
+    if cfg.model.embed_model.trim().is_empty() {
+        if let Some(found) = crate::models::autodetect_embed_model(&cfg.model, &app_dir, &data) {
+            cfg.model.embed_model = found;
+            autodetected = true;
+        }
+    }
     r.ok(
         "读取配置",
-        format!("{}（模型 {}）", cfg_path.display(), cfg.model.embed_model),
+        format!(
+            "{}（模型 {}{}）",
+            cfg_path.display(),
+            if cfg.model.embed_model.trim().is_empty() {
+                "未配置"
+            } else {
+                cfg.model.embed_model.as_str()
+            },
+            if autodetected { "，自动探测" } else { "" }
+        ),
         0.0,
     );
 

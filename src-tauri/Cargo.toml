@@ -1,6 +1,6 @@
 [package]
 name = "deepaisee"
-version = "0.0.20"
+version = "0.0.21"
 description = "deepaisee - AI disk search (Tauri 2 + Vue 3 + llama.cpp)"
 authors = ["deepaisee"]
 edition = "2021"
@@ -21,7 +21,7 @@ cmake = "0.1"
 [features]
 # 默认就带上 llama.cpp：否则 `tauri build` 不带 --features llama 时会编译出
 # 一个没有本地推理能力的版本，运行时悄悄退回哈希基线（表现为状态栏 hash · 256 维）。
-default = ["llama", "candle-cuda"]
+default = ["llama"]
 llama = []
 candle = ["dep:embeddinggemma2"]
 candle-cuda = ["candle", "embeddinggemma2/cuda"]

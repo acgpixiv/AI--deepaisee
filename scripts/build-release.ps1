@@ -1,8 +1,8 @@
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-# Build one portable Tauri application. CUDA is selected at build time only to
-# include Candle's kernels; the actual GPU index is selected by the app at run time.
+# Build the Tauri release and the NSIS installer in one shot.
+# CUDA is only a build-time switch for Candle kernels; the app picks the GPU at run time.
 $repo = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "activate-local.ps1")
 
@@ -28,15 +28,7 @@ function Stage-CudaRuntime([string]$cudaRoot) {
   $runtimeTarget = Join-Path $repo ".tools\cuda-runtime"
   New-Item -ItemType Directory -Force -Path $runtimeTarget | Out-Null
 
-  $patterns = @(
-    "cublas64_*.dll",
-    "cublasLt64_*.dll",
-    "cudart64_*.dll",
-    "curand64_*.dll",
-    "nvrtc64_*.dll",
-    "nvrtc-builtins64_*.dll",
-    "nvJitLink_*.dll"
-  )
+  $patterns = @("cublas64_*.dll", "cublasLt64_*.dll", "cudart64_*.dll", "curand64_*.dll", "nvrtc64_*.dll", "nvrtc-builtins64_*.dll", "nvJitLink_*.dll")
   $files = foreach ($pattern in $patterns) {
     Get-ChildItem -LiteralPath $runtimeSource -Filter $pattern -File -ErrorAction SilentlyContinue
   }
@@ -57,10 +49,54 @@ function Stage-CudaRuntime([string]$cudaRoot) {
   Write-Host "Staged $($files.Count + 1) CUDA/MSVC runtime DLLs in $runtimeTarget"
 }
 
+# Everything the installer ships must exist before tauri-bundler starts packaging.
+function Assert-ReleasePrerequisites {
+  $required = @(
+    ".tools\onnxruntime\onnxruntime.dll",
+    "models\embeddinggemma2.gguf",
+    "tools\bin\ffmpeg.exe",
+    "libstdc++-6.dll",
+    "libgcc_s_seh-1.dll",
+    "libwinpthread-1.dll",
+    "WebView2Loader.dll",
+    "src-tauri\nsis\installer.nsi",
+    "src-tauri\nsis\installer-hooks.nsh",
+    "scripts\install-onnxruntime.ps1",
+    "scripts\install-python-sidecar.ps1"
+  )
+  $missing = @()
+  foreach ($relative in $required) {
+    if (-not (Test-Path -LiteralPath (Join-Path $repo $relative))) { $missing += $relative }
+  }
+  if ($missing.Count -gt 0) {
+    $list = ($missing -join ([Environment]::NewLine + "  "))
+    throw ("Missing installer resources:" + [Environment]::NewLine + "  " + $list + [Environment]::NewLine + "Run scripts\install-onnxruntime.ps1 and stage the runtime DLLs next to the repo root.")
+  }
+  foreach ($pattern in @("models\clip\*", "models\clap\*")) {
+    $hits = Get-ChildItem -Path (Join-Path $repo $pattern) -File -ErrorAction SilentlyContinue
+    if (-not $hits) { Write-Warning "Optional cross-modal models not found: $pattern" }
+  }
+  # tauri-bundler treats every [[bin]] under src-tauri/src/bin as an external
+  # binary and copies it into the installer. Dev probes must live in
+  # src-tauri/examples so they never ship.
+  $strayBins = Get-ChildItem -Path (Join-Path $repo "src-tauri\src\bin") -Filter "*.rs" -File -ErrorAction SilentlyContinue
+  if ($strayBins) {
+    throw ("src-tauri\src\bin contains probe binaries that would be bundled into the installer: " + (($strayBins | ForEach-Object { $_.Name }) -join ", ") + ". Move them to src-tauri\examples.")
+  }
+  Write-Host "Installer prerequisites OK"
+}
+
+function Resolve-TargetRoot {
+  if ($env:CARGO_TARGET_DIR -and (Test-Path -LiteralPath $env:CARGO_TARGET_DIR)) { return (Resolve-Path -LiteralPath $env:CARGO_TARGET_DIR).Path }
+  return (Join-Path $repo "src-tauri\target")
+}
+
 Push-Location $repo
 try {
+  Assert-ReleasePrerequisites
   $runtimeDir = Join-Path $repo ".tools\cuda-runtime"
   New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+
   $cudaRoot = Find-CudaRoot
   $features = "llama,candle,custom-protocol"
   if ($cudaRoot) {
@@ -78,11 +114,22 @@ try {
 
   $tauriCli = Join-Path $repo "node_modules\.bin\tauri.cmd"
   & $tauriCli build --features $features @args
-  if ($LASTEXITCODE -ne 0) {
-    throw "Tauri release build failed with exit code $LASTEXITCODE"
-  }
-  if ($cudaRoot) {
-    Copy-Item -Path (Join-Path $runtimeDir "*.dll") -Destination (Join-Path $repo "src-tauri\target\release") -Force
+  if ($LASTEXITCODE -ne 0) { throw "Tauri release build failed with exit code $LASTEXITCODE" }
+
+  $targetRoot = Resolve-TargetRoot
+  $releaseDir = Join-Path $targetRoot "release"
+  if ($cudaRoot) { Copy-Item -Path (Join-Path $runtimeDir "*.dll") -Destination $releaseDir -Force }
+
+  $installerDir = Join-Path $releaseDir "bundle\nsis"
+  $installers = @(Get-ChildItem -Path $installerDir -Filter "*-setup.exe" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+  Write-Host ""
+  Write-Host "Release binary : $(Join-Path $releaseDir 'deepaisee.exe')"
+  if ($installers.Count -gt 0) {
+    $installer = $installers[0]
+    $sizeMb = [math]::Round($installer.Length / 1MB, 1)
+    Write-Host "NSIS installer : $($installer.FullName) ($sizeMb MB)"
+  } else {
+    Write-Warning "No NSIS installer was produced under $installerDir"
   }
 } finally {
   Pop-Location

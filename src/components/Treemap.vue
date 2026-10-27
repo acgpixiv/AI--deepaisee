@@ -181,7 +181,7 @@ function click(c: Cell) {
         @mouseenter="enter(c)"
         @mouseleave="leave"
         @click="click(c)"
-        :title="`${c.node.name}\n${humanSize(c.node.size)} · ${c.node.count} 个文件`"
+        :title="`${c.node.name}\n${humanSize(c.node.size)} · ${c.node.count} ${t('个文件')}`"
       >
         <div class="nm" v-if="c.rect.w > 64 && c.rect.h > 26">
           {{ c.node.name }}
@@ -207,9 +207,9 @@ function click(c: Cell) {
         document: '#f59e0b', text: '#94a3b8', archive: '#fb923c', other: '#64748b'
       }" :key="k" class="lg">
         <i :style="{ background: col }"></i>
-        {{ { image: '图片', video: '视频', audio: '音频', document: '文档', text: '文本', archive: '压缩包', other: '其它' }[k as string] }}
+        {{ { image: t('图片'), video: t('视频'), audio: t('音频'), document: t('文档'), text: t('文本'), archive: t('压缩包'), other: t('其它') }[k as string] }}
       </span>
-      <span class="sum">共 {{ humanSize(totalSize) }}</span>
+      <span class="sum">{{ t("共") }} {{ humanSize(totalSize) }}</span>
     </div>
   </div>
 </template>

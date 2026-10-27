@@ -977,6 +977,15 @@ impl Db {
         out
     }
 
+    /// 某个目录下已入库的文件路径（工作区实时检索用它排除已索引文件）。
+    pub fn paths_under(&self, root: &str) -> rusqlite::Result<Vec<String>> {
+        let (_, lower, upper) = index_root_bounds(root);
+        let c = self.conn.lock();
+        let mut st = c.prepare("SELECT path FROM files WHERE path >= ?1 AND path < ?2")?;
+        let rows = st.query_map(params![lower, upper], |r| r.get::<_, String>(0))?;
+        rows.collect()
+    }
+
     /// 目录聚合：返回 (dir, 文件数, 总大小)
     pub fn dir_rollup(&self) -> rusqlite::Result<Vec<(String, i64, i64)>> {
         let c = self.conn.lock();

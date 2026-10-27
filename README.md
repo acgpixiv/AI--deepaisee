@@ -9,7 +9,7 @@
 - 正文抽取：TXT / Markdown / Word（docx + doc）/ Excel（xlsx + xls）/ PPT（pptx + ppt）/ PDF / RTF / EPUB / ODF
 - 界面：搜索 / 相似、树状图、扫描 / 索引、模型管理 四模式
 
-当前版本 **v0.20**，版本历史见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本 **v0.21**，版本历史见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -19,17 +19,24 @@
 
 | 内容 | 位置 | 说明 |
 | --- | --- | --- |
-| **可直接运行的便携版** | 根目录：`deepaisee.exe` + 4 个 `.dll` + 启动器 | 缺模型与 ffmpeg，见下节 |
-| **前端源码** | `src/`（13 个文件，Vue 3） | 约 2,900 行 |
-| **后端源码** | `src-tauri/src/`（33 个 `.rs`） | 约 9,500 行 |
+| **安装包（推荐分发方式）** | `release/deepaisee_0.0.21_x64-setup.exe` | 已构建好的成品（约 651 MiB），含运行时 DLL、模型与 ffmpeg；重新生成用 `npm run tauri:release`，产物在 `build-target/release/bundle/nsis/` |
+| **可直接运行的便携版** | 根目录：`deepaisee.exe` + 5 个 `.dll` + 启动器（同版本副本在 `release/deepaisee.exe`） | 缺模型与 ffmpeg，见下节 |
+| **前端源码** | `src/`（20 个文件，Vue 3 + TS） | 约 4,400 行 |
+| **后端源码** | `src-tauri/src/`（30 个 `.rs`） | 约 14,400 行 |
 | **构建配置** | `src-tauri/{Cargo.toml,​build.rs,​tauri.conf.json}`、`package.json` 等 | — |
-| **验收截图** | `docs/screenshots/` | 6 张 |
+| **验收截图** | `docs/screenshots/` | 12 张（含 v0.21 中英文界面） |
 | **依赖源码** | ❌ 不含 `vendor/llama.cpp` | 需按第 2 节 clone |
 
-### 1. 直接运行（仓库已带 exe）
+### 1. 安装与运行
+
+**方式 A：安装包（推荐给普通用户）**
+
+运行 `release\deepaisee_0.0.21_x64-setup.exe`。安装向导会让你选择安装目录，**默认落在非系统盘的 `D:\Apps\deepaisee`**（D 盘不存在时退到 `E:\Apps`，再不行才用 `%LOCALAPPDATA%\deepaisee`），避免把几百 MB 的模型塞进 C 盘。安装包会自动带上全部运行时 DLL、`models\`（嵌入/CLIP/CLAP）与 `tools\bin\ffmpeg.exe`，并创建开始菜单与桌面快捷方式；卸载入口在「设置 → 应用」里。
+
+**方式 B：便携版（解压即用）**
 
 ```
-deepaisee 启动器.cmd     ← 推荐：带菜单的启动器
+deepaisee 启动器.cmd     ← 带菜单的启动器
 deepaisee.exe            ← 直接运行，跳过菜单
 ```
 
@@ -46,7 +53,7 @@ deepaisee.exe            ← 直接运行，跳过菜单
 
 启动器用 PowerShell 写（`launcher.ps1`），因为 **.bat 里放中文会被 cmd 按 GBK 解析坏**。`launcher.ps1` 必须保持 **UTF-8 with BOM + CRLF**，否则 Windows PowerShell 5.1 会报解析错误。
 
-首次启动会自动加载模型（约 0.5~1.5 秒）。数据写在 exe 同级的 `data\` 目录，整个文件夹可以拷走。
+首次启动会自动加载模型（约 0.5~1.5 秒）。**便携版**的数据写在 exe 同级的 `data\`，整个文件夹可以拷走；**安装版**如果 exe 所在目录不可写（例如装在 `D:\Apps`、`Program Files` 且当前用户没有写权限），程序会自动回退到 `%LOCALAPPDATA%\deepaisee\data`，启动器的「打开数据目录」会跟着指向实际位置。
 
 运行时必须一起带的文件（少一个就起不来或功能缺失）：
 
@@ -61,6 +68,8 @@ deepaisee.exe            ← 直接运行，跳过菜单
 | `models\clap\` | CLAP 音文模型（155MB） | 文字找声音停用，退回频谱特征 |
 | `tools\bin\ffmpeg.exe` | 抽帧 / 音频解码 | 视频缩略图与音频/视频向量失败 |
 | `launcher.ps1` / `deepaisee 启动器.cmd` | 启动器（可选） | 不影响主程序，只是少了菜单 |
+
+> 安装包已把上表所有文件打进安装目录，不需要单独准备；下面的「不含模型」只针对 Git 仓库里的便携版。
 
 > 表格里带体积的 4 项**不在本仓库**（超过 GitHub 100MB 单文件限制），要自己补，见下节。
 
@@ -77,7 +86,7 @@ GitHub 单文件硬上限 100MB，下面这些放不进 Git，**需要自己补*
 | `models\clap\audio_model.onnx` + `text_model.onnx` + `vocab.json` + `merges.txt` | 155MB | `Xenova/clap-htsat-unfused` 的两个 `onnx/*_model_quantized.onnx`，词表 `vocab.json` 与 `merges.txt` 原样保留（**不要改名**） |
 | `tools\bin\ffmpeg.exe` | 84MB | 任意 Windows 版 ffmpeg（需要 `-ss` 抽帧与 `f32le` 解码，7.x 已验证） |
 
-文件放到位后不用改配置：程序启动时会在 `models\` 下找 `.gguf` 自动装载，CLIP/CLAP 默认读 `<exe>\models\clip` 与 `<exe>\models\clap`。跨模态模型首次装好后需要**重建一次索引**才会产出 512 维图文/音文向量。
+文件放到位后不用改配置（主程序、`--selftest`、`--cli` 用同一套自动探测）：程序启动时会在 exe 同级 `models\`（其次数据目录 `models\`）下找 `.gguf` 自动装载，CLIP/CLAP 默认读 `<exe>\models\clip` 与 `<exe>\models\clap`。跨模态模型首次装好后需要**重建一次索引**才会产出 512 维图文/音文向量。
 
 ### 2. 源码运行
 
@@ -167,10 +176,12 @@ npm run tauri build -- --features llama,candle,candle-cuda,custom-protocol
 
 首页默认显示打字机标题和胶囊搜索框；输入后搜索栏收缩到顶部，结果以按相关度排序的图库卡片显示，并保留类型筛选、全文/拼音/模糊/语义/跨模态开关、相似检索、预览、定位和导出。顶栏只显示索引文件数与占用大小，点击它进入树状图，右侧齿轮进入设置。
 
-设置页的左栏固定分为四个标签：**文件索引**（扫描、索引参数、规则和数据库维护）、**模型配置**（GGUF、GPU 设备、上下文、CLIP/CLAP）、**局域网配置**（服务与实时监控）和**日志**（活动记录）。每个标签只提交自身的配置片段，避免修改一项覆盖其它设置。
+设置页的左栏分为六个标签：**通用配置**（语言、主题、启动行为、工作区目录）、**文件索引**（扫描、索引参数、规则和数据库维护）、**模型配置**（GGUF、GPU 设备、上下文、CLIP/CLAP）、**局域网配置**（服务与实时监控）、**可选扩展**和**日志**（活动记录）。每个标签只提交自身的配置片段，避免修改一项覆盖其它设置。
+
+通用配置里的**界面语言**支持简体中文与 English：保存后整个界面（顶栏、搜索页、六个设置标签、各类提示与报错前缀）会立即切换，重启后沿用上次选择；主题可选明亮 / 暗色 / 跟随系统，切换同样即时生效。
 
 搜索页的细节：
-- 四个开关控制检索通道：**全文**（文档正文）、**拼音**（`huiyijilu` / `hyjl` → 会议记录）、**找图找声**（一句话找图片/音频/视频）、**语义**（一句话找意思相近的文件）
+- 五个开关控制检索通道：**全文**（文档正文）、**拼音**（`huiyijilu` / `hyjl` → 会议记录）、**找图找声**（一句话找图片/音频/视频）、**语义**（一句话找意思相近的文件）、**工作区**（把工作区目录里还没建索引的文件也现场抽取正文一起检索）
 - 类型 chip（全部/图片/视频/音频/文档/文本/压缩包）即时筛选
 - 排序支持相关度/名称/大小/修改时间/类型，点击表头可切换升降序
 - 右侧预览面板显示缩略图、元信息、正文片段
@@ -180,6 +191,14 @@ npm run tauri build -- --features llama,candle,candle-cuda,custom-protocol
 ### 界面截图
 
 <table>
+<tr>
+<td width="50%"><img src="docs/screenshots/v0.21-general.png" alt="通用配置"><br><sub>通用配置：语言 / 主题（含跟随系统）/ 启动行为 / 工作区目录</sub></td>
+<td width="50%"><img src="docs/screenshots/v0.21-english.png" alt="English UI"><br><sub>English 界面：语言切换即时生效，六个设置标签与搜索页全部英文</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/v0.21-index.png" alt="文件索引"><br><sub>文件索引：视频抽帧间隔、最大帧数、去重阈值、索引音轨</sub></td>
+<td width="50%"><img src="docs/screenshots/v0.21-workspace.png" alt="工作区检索"><br><sub>工作区检索：未入库的文件现场抽正文，命中带「工作区」标签</sub></td>
+</tr>
 <tr>
 <td width="50%"><img src="docs/screenshots/v0.20-find-image.png" alt="用一句话找图片"><br><sub>文字找图：「一只黑色的狗」→ 命中真实照片，视频按首帧参与匹配</sub></td>
 <td width="50%"><img src="docs/screenshots/v0.20-find-audio.png" alt="用一句话找声音"><br><sub>文字找声音：「钢琴」→ 命中钢琴音频，纯画面查询不会串到声音</sub></td>
@@ -347,7 +366,11 @@ deepaisee.exe --cli serve --port 8770
 
 ## 六、数据目录
 
-exe 同级 `data\`：
+**便携版**在 exe 同级 `data\`；**安装版**在安装目录不可写时自动回退到 `%LOCALAPPDATA%\deepaisee\data`（探测顺序：exe 同级 → LOCALAPPDATA → APPDATA → TEMP）。目录结构一致：
+
+> WebView2 的用户数据目录是**单独一套**（不属于上表）：优先 exe 同级 `webview-data\`，其次 `<数据目录>\webview\`，最后 `%LOCALAPPDATA%\deepaisee\webview`；会自动挑第一个可写且不在 C 盘的位置。排障时可用环境变量 `WEBVIEW2_USER_DATA_FOLDER` 强制指定。
+
+> **插件扩展目录**：安装版会在安装根目录创建 `plugins\`（随包带一份说明文件），卸载时**保留**该目录；程序里的 `config\plugins_dir()` 已经指向它，后续插件把目录或压缩包放进去即可被发现。
 
 ```
 data\
@@ -355,7 +378,7 @@ data\
 ├─ index.db             SQLite（files 表 + FTS5 全文索引）
 ├─ vectors\             文本向量（llama.cpp）
 ├─ vectors_media\       媒体兜底向量（颜色/频谱哈希，256 维）
-├─ vectors_clip\        图片与视频首帧向量（CLIP，512 维）
+├─ vectors_clip\        图片与视频帧融合向量（CLIP，512 维；视频取多帧平均）
 ├─ vectors_audio\       音频向量（CLAP，512 维）
 ├─ thumbs\              缩略图
 ├─ tmp\                 抽帧临时目录（正常时为空）
@@ -386,13 +409,13 @@ data\
 
 **模型路径**：`data\config.json` 的 `model.embed_model` 指向 `.gguf` 或兼容目录中的 `model.safetensors`；留空则回退「哈希基线」（不需要模型，256 维，只适合演示）。EmbeddingGemma2 safetensors 由 Candle 原生适配器加载，未知架构只标记为 Python 候选，需在设置页安装可选 sidecar。
 
-**GPU**：模型设置页会列出当前构建实际支持的 GPU/核显，显示完整名称、总显存和空闲显存，并按显存从大到小排列。`model.gpu_device = "auto"` 默认选择显存最大的设备。llama.cpp 文本模型会将全部模型层放到所选 GPU；没有可用加速后端、所选设备失效或显存不足时会直接显示错误，不会退回 CPU。当前仓库附带的 `deepaisee.exe` 是旧 CPU 构建，不能代表源码构建的 GPU 能力。
+**GPU**：模型设置页会列出当前构建实际支持的 GPU/核显，显示完整名称、总显存和空闲显存，并按显存从大到小排列。`model.gpu_device = "auto"` 默认选择显存最大的设备，并在**没有可用加速后端时自动退回 CPU 推理**（v0.21 起；状态栏会显示 `llama.cpp GGUF · CPU 推理（没有可用加速后端）`）。也可以在下拉里显式选「CPU（无可用加速设备时）」。显式指定的 GPU 失效或显存不足时同样退回 CPU，不会让整个语义检索不可用。
 
 构建脚本会自动探测项目 `.tools/cuda/` 或系统 CUDA Toolkit 并为 llama.cpp 启用 CUDA；包含 Candle CUDA 的发布构建请使用上一节的 `--features llama,candle,candle-cuda,custom-protocol`。这会生成一个同时包含两种原生后端的 exe，运行时通过设置页选择具体 GPU。运行时需要 CUDA Runtime/cuBLAS DLL 在 `PATH` 或应用目录，Windows GNU 工具链不支持该 CUDA 路径。设置 `DEEPAISEE_CUDA=0` 可显式关闭 llama.cpp 的 CUDA 构建；Candle CUDA 编译仍需要构建时存在 Toolkit。
 
 要让设置页列出 Intel/AMD 核显，需要把 Vulkan SDK（必须含 `Include/vulkan/vulkan.h` 和 `Bin/glslc.exe`）放到项目 `.tools/vulkan`；构建脚本会自动探测，也可显式设置 `$env:DEEPAISEE_VULKAN='1'`。项目会通过 GGML Vulkan 枚举离散 GPU 和集成 GPU；没有 Vulkan SDK 时不会伪造核显条目。设置 `DEEPAISEE_VULKAN=0` 可显式关闭自动探测。CLIP/CLAP 的 ONNX 路径目前使用 CPU Execution Provider，与 llama.cpp 文本模型的 GPU 选择相互独立。
 
-**索引参数**：`index.max_text_chars`（单文件正文字符上限，默认 20 万）、`index.video_frames`（抽帧数）、`index.audio_seconds`（音频取样秒数）。
+**索引参数**：`index.max_text_chars`（单文件正文字符上限，默认 20 万）、`index.video_frames`（期望抽帧数，默认 16）、`index.video_frame_interval`（最小抽帧间隔秒，默认 4）、`index.video_max_frames`（单视频帧数上限，默认 64）、`index.video_dedup_distance`（帧指纹去重阈值，默认 6，越小越严格）、`index.video_index_audio`（是否索引视频音轨，默认开）、`index.audio_seconds`（音频取样秒数）。`ui.*` 下是通用配置（`language` / `theme` / `autostart` / `auto_scan_on_start` / `notify_file_changes` / `default_search_mode`），`workspace.dirs` 是工作区目录列表。
 
 ---
 
@@ -416,10 +439,13 @@ deepaisee.exe --selftest
 
 ```bat
 :: 后端端到端（扫描→索引→全文→拼音→语义→找相似→目录树）
-cd src-tauri && cargo run --bin smoke --features llama
+cd src-tauri && cargo run --example smoke --features llama
 ```
 
 `smoke` 会把结果打在控制台。发布包验收用 `--selftest`。
+
+> 其余开发探针（`claptest` / `crossprobe` / `melprobe` / `visdemo`）同样用 `cargo run --example <名字>` 运行。
+> 它们放在 `src-tauri/examples/` 而不是 `src/bin/`，因为 tauri-bundler 会把 `src/bin/` 下的每个 bin 都当外部二进制打进安装包——这些探针不该出现在分发包里。
 
 ---
 
@@ -446,6 +472,26 @@ A：CLAP 是英文音效语料训练的，只能理解**具体声音**（钢琴�
 **Q：视频搜不到 / 索引时报「抽帧失败」？**
 A：视频要靠 `tools\bin\ffmpeg.exe` 抽首帧。缺 ffmpeg、或 `%TEMP%` 不可写时程序会改用 `data\tmp\` 并在失败时明确提示。确认 `tools\bin\ffmpeg.exe` 在发布目录里即可。
 
+**Q：安装版装到 D:\Apps 后，索引库在哪？**
+A：程序启动时会先试 exe 同级的 `data\`，写不进去（`Program Files`、`D:\Apps` 这类目录需要管理员权限）就自动回退到 `%LOCALAPPDATA%\deepaisee\data`。启动器的「打开数据目录」按同一顺序探测，不会打开错地方。想确认实际路径：设置 → 文件索引 → 索引数据库里显示的就是真实路径。
+
+**Q：视频抽帧是怎么做的？会不会很占空间？**
+A：按 `index.video_frame_interval`（默认 4 秒）的间隔切成时间窗，每个窗口按「**场景切换点 → I 帧 → 窗口中心**」的优先级挑一帧（场景切换由 ffmpeg 的 `scene` 分数检测，I 帧由 `-skip_frame nokey` 探测），再用 64 位 dHash 指纹**加平均颜色**去重（结构汉明距离 ≤ `index.video_dedup_distance` 且颜色也接近的相邻帧才丢弃 —— 只比结构的话，纯色/黑屏/幻灯片白底这些低对比画面指纹几乎一样，「红底切绿底」会被误丢）。采样间隔还会按镜头切换密度自适应：几乎不换镜头的 PPT / 网课放稀到 1.5 倍省空间，动作片 / 体育加密到 0.5 倍，但任何情况下都不低于 4 秒。抽出来的帧只用于即时计算 CLIP/媒体向量，算完就删临时文件；库里只留**特征向量和压缩缩略图**，所以索引体积不会随视频时长线性膨胀。要更细的采样就调小间隔（下限 4 秒），要控制上限就调 `index.video_max_frames`。
+
+**Q：视频里的说话声/音乐能搜到吗？**
+A：能，前提是装了 `models\clap\` 且设置页「索引视频音轨」开着（默认开）。程序用 ffmpeg 把音轨解成 PCM，交给 CLAP 生成音频向量；无声视频会跳过而不报错。改动这个开关后需要**重建一次索引**才会产出音轨向量。
+
+**Q：工作区目录是什么？和扫描索引有什么区别？**
+A：工作区（设置 → 通用配置）指定的是「不建索引、搜索时现场读」的目录。搜索时打开工具栏的「工作区」开关，程序会遍历工作区目录里**还没入库**的文件，实时抽取正文参与匹配，结果与索引库结果一起排序（工作区命中会带「工作区」标签，缩略图显示为空）。适合放近期资料、U 盘、网络盘这类不值得建索引的地方；代价是首次搜索会慢一点（有 4 秒目录缓存与正文缓存）。
+
+**Q：启动时会自动扫描吗？**
+A：`ui.auto_scan_on_start` 默认开：程序启动 2.5 秒后在后台跑一次增量扫描，只对比修改时间，把新增/修改/删除的文件同步给索引，不会重算已有文件的向量。扫描结束若检测到变化，右下角会弹一条轻量提示（可在通用配置里关掉 `notify_file_changes`）。
+
+**Q：装了之后语义搜索不工作 / 状态栏显示「哈希基线」？**
+A：说明嵌入模型没加载成功，程序退回了 256 维哈希向量（只能做近似字面匹配）。v0.21 起 llama.cpp 在没有可用加速后端时会**自动走 CPU 推理**（状态栏显示 `llama.cpp GGUF · CPU 推理（没有可用加速后端）`），650 MB 的 `models\embeddinggemma2.gguf` 在 CPU 上也能跑，只是索引慢一些。如果仍显示哈希基线，检查 `models\embeddinggemma2.gguf` 是否随安装包放了进来（安装目录下应有 `models\` 子目录），以及模型设置页是否把它设成了当前模型。
+
+**Q：安装时弹出「无法打开要写入的文件」或静默安装一闪而过？**
+A：多见于安全软件（如火绒、360）拦截**未签名**的安装程序写目标目录或解压到 `%TEMP%`。处理办法：① 双击安装包，在安全软件弹窗里选「允许」；② 或先把安装包加入安全软件信任区；③ 静默安装（`/S`）时若 `%TEMP%` 不可写会直接退出，可先把 `TEMP`/`TMP` 指到一个可写目录再运行。
 **Q：老式 .doc / .xls / .ppt 能搜吗？**
 A：能，用的是内置的 OLE2 解析器（不依赖 Office）。但加密文档、以及 Word 6/95 这种更老的二进制格式不在支持范围内，会跳过并计入「抽取失败」。
 

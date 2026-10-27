@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { Check } from "lucide-vue-next";
 import { api, type AppConfig, type ScanProgress, type IndexStats, type RootIndexStats } from "../api";
 import { refreshStats, store, toast } from "../store";
+import { t } from "../i18n";
 
 const cfg = ref<AppConfig | null>(null);
 const roots = ref<string[]>([]);
@@ -19,13 +20,13 @@ const cancelledIndexPct = ref<number | null>(null);
 let lastRootRefresh = 0;
 
 const TYPES = [
-  { k: "images", t: "图片" },
-  { k: "videos", t: "视频" },
-  { k: "audios", t: "音频" },
-  { k: "pdf", t: "PDF" },
-  { k: "documents", t: "文档" },
-  { k: "archives", t: "压缩包" },
-  { k: "others", t: "其它" },
+  { k: "images", label: "图片" },
+  { k: "videos", label: "视频" },
+  { k: "audios", label: "音频" },
+  { k: "pdf", label: "PDF" },
+  { k: "documents", label: "文档" },
+  { k: "archives", label: "压缩包" },
+  { k: "others", label: "其它" },
 ];
 
 const typeState = ref<Record<string, boolean>>({
@@ -55,7 +56,7 @@ async function loadCfg() {
       others: !!s.others,
     };
   } catch (e) {
-    toast(`读取配置失败：${e}`, "error");
+    toast(`${t("读取配置失败：")}${e}`, "error");
   }
 }
 
@@ -83,7 +84,7 @@ async function toggleRoot(root: string) {
     await saveRoots();
   } catch (e) {
     rootEnabled.value[root] = !rootEnabled.value[root];
-    toast(`保存目录状态失败：${e}`, "error");
+    toast(`${t("保存目录状态失败：")}${e}`, "error");
   }
 }
 
@@ -100,13 +101,13 @@ const persistedIndexPct = computed(() => {
 });
 
 function formatRootScanTime(value: number) {
-  if (!value) return "尚未扫描";
+  if (!value) return t("尚未扫描");
   return new Date(value * 1000).toLocaleString();
 }
 
 async function pickDir() {
   try {
-    const p = await open({ directory: true, multiple: true, title: "选择要扫描的目录" });
+    const p = await open({ directory: true, multiple: true, title: t("选择要扫描的目录") });
     if (!p) return;
     const arr = Array.isArray(p) ? p : [p];
     for (const d of arr) {
@@ -116,7 +117,7 @@ async function pickDir() {
       }
     }
   } catch (e) {
-    toast(`选择目录失败：${e}`, "error");
+    toast(`${t("选择目录失败：")}${e}`, "error");
   }
 }
 
@@ -137,7 +138,7 @@ async function saveRoots() {
 }
 
 async function startScan() {
-  if (!activeRoots.value.length) return toast("至少启用一个扫描目录", "warn");
+  if (!activeRoots.value.length) return toast(t("至少启用一个扫描目录"), "warn");
   await api.saveConfig({
     scan: {
       roots: roots.value,
@@ -156,9 +157,9 @@ async function startScan() {
     store.scanBusy = true;
     operationActive.value = true;
     startPolling();
-    toast("开始扫描…", "ok");
+    toast(t("开始扫描…"), "ok");
   } catch (e) {
-    toast(`扫描失败：${e}`, "error");
+    toast(`${t("扫描失败：")}${e}`, "error");
   }
 }
 
@@ -171,7 +172,7 @@ async function cancelScan() {
   try {
     await api.scanCancel();
     await api.indexCancel();
-    toast("已取消当前任务，已完成部分会保留", "warn");
+    toast(t("已取消当前任务，已完成部分会保留"), "warn");
   } catch (e) {
     toast(`${e}`, "error");
   }
@@ -213,7 +214,7 @@ function stopPolling() {
 
 async function buildIndex(what: "auto" | "text" | "embed") {
   try {
-    if (!activeRoots.value.length) return toast("至少启用一个扫描目录", "warn");
+    if (!activeRoots.value.length) return toast(t("至少启用一个扫描目录"), "warn");
     await api.saveConfig({
       scan: {
         roots: roots.value,
@@ -231,9 +232,9 @@ async function buildIndex(what: "auto" | "text" | "embed") {
     await api.scanStart(activeRoots.value, what);
     operationActive.value = true;
     startPolling();
-    toast(`已重新扫描目录，随后继续${what === "auto" ? "全文和向量" : what === "text" ? "正文" : "向量"}索引`, "ok");
+    toast(`${t("已重新扫描目录，随后继续")}${what === "auto" ? t("全文和向量") : what === "text" ? t("正文") : t("向量")}${t("索引")}`, "ok");
   } catch (e) {
-    toast(`索引失败：${e}`, "error");
+    toast(`${t("索引失败：")}${e}`, "error");
   }
 }
 
@@ -276,7 +277,7 @@ onBeforeUnmount(stopPolling);
   <div class="view">
     <div class="grid">
       <section class="card blk roots-card">
-        <h3>扫描目录</h3>
+        <h3>{{ t("扫描目录") }}</h3>
         <div class="roots">
           <div
             v-for="r in roots"
@@ -290,103 +291,103 @@ onBeforeUnmount(stopPolling);
               type="button"
               role="checkbox"
               :aria-checked="rootEnabled[r] !== false"
-              :title="rootEnabled[r] === false ? '点击启用此目录' : '点击跳过此目录'"
+              :title="rootEnabled[r] === false ? t('点击启用此目录') : t('点击跳过此目录')"
               @click.stop="toggleRoot(r)"
             ><Check v-if="rootEnabled[r] !== false" :size="16" :stroke-width="3" /></button>
             <span class="mono root-name">{{ r }}</span>
-            <button class="mini" @click.stop="removeRoot(r)">移除</button>
+            <button class="mini" @click.stop="removeRoot(r)">{{ t("移除") }}</button>
           </div>
-          <div v-if="!roots.length" class="none">还没有添加目录</div>
+          <div v-if="!roots.length" class="none">{{ t("还没有添加目录") }}</div>
         </div>
         <div class="row">
-          <button class="primary" @click="pickDir">+ 添加目录</button>
-          <button class="ghost" @click="saveRoots">保存</button>
+          <button class="primary" @click="pickDir">{{ t("+ 添加目录") }}</button>
+          <button class="ghost" @click="saveRoots">{{ t("保存") }}</button>
         </div>
         <div v-if="selectedRoot" class="root-detail">
-          <div class="root-detail-head"><b>{{ selectedRoot }}</b><span>{{ rootEnabled[selectedRoot] === false ? '已跳过' : '已启用' }}</span></div>
+          <div class="root-detail-head"><b>{{ selectedRoot }}</b><span>{{ rootEnabled[selectedRoot] === false ? t("已跳过") : t("已启用") }}</span></div>
           <div class="root-detail-grid">
-            <span>文件类型</span><b>{{ selectedRootStats?.kinds_label || '暂无文件' }}</b>
-            <span>建立索引</span><b>{{ rootProgress(selectedRootStats) }}%</b>
-            <span>总文件数</span><b>{{ (selectedRootStats?.files ?? 0).toLocaleString() }}</b>
-            <span>目录大小</span><b>{{ selectedRootStats?.bytes_label || '0 B' }}</b>
-            <span>上次扫描</span><b>{{ formatRootScanTime(selectedRootStats?.last_scan ?? 0) }}</b>
-            <span>新增文件</span><b>{{ (selectedRootStats?.added ?? 0).toLocaleString() }}</b>
-            <span>更新文件</span><b>{{ (selectedRootStats?.updated ?? 0).toLocaleString() }}</b>
-            <span>跳过 / 错误</span><b>{{ (selectedRootStats?.skipped ?? 0).toLocaleString() }} / {{ (selectedRootStats?.errors ?? 0).toLocaleString() }}</b>
-            <span>正文完成 / 待处理</span><b>{{ (selectedRootStats?.text_ok ?? 0).toLocaleString() }} / {{ (selectedRootStats?.text_pending ?? 0).toLocaleString() }}</b>
-            <span>向量完成 / 待处理</span><b>{{ (selectedRootStats?.embed_ok ?? 0).toLocaleString() }} / {{ (selectedRootStats?.embed_pending ?? 0).toLocaleString() }}</b>
-            <span>已消失文件</span><b>{{ (selectedRootStats?.missing ?? 0).toLocaleString() }}</b>
+            <span>{{ t("文件类型") }}</span><b>{{ selectedRootStats?.kinds_label || t("暂无文件") }}</b>
+            <span>{{ t("建立索引") }}</span><b>{{ rootProgress(selectedRootStats) }}%</b>
+            <span>{{ t("总文件数") }}</span><b>{{ (selectedRootStats?.files ?? 0).toLocaleString() }}</b>
+            <span>{{ t("目录大小") }}</span><b>{{ selectedRootStats?.bytes_label || '0 B' }}</b>
+            <span>{{ t("上次扫描") }}</span><b>{{ formatRootScanTime(selectedRootStats?.last_scan ?? 0) }}</b>
+            <span>{{ t("新增文件") }}</span><b>{{ (selectedRootStats?.added ?? 0).toLocaleString() }}</b>
+            <span>{{ t("更新文件") }}</span><b>{{ (selectedRootStats?.updated ?? 0).toLocaleString() }}</b>
+            <span>{{ t("跳过 / 错误") }}</span><b>{{ (selectedRootStats?.skipped ?? 0).toLocaleString() }} / {{ (selectedRootStats?.errors ?? 0).toLocaleString() }}</b>
+            <span>{{ t("正文完成 / 待处理") }}</span><b>{{ (selectedRootStats?.text_ok ?? 0).toLocaleString() }} / {{ (selectedRootStats?.text_pending ?? 0).toLocaleString() }}</b>
+            <span>{{ t("向量完成 / 待处理") }}</span><b>{{ (selectedRootStats?.embed_ok ?? 0).toLocaleString() }} / {{ (selectedRootStats?.embed_pending ?? 0).toLocaleString() }}</b>
+            <span>{{ t("已消失文件") }}</span><b>{{ (selectedRootStats?.missing ?? 0).toLocaleString() }}</b>
           </div>
           <p v-if="selectedRootStats?.last_error" class="root-error">{{ selectedRootStats.last_error }}</p>
         </div>
       </section>
 
       <section class="card blk types-card">
-        <h3>文件类型</h3>
+        <h3>{{ t("文件类型") }}</h3>
         <div class="types">
           <button
-            v-for="t in TYPES"
-            :key="t.k"
+            v-for="item in TYPES"
+            :key="item.k"
             type="button"
             class="type-tag"
-            :class="{ active: typeState[t.k] }"
-            :aria-pressed="typeState[t.k]"
-            @click="typeState[t.k] = !typeState[t.k]"
-          >{{ t.t }}</button>
+            :class="{ active: typeState[item.k] }"
+            :aria-pressed="typeState[item.k]"
+            @click="typeState[item.k] = !typeState[item.k]"
+          >{{ t(item.label) }}</button>
         </div>
         <p class="muted tiny">
-          默认跳过系统目录、回收站、node_modules、.git 等；网盘目录可手动加排除。
+          {{ t("默认跳过系统目录、回收站、node_modules、.git 等；网盘目录可手动加排除。") }}
         </p>
         <div class="row">
           <button class="primary" :disabled="operationBusy" @click="startScan">
-            {{ operationBusy ? "处理中…" : "扫描并建立索引" }}
+            {{ operationBusy ? t("处理中…") : t("扫描并建立索引") }}
           </button>
-          <button class="ghost" :disabled="!operationBusy" @click="cancelScan">取消</button>
+          <button class="ghost" :disabled="!operationBusy" @click="cancelScan">{{ t("取消") }}</button>
         </div>
       </section>
     </div>
 
     <section class="card blk grow">
-      <h3>进度</h3>
+      <h3>{{ t("进度") }}</h3>
       <div class="prog">
         <div class="pbar"><div class="pfill" :class="{ scanning: progress?.running }" :style="{ width: pct + '%' }"></div></div>
-        <span class="muted mono">{{ progress?.done ? "100%" : progress?.running ? "扫描中" : "0%" }}</span>
+        <span class="muted mono">{{ progress?.done ? "100%" : progress?.running ? t("扫描中") : "0%" }}</span>
       </div>
       <div class="stats" v-if="progress">
-        <div><b>{{ progress.files.toLocaleString() }}</b><span>文件</span></div>
-        <div><b>{{ progress.dirs.toLocaleString() }}</b><span>目录</span></div>
-        <div><b>{{ progress.added.toLocaleString() }}</b><span>新增</span></div>
-        <div><b>{{ progress.updated.toLocaleString() }}</b><span>更新</span></div>
-        <div><b>{{ progress.skipped.toLocaleString() }}</b><span>跳过</span></div>
-        <div><b>{{ progress.errors.toLocaleString() }}</b><span>错误</span></div>
+        <div><b>{{ progress.files.toLocaleString() }}</b><span>{{ t("文件") }}</span></div>
+        <div><b>{{ progress.dirs.toLocaleString() }}</b><span>{{ t("目录") }}</span></div>
+        <div><b>{{ progress.added.toLocaleString() }}</b><span>{{ t("新增") }}</span></div>
+        <div><b>{{ progress.updated.toLocaleString() }}</b><span>{{ t("更新") }}</span></div>
+        <div><b>{{ progress.skipped.toLocaleString() }}</b><span>{{ t("跳过") }}</span></div>
+        <div><b>{{ progress.errors.toLocaleString() }}</b><span>{{ t("错误") }}</span></div>
         <div :class="{ warn: progress.missing > 0 }">
-          <b>{{ (progress.missing || 0).toLocaleString() }}</b><span>已消失</span>
+          <b>{{ (progress.missing || 0).toLocaleString() }}</b><span>{{ t("已消失") }}</span>
         </div>
         <div><b>{{ (progress.bytes / 1048576).toFixed(1) }}</b><span>MB</span></div>
-        <div><b>{{ progress.seconds.toFixed(1) }}</b><span>秒</span></div>
+        <div><b>{{ progress.seconds.toFixed(1) }}</b><span>{{ t("秒") }}</span></div>
       </div>
       <div class="cur mono" v-if="progress?.current">正在扫描：{{ progress.current }}</div>
 
-      <h3 class="mt">索引</h3>
+      <h3 class="mt">{{ t("索引") }}</h3>
       <div class="prog">
         <div class="pbar"><div class="pfill index-fill" :style="{ width: indexPct + '%' }"></div></div>
         <span class="muted mono">{{ indexPct }}%</span>
       </div>
       <div class="stats" v-if="idx">
-        <div><b>{{ idx.text_done }}</b><span>正文已抽取</span></div>
-        <div><b>{{ idx.emb_done }}</b><span>向量已完成</span></div>
-        <div><b>{{ idx.thumb_done }}</b><span>缩略图</span></div>
-        <div><b>{{ idx.queued }}</b><span>队列</span></div>
-        <div><b>{{ displayedIndexDone }} / {{ displayedIndexTotal }}</b><span>{{ selectedRoot ? '所选目录已处理 / 总数' : '本批次进度' }}</span></div>
-        <div><b>{{ idx.emb_fail }}</b><span>失败</span></div>
+        <div><b>{{ idx.text_done }}</b><span>{{ t("正文已抽取") }}</span></div>
+        <div><b>{{ idx.emb_done }}</b><span>{{ t("向量已完成") }}</span></div>
+        <div><b>{{ idx.thumb_done }}</b><span>{{ t("缩略图") }}</span></div>
+        <div><b>{{ idx.queued }}</b><span>{{ t("队列") }}</span></div>
+        <div><b>{{ displayedIndexDone }} / {{ displayedIndexTotal }}</b><span>{{ selectedRoot ? t("所选目录已处理 / 总数") : t("本批次进度") }}</span></div>
+        <div><b>{{ idx.emb_fail }}</b><span>{{ t("失败") }}</span></div>
       </div>
       <div class="row">
-        <button class="primary" :disabled="operationBusy" @click="buildIndex('auto')">建立索引</button>
-        <button class="ghost" :disabled="!operationBusy" @click="cancelScan">取消</button>
-        <button class="ghost" :disabled="operationBusy" @click="buildIndex('text')">仅补正文</button>
-        <button class="ghost" :disabled="operationBusy" @click="buildIndex('embed')">仅补向量</button>
+        <button class="primary" :disabled="operationBusy" @click="buildIndex('auto')">{{ t("建立索引") }}</button>
+        <button class="ghost" :disabled="!operationBusy" @click="cancelScan">{{ t("取消") }}</button>
+        <button class="ghost" :disabled="operationBusy" @click="buildIndex('text')">{{ t("仅补正文") }}</button>
+        <button class="ghost" :disabled="operationBusy" @click="buildIndex('embed')">{{ t("仅补向量") }}</button>
       </div>
-      <p class="muted tiny index-help">正文用于全文检索，向量用于语义检索。日常使用“扫描并建立索引”即可；只有修改了抽取规则或更换模型时，才需要单独补其中一项。</p>
+      <p class="muted tiny index-help">{{ t("正文用于全文检索，向量用于语义检索。日常使用“扫描并建立索引”即可；只有修改了抽取规则或更换模型时，才需要单独补其中一项。") }}</p>
       <p class="muted tiny processing-files" v-if="idx?.running && idx.current_items?.length">
         正在处理：{{ idx.current_items.join("、") }}
       </p>

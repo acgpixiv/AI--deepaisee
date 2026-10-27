@@ -68,3 +68,75 @@ input:focus, select:focus { border-color: var(--accent); }
 ::-webkit-scrollbar-thumb { background: #aaa; border-radius: 0; }
 ::-webkit-scrollbar-thumb:hover { background: #666; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------------------------------------------------------------- 主题
+   浅色是默认值（上面 :root）。暗色只在 <html data-theme="dark"> 时生效，
+   由 App.vue 的 applyAppearance() 根据 config.ui.theme 写入。
+   这里同时覆盖各组件里因历史原因写死的白色背景，避免暗色下出现白块。 */
+html[data-theme="dark"] {
+  --bg: #0f1110;
+  --panel: #171a18;
+  --panel-2: #1e2220;
+  --border: #3d4440;
+  --text: #e9ede9;
+  --muted: #98a29b;
+  --accent: #e9ede9;
+  --accent-2: #b6bfb8;
+  --warn: #e2bb72;
+  --danger: #ef8a82;
+  color-scheme: dark;
+}
+
+html[data-theme="dark"] body { background: var(--bg); color: var(--text); }
+html[data-theme="dark"] button { background: var(--panel); border-color: var(--border); color: var(--text); }
+html[data-theme="dark"] button:hover { background: var(--panel-2); border-color: var(--text); }
+html[data-theme="dark"] button.primary,
+html[data-theme="dark"] button.tab.active { background: var(--text); border-color: var(--text); color: #121514; }
+html[data-theme="dark"] input,
+html[data-theme="dark"] select,
+html[data-theme="dark"] textarea { background: var(--panel-2); border-color: var(--border); color: var(--text); }
+html[data-theme="dark"] .card { background: var(--panel); border-color: var(--border); }
+html[data-theme="dark"] ::-webkit-scrollbar-thumb { background: #454d47; }
+html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover { background: #5b645d; }
+
+/* 组件内写死的浅色表面（scoped 选择器优先级低于这里） */
+html[data-theme="dark"] .toast,
+html[data-theme="dark"] .query-shell,
+html[data-theme="dark"] .query-shell.focused,
+html[data-theme="dark"] .recent-panel,
+html[data-theme="dark"] .result,
+html[data-theme="dark"] .preview-popover,
+html[data-theme="dark"] .context-menu,
+html[data-theme="dark"] .pdf-card,
+html[data-theme="dark"] .settings-sidebar,
+html[data-theme="dark"] .settings-section,
+html[data-theme="dark"] .blk,
+html[data-theme="dark"] .root,
+html[data-theme="dark"] .chart,
+html[data-theme="dark"] .side,
+html[data-theme="dark"] .cur,
+html[data-theme="dark"] .list,
+html[data-theme="dark"] .extension-card,
+html[data-theme="dark"] .workspace-row .tiny-button { background: var(--panel); border-color: var(--border); color: var(--text); }
+
+html[data-theme="dark"] .result:hover { background: var(--panel-2); }
+html[data-theme="dark"] .context-menu button { color: var(--text); }
+html[data-theme="dark"] .context-menu button:hover { background: var(--panel-2); }
+html[data-theme="dark"] .preview-popover,
+html[data-theme="dark"] .context-menu,
+html[data-theme="dark"] .recent-panel,
+html[data-theme="dark"] .query-shell { border-color: var(--border); }
+html[data-theme="dark"] .settings-nav-item { color: var(--muted); }
+html[data-theme="dark"] .settings-nav-item:hover { color: var(--text); background: var(--panel-2); border-color: var(--border); }
+html[data-theme="dark"] .settings-nav-item.active { color: #121514; background: var(--text); border-color: var(--text); }
+html[data-theme="dark"] .settings-subtitle,
+html[data-theme="dark"] .settings-main-head p,
+html[data-theme="dark"] .section-head p,
+html[data-theme="dark"] .field-hint,
+html[data-theme="dark"] .empty-line { color: var(--muted); }
+html[data-theme="dark"] .workspace-row { border-color: var(--border); }
+html[data-theme="dark"] .workspace-row .mono { color: var(--text); }
+html[data-theme="dark"] .popover-empty { color: var(--muted); }
+html[data-theme="dark"] .toast.ok { background: #17281c; border-color: #3f6b4b; color: #b6e3c1; }
+html[data-theme="dark"] .toast.warn { background: #2a2418; border-color: #6d5a30; color: #e7cd96; }
+html[data-theme="dark"] .toast.error { background: #2b1a19; border-color: #6d3b37; color: #f0b3ae; }

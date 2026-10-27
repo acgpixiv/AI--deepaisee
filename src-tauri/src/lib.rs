@@ -19,12 +19,12 @@ pub mod util;
 pub mod vector;
 pub mod vision;
 pub mod watch;
+pub mod workspace;
 
-pub const APP_VERSION: &str = "0.0.20";
-pub const APP_DISPLAY_VERSION: &str = "0.20";
+pub const APP_VERSION: &str = "0.0.21";
+pub const APP_DISPLAY_VERSION: &str = "0.21";
 
 use std::sync::Arc;
-#[cfg(debug_assertions)]
 use tauri::Manager;
 
 pub fn run() {
@@ -66,32 +66,18 @@ pub fn run() {
             // 让「解压即用」成立，而不是逼用户先去设置页填路径。
             let mut cfg = cfg;
             if cfg.model.embed_model.trim().is_empty() {
-                for dir in [st.app_dir.join("models"), st.data_dir.join("models")] {
-                    let entries = crate::models::scan(&cfg.model, std::slice::from_ref(&dir));
-                    // Prefer a complete multimodal safetensors package when
-                    // present. Its vision/audio towers would be lost if the
-                    // text-only GGUF is selected first.
-                    let found = entries
-                        .iter()
-                        .find(|m| {
-                            m.kind == "embed"
-                                && m.format == "safetensors"
-                                && m.modalities.iter().any(|x| matches!(x.as_str(), "image" | "audio" | "video"))
-                        })
-                        .or_else(|| {
-                            entries.iter().find(|m| {
-                                m.direct_loadable && m.kind == "embed"
-                            })
-                        });
-                    if let Some(found) = found {
-                        cfg.model.embed_model = found.path.clone();
-                        let mut c = st.cfg.read().clone();
-                        c.model.embed_model = cfg.model.embed_model.clone();
-                        let _ = c.save(&crate::config::config_path(Some(&st.app_dir)));
-                        *st.cfg.write() = c;
-                        trace(format!("autodetect model={}", cfg.model.embed_model));
-                        break;
-                    }
+                // 便携版/安装版首次运行：在 models\ 里自动挑一个能直接加载的嵌入模型。
+                if let Some(found) = crate::models::autodetect_embed_model(
+                    &cfg.model,
+                    &st.app_dir,
+                    &st.data_dir,
+                ) {
+                    cfg.model.embed_model = found;
+                    let mut c = st.cfg.read().clone();
+                    c.model.embed_model = cfg.model.embed_model.clone();
+                    let _ = c.save(&crate::config::config_path(Some(&st.app_dir)));
+                    *st.cfg.write() = c;
+                    trace(format!("autodetect model={}", cfg.model.embed_model));
                 }
             }
             if cfg.model.auto_load && !cfg.model.embed_model.trim().is_empty() {
@@ -217,6 +203,12 @@ pub fn run() {
             cmd::extension_install,
         ])
         .setup(|app| {
+            // 主窗口在 setup 里手动创建：`tauri.conf.json` 的 `dataDirectory`
+            // 只接受「相对 localDataDir()」的路径，没法指到别的盘；而有些受限
+            // 环境下 WebView2 把用户数据目录建在 C:\Users\...\AppData\Local
+            // 里会直接报 0x800700AA（资源被占用）。这里用 WebviewWindowBuilder
+            // 指定绝对路径，见 webview_data_dir 的候选顺序。
+            create_main_window(app.handle())?;
             // 开发期打开 devtools
             #[cfg(debug_assertions)]
             {
@@ -224,7 +216,7 @@ pub fn run() {
                     w.open_devtools();
                 }
             }
-            let _ = app;
+            schedule_startup_scan(app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -238,4 +230,101 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// 创建主窗口（见 setup 里的说明）。
+fn create_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let conf = app.config().app.windows[0].clone();
+    let mut builder = tauri::WebviewWindowBuilder::from_config(app, &conf)?;
+    if let Some(dir) = webview_data_dir(app) {
+        builder = builder.data_directory(dir);
+    }
+    builder.build()?;
+    Ok(())
+}
+
+/// WebView2 用户数据目录的候选顺序：
+/// 1. 环境变量 `WEBVIEW2_USER_DATA_FOLDER`（排障时手动覆盖）
+/// 2. exe 同级 `webview-data`（便携版、安装到非系统盘时都在这里）
+/// 3. 数据目录旁的 `webview`（data_dir 已回退到用户目录时）
+/// 4. `%LOCALAPPDATA%\deepaisee\webview`（最后兜底）
+///
+/// 非系统盘优先：本机实测 WebView2 数据目录落在 C: 盘 AppData 下会失败，
+/// 换到其它盘立刻正常，而普通用户的机器上两种位置都能用。
+fn webview_data_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("WEBVIEW2_USER_DATA_FOLDER") {
+        let p = std::path::PathBuf::from(p);
+        let _ = std::fs::create_dir_all(&p);
+        return Some(p);
+    }
+    let state = app.state::<Arc<state::AppState>>();
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        candidates.push(dir.join("webview-data"));
+    }
+    candidates.push(state.data_dir.join("webview"));
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(std::path::PathBuf::from(local).join("deepaisee").join("webview"));
+    }
+    let on_system_drive = |p: &std::path::Path| {
+        p.to_string_lossy().to_ascii_lowercase().starts_with("c:")
+    };
+    let ordered = candidates
+        .iter()
+        .filter(|d| !on_system_drive(d))
+        .chain(candidates.iter().filter(|d| on_system_drive(d)));
+    for dir in ordered {
+        if is_writable_dir(dir) {
+            return Some(dir.clone());
+        }
+    }
+    None
+}
+
+fn is_writable_dir(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".write-probe");
+    let ok = std::fs::write(&probe, b"ok").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+/// 启动时自动扫描（需求：自动扫描与文件变化提醒）。
+///
+/// 只做一次「增量扫描 + 变化统计」：扫描器本身按 mtime/size 判断新增、修改，
+/// 并把扫描根下没再出现的记录标成 missing，所以不需要额外的 diff 逻辑。
+/// 延迟 2.5 秒执行，避开窗口首帧与模型加载的高峰。
+fn schedule_startup_scan(app: &tauri::AppHandle) {
+    let cfg_now = {
+        let state = app.state::<Arc<state::AppState>>();
+        let current = state.cfg.read().clone();
+        current
+    };
+    if !cfg_now.ui.auto_scan_on_start || cfg_now.scan.roots.is_empty() {
+        return;
+    }
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        let state = handle.state::<Arc<state::AppState>>();
+        // 用户可能刚在设置里关掉了开关，这里再读一次，避免关掉后仍然扫描。
+        if !state.cfg.read().ui.auto_scan_on_start {
+            return;
+        }
+        match cmd::start_scan(state.inner(), None, None) {
+            Ok(()) => {
+                let _ = state.db.log("scan", "启动时自动扫描已开始");
+            }
+            Err(e) => {
+                // 扫描正在进行中属于正常情况（例如用户手动点了扫描），不记错误。
+                if !e.contains("已在进行中") {
+                    let _ = state.db.log("error", &format!("启动自动扫描失败：{e}"));
+                }
+            }
+        }
+    });
 }

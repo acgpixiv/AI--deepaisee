@@ -1,6 +1,7 @@
 import { createApp } from "vue";
 import App from "./App.vue";
 import "./styles.css";
+import { primeAppearance } from "./theme";
 
 // ---- 全局错误兜底：界面挂掉时把原因显示出来，而不是留一片黑屏。
 // （Tauri 的 WebView 里没有控制台，出错时用户只能看到空白，极难排查）
@@ -26,6 +27,9 @@ window.addEventListener("unhandledrejection", (e) => {
   const r = e.reason as any;
   showFatal("未处理的异步错误", `${r?.message ?? String(r)}\n${r?.stack ?? ""}`);
 });
+
+// 先按本地缓存应用主题/语言，避免首帧闪白或闪黑。
+primeAppearance();
 
 try {
   createApp(App).mount("#app");

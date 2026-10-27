@@ -98,7 +98,15 @@ impl Ctx {
             .and_then(|p| p.parent().map(|x| x.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
         let data_dir = data_dir(Some(&app_dir));
-        let cfg = AppConfig::load(&config_path(Some(&app_dir)));
+        let mut cfg = AppConfig::load(&config_path(Some(&app_dir)));
+        // 与主程序一致：没配置模型时在 models\ 下自动探测。
+        if cfg.model.embed_model.trim().is_empty() {
+            if let Some(found) =
+                crate::models::autodetect_embed_model(&cfg.model, &app_dir, &data_dir)
+            {
+                cfg.model.embed_model = found;
+            }
+        }
         let db = Db::open(&data_dir.join("index.db")).map_err(|e| format!("打开数据库失败：{e}"))?;
         db.sync_index_roots(&cfg.scan.roots, &cfg.scan.disabled_roots)
             .map_err(|e| format!("同步索引目录失败：{e}"))?;

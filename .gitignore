@@ -27,6 +27,11 @@ src-tauri/cmake-check/
 target-candle-check/
 .tools/
 
+# ───────── 交付产物（体积大，不入库） ─────────
+release/
+dist-app/
+AI--deepaisee-main/
+
 # ───────── 系统与编辑器 ─────────
 Thumbs.db
 desktop.ini

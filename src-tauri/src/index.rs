@@ -1281,31 +1281,75 @@ impl Indexer {
                 }
             }
             "video" => {
-                // 视频取中间那帧代表整个视频：CLIP 对构图/主体的判断
-                // 比逐帧平均更稳，也省一大截时间。
+                // 视频：智能抽帧（间隔 + I 帧/场景切换优先 + 指纹去重）后
+                // 把多帧 CLIP 向量求平均。旧实现只取中间一帧，片尾字幕、
+                // 转场黑场一类的视频经常抽到无意义画面，直接搜不到。
                 let clip = self.clip.read().clone();
-                let Some(clip) = clip else { return };
-                if self.clip_vectors.has(row.id) {
-                    return;
-                }
-                let frames = media::sample_video_frames(path, 1, 256);
-                let Some(frame) = frames.first() else {
-                    // 抽帧失败多半是没装 ffmpeg 或临时目录不可写，说清楚，
-                    // 否则用户只看到「视频搜不到」，猜不出原因。
-                    self.record_error(format!("视频 {}: 抽帧失败（需要 ffmpeg）", row.name));
-                    return;
-                };
-                match clip.image_vec(frame) {
-                    Ok(v) => {
-                        self.clip_vectors.add(row.id, &v);
-                        self.stats.lock().cross_done += 1;
-                        dirty += 1;
+                if let Some(clip) = clip {
+                    if !self.clip_vectors.has(row.id) {
+                        let frames = media::sample_video_frames_smart(
+                            path,
+                            media::FramePlan {
+                                interval: self.cfg.video_frame_interval,
+                                // 跨模态只需要少量代表帧，帧数太多纯属浪费
+                                max_frames: self.cfg.video_max_frames.clamp(1, 12),
+                                max_side: 256,
+                                dedup_distance: self.cfg.video_dedup_distance,
+                            },
+                        );
+                        if frames.is_empty() {
+                            // 抽帧失败多半是没装 ffmpeg 或临时目录不可写，
+                            // 说清楚，否则用户只看到「视频搜不到」。
+                            self.record_error(format!(
+                                "视频 {}: 抽帧失败（需要 ffmpeg）",
+                                row.name
+                            ));
+                        } else {
+                            let mut merged = vec![0.0f32; clip.dim()];
+                            let mut frames_used = 0usize;
+                            for frame in &frames {
+                                if self.is_cancelled() {
+                                    break;
+                                }
+                                if let Ok(v) = clip.image_vec(frame) {
+                                    if v.len() == merged.len() {
+                                        for (dst, value) in merged.iter_mut().zip(v) {
+                                            *dst += value;
+                                        }
+                                        frames_used += 1;
+                                    }
+                                }
+                                let _ = std::fs::remove_file(frame);
+                            }
+                            if frames_used > 0 {
+                                for value in &mut merged {
+                                    *value /= frames_used as f32;
+                                }
+                                crate::ai::l2_normalize(&mut merged);
+                                self.clip_vectors.add(row.id, &merged);
+                                self.stats.lock().cross_done += 1;
+                                dirty += 1;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        self.record_error(format!("CLIP 帧 {}: {e}", row.name));
+                }
+                // 音轨语义索引：视频里的说话声/环境声同样能用一句话搜到。
+                // 复用 CLAP 的音频向量空间，和纯音频文件放在一起，
+                // 「找一段下雨的声音」能同时命中音频和视频。
+                if self.cfg.video_index_audio {
+                    let clap = self.clap.read().clone();
+                    if let Some(clap) = clap {
+                        if !self.audio_vectors.has(row.id) {
+                            // 无声视频解不出音轨是正常情况，不记错误，
+                            // 否则每批索引都会刷一屏「失败」。
+                            if let Ok(v) = clap.audio_vec(path) {
+                                self.audio_vectors.add(row.id, &v);
+                                self.stats.lock().cross_done += 1;
+                                dirty += 1;
+                            }
+                        }
                     }
                 }
-                let _ = std::fs::remove_file(frame);
             }
             "audio" => {
                 let clap = self.clap.read().clone();

@@ -277,7 +277,12 @@ impl Embedder for CandleEmbedder {
     }
 
     fn embed_video(&self, path: &Path) -> Result<Vec<f32>, String> {
-        let frames = crate::media::sample_video_frames(path, 32, 1024);
+        // 与 index.rs 用同一套智能抽帧：场景切换/I 帧优先 + dHash 去重，
+        // 避免「固定均匀切 32 帧」在长静止镜头上浪费算力、在快剪视频上漏画面。
+        let frames = crate::media::sample_video_frames_smart(
+            path,
+            crate::media::FramePlan { interval: 4.0, max_frames: 32, max_side: 1024, dedup_distance: 6 },
+        );
         if frames.is_empty() {
             return Err("视频抽帧失败（需要 ffmpeg）".into());
         }

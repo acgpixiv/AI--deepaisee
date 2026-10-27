@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
-import { Cpu, Files, Package, ScrollText, Wifi } from "lucide-vue-next";
+import { Cpu, Files, Package, ScrollText, SlidersHorizontal, Wifi } from "lucide-vue-next";
 import { api, type Activity, type AppConfig, type PartialConfig, type Rule, type ServerStatus, type WatchStatus } from "../api";
+import { t } from "../i18n";
 import { refreshStats, toast } from "../store";
+import { applyAppearance } from "../theme";
+import SettingsGeneralTab from "./SettingsGeneralTab.vue";
 import SettingsIndexTab from "./SettingsIndexTab.vue";
 import SettingsModelTab from "./SettingsModelTab.vue";
 import SettingsLanTab from "./SettingsLanTab.vue";
@@ -13,6 +16,7 @@ const props = defineProps<{ open: boolean; tab: string }>();
 const emit = defineEmits<{ (event: "tab", tab: string): void }>();
 
 const TABS = [
+  { key: "general", label: "通用配置", icon: SlidersHorizontal },
   { key: "index", label: "文件索引", icon: Files },
   { key: "model", label: "模型配置", icon: Cpu },
   { key: "lan", label: "局域网配置", icon: Wifi },
@@ -20,7 +24,7 @@ const TABS = [
   { key: "log", label: "日志", icon: ScrollText },
 ] as const;
 
-const activeTab = computed(() => TABS.some((item) => item.key === props.tab) ? props.tab : "index");
+const activeTab = computed(() => TABS.some((item) => item.key === props.tab) ? props.tab : "general");
 const cfg = ref<AppConfig | null>(null);
 const rules = ref<Rule[]>([]);
 const logs = ref<Activity[]>([]);
@@ -63,7 +67,7 @@ async function load() {
     watchRootsText.value = (config.watch.roots || []).join("\n");
     excludeDirsText.value = (config.scan.exclude_dirs || []).join("\n");
   } catch (error) {
-    toast(`读取设置失败：${error}`, "error");
+    toast(`${t("读取设置失败：")}${error}`, "error");
   } finally {
     loading.value = false;
   }
@@ -73,10 +77,10 @@ async function savePatch(patch: PartialConfig, message = "设置已保存") {
   try {
     await api.saveConfig(patch);
     cfg.value = await api.getConfig();
-    toast(message, "ok");
+    toast(t(message), "ok");
     return true;
   } catch (error) {
-    toast(`保存失败：${error}`, "error");
+    toast(`${t("保存失败：")}${error}`, "error");
     return false;
   }
 }
@@ -94,6 +98,10 @@ async function saveFileConfig(): Promise<boolean> {
       max_text_chars: cfg.value.index.max_text_chars,
       image_max_side: cfg.value.index.image_max_side,
       video_frames: cfg.value.index.video_frames,
+      video_frame_interval: cfg.value.index.video_frame_interval,
+      video_max_frames: cfg.value.index.video_max_frames,
+      video_dedup_distance: cfg.value.index.video_dedup_distance,
+      video_index_audio: cfg.value.index.video_index_audio,
       audio_seconds: cfg.value.index.audio_seconds,
       batch_size: cfg.value.index.batch_size,
       auto_fulltext: cfg.value.index.auto_fulltext,
@@ -110,6 +118,33 @@ async function saveFileConfig(): Promise<boolean> {
       debounce_ms: cfg.value.search.debounce_ms,
     },
   });
+}
+
+/** 通用配置：界面、启动行为和「工作区」目录。 */
+async function saveGeneralConfig(): Promise<boolean> {
+  if (!cfg.value) return false;
+  const ok = await savePatch({
+    ui: {
+      language: cfg.value.ui.language,
+      theme: cfg.value.ui.theme,
+      font_size: cfg.value.ui.font_size,
+      remember_window: cfg.value.ui.remember_window,
+      autostart: cfg.value.ui.autostart,
+      auto_scan_on_start: cfg.value.ui.auto_scan_on_start,
+      notify_file_changes: cfg.value.ui.notify_file_changes,
+      default_search_mode: cfg.value.ui.default_search_mode,
+    },
+    workspace: {
+      dirs: (cfg.value.workspace?.dirs as string[]) ?? [],
+      enabled: cfg.value.workspace?.enabled ?? true,
+      live_extract: cfg.value.workspace?.live_extract ?? true,
+      max_file_mb: cfg.value.workspace?.max_file_mb ?? 64,
+      depth: cfg.value.workspace?.depth ?? 4,
+    },
+  }, "通用设置已保存");
+  // 注意：必须传入 ui，否则 applyAppearance 会用默认值（system / zh）把刚保存的语言和主题覆盖掉。
+  if (ok) await applyAppearance(cfg.value?.ui);
+  return ok;
 }
 
 async function saveModelConfig(): Promise<boolean> {
@@ -160,14 +195,14 @@ async function toggleServer() {
     if (srv.value?.running) {
       await api.serverStop();
       srv.value = { running: false, url: "" };
-      toast("局域网服务已停止", "warn");
+      toast(t("局域网服务已停止"), "warn");
     } else {
       const url = await api.serverStart();
       srv.value = { running: true, url };
-      toast(`局域网服务已启动：${url}`, "ok");
+      toast(`${t("局域网服务已启动：")}${url}`, "ok");
     }
   } catch (error) {
-    toast(`服务操作失败：${error}`, "error");
+    toast(`${t("服务操作失败：")}${error}`, "error");
   }
 }
 
@@ -176,14 +211,14 @@ async function toggleWatcher() {
   try {
     if (watcher.value?.running) {
       await api.watchStop();
-      toast("实时监控已停止", "warn");
+      toast(t("实时监控已停止"), "warn");
     } else {
       const count = await api.watchStart();
-      toast(`实时监控已开启，监视 ${count} 个目录`, "ok");
+      toast(`${t("实时监控已开启，监视")} ${count} ${t("个目录")}`, "ok");
     }
     watcher.value = await api.watchStatus();
   } catch (error) {
-    toast(`监控操作失败：${error}`, "error");
+    toast(`${t("监控操作失败：")}${error}`, "error");
   }
 }
 
@@ -191,13 +226,13 @@ async function refreshLogs() {
   try {
     logs.value = await api.activityList(logKind.value || undefined, 300);
   } catch (error) {
-    toast(`读取日志失败：${error}`, "error");
+    toast(`${t("读取日志失败：")}${error}`, "error");
   }
 }
 
 async function addRule() {
   if (!newRule.value.value.trim() || !newRule.value.category.trim()) {
-    toast("请填写匹配内容与分类名", "warn");
+    toast(t("请填写匹配内容与分类名"), "warn");
     return;
   }
   rules.value.push({ ...newRule.value, id: 0 });
@@ -209,9 +244,9 @@ async function addRule() {
 async function saveRules() {
   try {
     await api.rulesSave(rules.value.map((rule, index) => ({ ...rule, priority: rule.priority ?? index })));
-    toast("分类规则已保存", "ok");
+    toast(t("分类规则已保存"), "ok");
   } catch (error) {
-    toast(`保存规则失败：${error}`, "error");
+    toast(`${t("保存规则失败：")}${error}`, "error");
   }
 }
 
@@ -223,31 +258,31 @@ async function deleteRule(index: number) {
 async function applyRules() {
   try {
     const count = await api.rulesApply();
-    toast(`已重新分类 ${count} 个文件`, "ok");
+    toast(`${t("已重新分类")} ${count} ${t("个文件")}`, "ok");
     await refreshStats();
   } catch (error) {
-    toast(`应用规则失败：${error}`, "error");
+    toast(`${t("应用规则失败：")}${error}`, "error");
   }
 }
 
 async function vacuum() {
   try {
     await api.dbVacuum();
-    toast("数据库已压缩", "ok");
+    toast(t("数据库已压缩"), "ok");
     await refreshStats();
   } catch (error) {
-    toast(`压缩失败：${error}`, "error");
+    toast(`${t("压缩失败：")}${error}`, "error");
   }
 }
 
 async function clearAll() {
-  if (!confirm("确定清空全部索引？文件本身不会被删除。")) return;
+  if (!confirm(t("确定清空全部索引？文件本身不会被删除。"))) return;
   try {
     await api.dbClear();
-    toast("索引已清空", "ok");
+    toast(t("索引已清空"), "ok");
     await refreshStats();
   } catch (error) {
-    toast(`清空失败：${error}`, "error");
+    toast(`${t("清空失败：")}${error}`, "error");
   }
 }
 
@@ -261,11 +296,11 @@ onMounted(load);
     <aside class="settings-sidebar">
       <div class="settings-sidebar-head">
         <div>
-          <div class="settings-title">设置</div>
+          <div class="settings-title">{{ t("设置") }}</div>
           <div class="settings-subtitle">deepaisee</div>
         </div>
       </div>
-      <nav class="settings-nav" aria-label="设置分类">
+      <nav class="settings-nav" :aria-label="t('设置分类')">
         <button
           v-for="item in TABS"
           :key="item.key"
@@ -274,7 +309,7 @@ onMounted(load);
           @click="emit('tab', item.key)"
         >
           <component :is="item.icon" :size="17" aria-hidden="true" />
-          <span>{{ item.label }}</span>
+          <span>{{ t(item.label) }}</span>
         </button>
       </nav>
     </aside>
@@ -282,17 +317,23 @@ onMounted(load);
     <section class="settings-main">
       <header class="settings-main-head">
         <div>
-          <h1>{{ TABS.find((item) => item.key === activeTab)?.label }}</h1>
-          <p v-if="activeTab === 'index'">扫描目录、建立全文与向量索引、管理分类规则。</p>
-          <p v-else-if="activeTab === 'model'">管理嵌入模型、跨模态模型和 GPU 推理参数。</p>
-          <p v-else-if="activeTab === 'lan'">配置局域网访问和文件变化监控。</p>
-          <p v-else-if="activeTab === 'log'">查看应用、扫描、索引和模型活动。</p>
-          <p v-else>按需安装 ONNX Runtime 和 Python sidecar，扩展文件保存在项目目录。</p>
+          <h1>{{ t(TABS.find((item) => item.key === activeTab)?.label ?? "设置") }}</h1>
+          <p v-if="activeTab === 'general'">{{ t("界面语言与主题、启动行为，以及无需建索引的工作区目录。") }}</p>
+          <p v-else-if="activeTab === 'index'">{{ t("扫描目录、建立全文与向量索引、管理分类规则。") }}</p>
+          <p v-else-if="activeTab === 'model'">{{ t("管理嵌入模型、跨模态模型和 GPU 推理参数。") }}</p>
+          <p v-else-if="activeTab === 'lan'">{{ t("配置局域网访问和文件变化监控。") }}</p>
+          <p v-else-if="activeTab === 'log'">{{ t("查看应用、扫描、索引和模型活动。") }}</p>
+          <p v-else>{{ t("按需安装 ONNX Runtime 和 Python sidecar，扩展文件保存在项目目录。") }}</p>
         </div>
       </header>
 
-      <div v-if="loading" class="settings-loading">正在读取设置…</div>
+      <div v-if="loading" class="settings-loading">{{ t("正在读取设置…") }}</div>
       <div v-else-if="cfg" class="settings-scroll">
+        <SettingsGeneralTab
+          v-if="activeTab === 'general'"
+          :cfg="cfg"
+          :save-general-config="saveGeneralConfig"
+        />
         <SettingsIndexTab
           v-if="activeTab === 'index'"
           :cfg="cfg"

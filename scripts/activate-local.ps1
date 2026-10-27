@@ -1,18 +1,29 @@
 $ErrorActionPreference = "Stop"
 
 $repo = Split-Path -Parent $PSScriptRoot
+# Toolchains live in .tools by default; checkouts that unpacked them next to the
+# repo (tools/) must keep working too, so probe both before giving up.
 $tools = Join-Path $repo ".tools"
+if (-not (Test-Path -LiteralPath (Join-Path $tools "cargo"))) {
+  $fallbackTools = Join-Path $repo "tools"
+  if (Test-Path -LiteralPath (Join-Path $fallbackTools "cargo")) { $tools = $fallbackTools }
+}
 $cargoHome = Join-Path $tools "cargo"
 $rustupHome = Join-Path $tools "rustup"
 $nodeHome = Join-Path $tools "node\node-v22.14.0-win-x64"
+# Some checkouts keep a plain tools\node folder instead of the pinned versioned one.
+if (-not (Test-Path (Join-Path $nodeHome "node.exe"))) { $nodeHome = Join-Path $tools "node" }
 $cmakeHome = Join-Path $tools "cmake"
 $ninjaHome = Join-Path $tools "ninja"
+# The MSYS2 UCRT64 toolchain ships cmake/ninja/gcc and is the fallback on this host.
+$ucrt64Bin = Join-Path $tools "msys64\ucrt64\bin"
 $npmCache = Join-Path $tools "npm-cache"
 
 $env:DEEPAISEE_REPO = $repo
 $env:CARGO_HOME = $cargoHome
 $env:RUSTUP_HOME = $rustupHome
-$env:CARGO_TARGET_DIR = Join-Path $repo "src-tauri\target"
+# Keep an externally chosen target dir (CI / limited-disk hosts redirect it).
+if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = Join-Path $repo "src-tauri\target" }
 $env:npm_config_cache = $npmCache
 $env:npm_config_prefix = Join-Path $tools "npm-global"
 
@@ -20,7 +31,8 @@ $localPaths = @(
   (Join-Path $cargoHome "bin"),
   $nodeHome,
   (Join-Path $cmakeHome "bin"),
-  $ninjaHome
+  $ninjaHome,
+  $ucrt64Bin
 )
 
 # Prefer a project-local CUDA Toolkit when one has been unpacked or installed.
