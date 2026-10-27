@@ -233,7 +233,40 @@ fn main() {
         println!("cargo:rerun-if-changed=native/CMakeLists.txt");
     }
 
-    tauri_build::build()
+    // Windows + GNU 工具链下，windres 无法打开含非 ASCII 字符路径的 .ico
+    // （报 `can't open icon file ...: Invalid argument`）。这里在需要时把图标
+    // 复制到 OUT_DIR 下的纯 ASCII 路径再交给 tauri-build；路径本身是 ASCII 时
+    // 走默认逻辑，行为完全不变。
+    let mut attrs = tauri_build::Attributes::new();
+    if let Some(icon) = ascii_window_icon() {
+        attrs = attrs.windows_attributes(
+            tauri_build::WindowsAttributes::new().window_icon_path(icon),
+        );
+    }
+    tauri_build::try_build(attrs).expect("failed to run tauri-build")
+}
+
+/// 当 `icons/icon.ico` 的绝对路径含非 ASCII 字符时，复制一份到 OUT_DIR（ASCII）
+/// 并返回该副本路径；否则返回 None，让 tauri-build 用默认图标路径。
+fn ascii_window_icon() -> Option<std::path::PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let manifest = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
+    let icon = manifest.join("icons").join("icon.ico");
+    if !icon.exists() {
+        return None;
+    }
+    let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR")?);
+    if !out_dir.to_string_lossy().is_ascii() {
+        return None;
+    }
+    let dst = out_dir.join("icon-ascii.ico");
+    if std::fs::copy(&icon, &dst).is_ok() {
+        Some(dst)
+    } else {
+        None
+    }
 }
 
 /// Resolve the CUDA toolkit root consistently for CMake configuration and
@@ -311,5 +344,5 @@ fn windows_ascii_cmake_out_dir() -> Option<std::path::PathBuf> {
     if volume_root.as_os_str().is_empty() {
         return None;
     }
-    Some(volume_root.join(".deepaisee-cmake").join(build_id))
+    Some(volume_root.join(".deepdark-oracle-cmake").join(build_id))
 }

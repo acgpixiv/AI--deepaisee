@@ -123,7 +123,7 @@ try {
   $installerDir = Join-Path $releaseDir "bundle\nsis"
   $installers = @(Get-ChildItem -Path $installerDir -Filter "*-setup.exe" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
   Write-Host ""
-  Write-Host "Release binary : $(Join-Path $releaseDir 'deepaisee.exe')"
+  Write-Host "Release binary : $(Join-Path $releaseDir 'DeepDark_Oracle.exe')"
   if ($installers.Count -gt 0) {
     $installer = $installers[0]
     $sizeMb = [math]::Round($installer.Length / 1MB, 1)

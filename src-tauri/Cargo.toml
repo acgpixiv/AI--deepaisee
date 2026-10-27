@@ -1,15 +1,15 @@
 [package]
-name = "deepaisee"
-version = "0.0.21"
-description = "deepaisee - AI disk search (Tauri 2 + Vue 3 + llama.cpp)"
-authors = ["deepaisee"]
+name = "DeepDark_Oracle"
+version = "0.0.22"
+description = "DeepDark_Oracle - AI disk search (Tauri 2 + Vue 3 + llama.cpp)"
+authors = ["DeepDark_Oracle"]
 edition = "2021"
 rust-version = "1.77.2"
 # 无 default-run 时 `tauri build` 会报 "failed to find main binary"。
-default-run = "deepaisee"
+default-run = "DeepDark_Oracle"
 
 [lib]
-name = "deepaisee_lib"
+name = "deepdark_oracle_lib"
 # Windows GNU 工具链下 cdylib 会导出海量符号，ld 报 "export ordinal too large: 111178"。
 # 桌面端只需要 rlib（main.rs 直接链接），cdylib/staticlib 是给移动端用的，这里不需要。
 crate-type = ["rlib"]

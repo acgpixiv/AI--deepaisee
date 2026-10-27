@@ -8,16 +8,25 @@ import { langState, t } from "./i18n";
 import SearchView from "./views/SearchView.vue";
 import TreeView from "./views/TreeView.vue";
 import SettingsDrawer from "./components/SettingsDrawer.vue";
+import IndexTreePanel from "./components/IndexTreePanel.vue";
 
 type Page = "home" | "tree" | "settings";
 const page = ref<Page>("home");
 const settingsTab = ref("general");
+/** 右上角「索引目录结构」下拉面板是否展开。 */
+const treePanelOpen = ref(false);
 const thumbDir = ref("");
 const notifyChanges = ref(true);
 let statsTimer: number | undefined;
 let scanTimer: number | undefined;
 let lastScanRunning = false;
 let lastScan: ScanProgress | null = null;
+
+/** 面板底部的「完整视图」：收起面板并切到树状图页面。 */
+function openFullTree() {
+  treePanelOpen.value = false;
+  page.value = "tree";
+}
 
 function showSettings(tab = "general") {
   settingsTab.value = tab;
@@ -90,19 +99,27 @@ watch(page, (next) => {
         <Search :size="18" aria-hidden="true" />
         <span>{{ t("文件搜索") }}</span>
       </button>
-      <button
-        class="index-link"
-        :class="{ current: page === 'tree' }"
-        :title="page === 'tree' ? t('返回搜索主页') : t('查看目录树状图')"
-        @click="page = page === 'tree' ? 'home' : 'tree'"
-      >
-        <Database :size="15" aria-hidden="true" />
-        <span>
-          {{ (store.stats?.files ?? 0).toLocaleString() }} {{ langState.current === "en" ? "files" : "个文件" }}
-          <span class="index-divider">·</span>
-          {{ store.stats?.bytes_label ?? "0 B" }}
-        </span>
-      </button>
+      <div class="index-wrap">
+        <button
+          class="index-link"
+          :class="{ current: page === 'tree', open: treePanelOpen }"
+          :title="t('查看索引目录结构')"
+          :aria-expanded="treePanelOpen"
+          @click="treePanelOpen = !treePanelOpen"
+        >
+          <Database :size="15" aria-hidden="true" />
+          <span>
+            {{ (store.stats?.files ?? 0).toLocaleString() }} {{ langState.current === "en" ? "files" : "个文件" }}
+            <span class="index-divider">·</span>
+            {{ store.stats?.bytes_label ?? "0 B" }}
+          </span>
+        </button>
+        <IndexTreePanel
+          :open="treePanelOpen"
+          @close="treePanelOpen = false"
+          @open-full="openFullTree"
+        />
+      </div>
       <button class="icon-button settings-button" :title="t('设置')" :aria-label="t('设置')" @click="page === 'settings' ? (page = 'home') : showSettings()">
         <Settings2 :size="19" aria-hidden="true" />
       </button>
@@ -163,9 +180,14 @@ watch(page, (next) => {
 .search-link span { width: 0; overflow: hidden; opacity: 0; transition: width .16s ease, opacity .16s ease; }
 .search-link:hover, .search-link:focus-visible { width: 112px; border-color: var(--border); background: var(--panel); }
 .search-link:hover span, .search-link:focus-visible span { width: 56px; opacity: 1; }
+.index-wrap {
+  position: relative;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+}
 .index-link {
   min-width: 210px;
-  margin-left: auto;
   display: inline-flex;
   justify-content: center;
   align-items: center;
@@ -178,7 +200,7 @@ watch(page, (next) => {
   font-variant-numeric: tabular-nums;
   transition: background .16s ease, border-color .16s ease, color .16s ease;
 }
-.index-link:hover, .index-link.current { background: var(--panel); border-color: var(--border); color: var(--text); }
+.index-link:hover, .index-link.current, .index-link.open { background: var(--panel); border-color: var(--border); color: var(--text); }
 .index-divider { padding: 0 3px; color: #59615d; }
 .index-link :deep(svg:last-child) { color: #707a73; }
 .icon-button {
@@ -213,6 +235,7 @@ watch(page, (next) => {
 
 @media (max-width: 560px) {
   .topbar { padding: 0 12px; }
+  .index-wrap { margin-left: auto; }
   .index-link { min-width: 0; gap: 6px; padding-inline: 7px; }
   .index-link span { max-width: 175px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }

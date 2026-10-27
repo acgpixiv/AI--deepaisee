@@ -1,4 +1,4 @@
-# deepaisee · AI 磁盘智搜
+# DeepDark_Oracle · AI 磁盘智搜
 
 本地离线的**磁盘全文 + 语义检索**桌面工具。用一句中文找到硬盘里的文件，不上传任何数据。
 
@@ -9,7 +9,7 @@
 - 正文抽取：TXT / Markdown / Word（docx + doc）/ Excel（xlsx + xls）/ PPT（pptx + ppt）/ PDF / RTF / EPUB / ODF
 - 界面：搜索 / 相似、树状图、扫描 / 索引、模型管理 四模式
 
-当前版本 **v0.21**，版本历史见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本 **v0.22**，版本历史见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -19,28 +19,28 @@
 
 | 内容 | 位置 | 说明 |
 | --- | --- | --- |
-| **安装包（推荐分发方式）** | `release/deepaisee_0.0.21_x64-setup.exe` | 已构建好的成品（约 651 MiB），含运行时 DLL、模型与 ffmpeg；重新生成用 `npm run tauri:release`，产物在 `build-target/release/bundle/nsis/` |
-| **可直接运行的便携版** | 根目录：`deepaisee.exe` + 5 个 `.dll` + 启动器（同版本副本在 `release/deepaisee.exe`） | 缺模型与 ffmpeg，见下节 |
-| **前端源码** | `src/`（20 个文件，Vue 3 + TS） | 约 4,400 行 |
-| **后端源码** | `src-tauri/src/`（30 个 `.rs`） | 约 14,400 行 |
+| **安装包** | ❌ 不随仓库分发（682 MB，超过 GitHub 限制） | 本地构建产物为 `release/DeepDark_Oracle_0.0.22_x64-setup.exe`，用 `npm run tauri:release` 生成，产物在 `src-tauri/target/release/bundle/nsis/` |
+| **可直接运行的便携版** | 根目录：`DeepDark_Oracle.exe` + 5 个 `.dll` + 启动器 | 缺模型与 ffmpeg，见下节 |
+| **前端源码** | `src/`（23 个文件，Vue 3 + TS） | 约 5,900 行 |
+| **后端源码** | `src-tauri/src/`（30 个 `.rs`） | 约 15,000 行 |
 | **构建配置** | `src-tauri/{Cargo.toml,​build.rs,​tauri.conf.json}`、`package.json` 等 | — |
-| **验收截图** | `docs/screenshots/` | 12 张（含 v0.21 中英文界面） |
+| **验收截图** | `docs/screenshots/` | 13 张（v0.19 ~ v0.22） |
 | **依赖源码** | ❌ 不含 `vendor/llama.cpp` | 需按第 2 节 clone |
 
 ### 1. 安装与运行
 
 **方式 A：安装包（推荐给普通用户）**
 
-运行 `release\deepaisee_0.0.21_x64-setup.exe`。安装向导会让你选择安装目录，**默认落在非系统盘的 `D:\Apps\deepaisee`**（D 盘不存在时退到 `E:\Apps`，再不行才用 `%LOCALAPPDATA%\deepaisee`），避免把几百 MB 的模型塞进 C 盘。安装包会自动带上全部运行时 DLL、`models\`（嵌入/CLIP/CLAP）与 `tools\bin\ffmpeg.exe`，并创建开始菜单与桌面快捷方式；卸载入口在「设置 → 应用」里。
+运行构建好的 `DeepDark_Oracle_0.0.22_x64-setup.exe`。安装向导会让你选择安装目录，**默认落在非系统盘的 `D:\Apps\DeepDark_Oracle`**（D 盘不存在时退到 `E:\Apps`，再不行才用 `%LOCALAPPDATA%\DeepDark_Oracle`），避免把几百 MB 的模型塞进 C 盘。安装包会自动带上全部运行时 DLL、`models\`（嵌入/CLIP/CLAP）与 `tools\bin\ffmpeg.exe`，并创建开始菜单与桌面快捷方式；卸载入口在「设置 → 应用」里。
 
 **方式 B：便携版（解压即用）**
 
 ```
-deepaisee 启动器.cmd     ← 带菜单的启动器
-deepaisee.exe            ← 直接运行，跳过菜单
+DeepDark_Oracle 启动器.cmd     ← 带菜单的启动器
+DeepDark_Oracle.exe            ← 直接运行，跳过菜单
 ```
 
-**启动器**（`deepaisee 启动器.cmd` + `launcher.ps1`）提供六个入口：
+**启动器**（`DeepDark_Oracle 启动器.cmd` + `launcher.ps1`）提供六个入口：
 
 | 选项 | 作用 |
 | --- | --- |
@@ -53,13 +53,13 @@ deepaisee.exe            ← 直接运行，跳过菜单
 
 启动器用 PowerShell 写（`launcher.ps1`），因为 **.bat 里放中文会被 cmd 按 GBK 解析坏**。`launcher.ps1` 必须保持 **UTF-8 with BOM + CRLF**，否则 Windows PowerShell 5.1 会报解析错误。
 
-首次启动会自动加载模型（约 0.5~1.5 秒）。**便携版**的数据写在 exe 同级的 `data\`，整个文件夹可以拷走；**安装版**如果 exe 所在目录不可写（例如装在 `D:\Apps`、`Program Files` 且当前用户没有写权限），程序会自动回退到 `%LOCALAPPDATA%\deepaisee\data`，启动器的「打开数据目录」会跟着指向实际位置。
+首次启动会自动加载模型（约 0.5~1.5 秒）。**便携版**的数据写在 exe 同级的 `data\`，整个文件夹可以拷走；**安装版**如果 exe 所在目录不可写（例如装在 `D:\Apps`、`Program Files` 且当前用户没有写权限），程序会自动回退到 `%LOCALAPPDATA%\DeepDark_Oracle\data`，启动器的「打开数据目录」会跟着指向实际位置。
 
 运行时必须一起带的文件（少一个就起不来或功能缺失）：
 
 | 文件 | 作用 | 缺了会怎样 |
 | --- | --- | --- |
-| `deepaisee.exe` | 主程序 | — |
+| `DeepDark_Oracle.exe` | 主程序 | — |
 | `WebView2Loader.dll` | WebView2 装载器 | **双击无反应、退出码 `0xC0000135`** |
 | `libstdc++-6.dll` / `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` | gnu 运行时（llama.cpp 是 C++） | 弹「系统错误」窗后退出 |
 | `onnxruntime.dll` | ONNX 推理引擎（13.5MB） | 文字找图/找声音不可用（自检里两项标 `[FAIL]`） |
@@ -67,13 +67,13 @@ deepaisee.exe            ← 直接运行，跳过菜单
 | `models\clip\` | CLIP 图文模型（183MB） | 文字找图片/视频停用，退回颜色特征 |
 | `models\clap\` | CLAP 音文模型（155MB） | 文字找声音停用，退回频谱特征 |
 | `tools\bin\ffmpeg.exe` | 抽帧 / 音频解码 | 视频缩略图与音频/视频向量失败 |
-| `launcher.ps1` / `deepaisee 启动器.cmd` | 启动器（可选） | 不影响主程序，只是少了菜单 |
+| `launcher.ps1` / `DeepDark_Oracle 启动器.cmd` | 启动器（可选） | 不影响主程序，只是少了菜单 |
 
 > 安装包已把上表所有文件打进安装目录，不需要单独准备；下面的「不含模型」只针对 Git 仓库里的便携版。
 
 > 表格里带体积的 4 项**不在本仓库**（超过 GitHub 100MB 单文件限制），要自己补，见下节。
 
-验证办法：`deepaisee.exe --selftest`，看 `selftest.txt` 末尾是不是 `失败 0 项`。库里还没索引文件时，检索类检查会标成 `[SKIP]` 而不是失败 —— 此时先把「扫描 / 索引」页的目录扫进来再跑一次。
+验证办法：`DeepDark_Oracle.exe --selftest`，看 `selftest.txt` 末尾是不是 `失败 0 项`。库里还没索引文件时，检索类检查会标成 `[SKIP]` 而不是失败 —— 此时先把「扫描 / 索引」页的目录扫进来再跑一次。
 
 ### 关于本仓库不含模型
 
@@ -93,10 +93,10 @@ GitHub 单文件硬上限 100MB，下面这些放不进 Git，**需要自己补*
 **先把 llama.cpp 源码放到 `vendor/llama.cpp`**（不入库，需 clone）：
 
 ```bat
-git clone --depth 1 --branch b9999 https://github.com/ggml-org/llama.cpp vendor/llama.cpp
+git clone --depth 1 https://github.com/ggml-org/llama.cpp vendor/llama.cpp
 ```
 
-本项目按 `b9999` 验证 llama.cpp C ABI；不要直接跟随上游默认分支，否则 `llama.h` 变动可能导致原生构建失败。
+v0.22 验证的是 llama.cpp `0.7.0-dev`（master，`LLAMA_VERSION_MAJOR/MINOR/PATCH = 0/7/0`）。上游 `llama.h` 的 C ABI 在小版本间会有增删，换版本后请先确认 `src-tauri/native/llama_shim.cpp` 用到的符号（`llama_model_load_from_file` / `llama_init_from_model` / `llama_batch_get_one` / `llama_get_embeddings_seq` / `llama_memory_clear` / `llama_model_n_embd_out`）仍在。
 
 Windows 开发机可运行一次性依赖脚本安装 Rust MSVC 工具链、CMake、Ninja，拉取固定版本并恢复 npm/Cargo 依赖：
 
@@ -166,7 +166,10 @@ $env:DEEPAISEE_CUDA = '1'
 npm run tauri build -- --features llama,candle,candle-cuda,custom-protocol
 ```
 
-验证记录：本项目已在 CUDA Toolkit 13.1 + Visual Studio 2022/MSVC 下完成 CUDA Release 编译和链接。直接运行 Cargo 构建时，可执行文件位于 `src-tauri/target/release/deepaisee.exe`；发布包可用上面的 Tauri 命令生成。CUDA 运行仍需要驱动和 CUDA/cuBLAS 运行时 DLL，应用会优先从项目 `.tools/cuda/` 或安装目录加载，不会替用户改系统磁盘布局。没有 NVIDIA CUDA 的机器仍可使用同一个 exe 的 llama.cpp/Vulkan 路径；Candle 模型会报告当前设备不可用，而不会悄悄回退到 CPU。
+验证记录：
+
+- **v0.22（GNU / MSYS2 UCRT64）**：本机无 MSVC，用 `x86_64-pc-windows-gnu` + MSYS2 UCRT64 的 gcc 16.2 / cmake 4.4 / ninja 1.13 完整跑通 `cargo check` 与 `cargo build --release`，并产出 682 MB 的 NSIS 安装包。GNU 工具链有两条硬约束：① 中文路径会让 `windres` 打不开 `.ico`、让 MinGW `ld` 找不到标准库，`CARGO_HOME` / `RUSTUP_HOME` / `CARGO_TARGET_DIR` / `TMP` 必须全在纯 ASCII 目录（项目本身可用 `subst` 映射盘符后构建）；② 依赖 `dlltool.exe` / `windres.exe`，`PATH` 里要有 `<msys64>\ucrt64\bin`。构建命令：`cargo build --release --no-default-features --features llama,candle,custom-protocol`。
+- **CUDA（MSVC）**：已在 CUDA Toolkit 13.1 + Visual Studio 2022/MSVC 下完成 CUDA Release 编译和链接。直接运行 Cargo 构建时，可执行文件位于 `src-tauri/target/release/DeepDark_Oracle.exe`。CUDA 运行仍需要驱动和 CUDA/cuBLAS 运行时 DLL，应用会优先从项目 `.tools/cuda/` 或安装目录加载，不会替用户改系统磁盘布局。没有 NVIDIA CUDA 的机器仍可使用同一个 exe 的 llama.cpp/Vulkan 路径；Candle 模型会报告当前设备不可用，而不会悄悄回退到 CPU。
 
 **`custom-protocol` 这个 feature 不能漏**。它由 `tauri-build` 在构建脚本里读到，决定前端资源是「从磁盘内嵌协议加载」还是「连 `http://localhost:1420` 的开发服务器」；漏了这个 feature 也能编过，但打出来的 exe 双击后是**白屏**（只在 debug 下连 dev server，release 下没有服务器可连）。
 
@@ -174,7 +177,7 @@ npm run tauri build -- --features llama,candle,candle-cuda,custom-protocol
 
 ## 二、界面结构
 
-首页默认显示打字机标题和胶囊搜索框；输入后搜索栏收缩到顶部，结果以按相关度排序的图库卡片显示，并保留类型筛选、全文/拼音/模糊/语义/跨模态开关、相似检索、预览、定位和导出。顶栏只显示索引文件数与占用大小，点击它进入树状图，右侧齿轮进入设置。
+首页默认显示打字机标题和胶囊搜索框；输入后搜索栏收缩到顶部，结果以按相关度排序的图库卡片显示，并保留类型筛选、全文/拼音/模糊/语义/跨模态开关、相似检索、预览、定位和导出。顶栏右侧显示索引文件数与占用大小，**点击它从按钮下方弹出「索引目录结构」面板**（见下节），再往右的齿轮进入设置。
 
 设置页的左栏分为六个标签：**通用配置**（语言、主题、启动行为、工作区目录）、**文件索引**（扫描、索引参数、规则和数据库维护）、**模型配置**（GGUF、GPU 设备、上下文、CLIP/CLAP）、**局域网配置**（服务与实时监控）、**可选扩展**和**日志**（活动记录）。每个标签只提交自身的配置片段，避免修改一项覆盖其它设置。
 
@@ -187,6 +190,26 @@ npm run tauri build -- --features llama,candle,candle-cuda,custom-protocol
 - 右侧预览面板显示缩略图、元信息、正文片段
 - 正文命中的结果会在标题下显示**加粗高亮的片段**，前后各留 60 字上下文
 - 选中结果后可导出清单（CSV / TXT / JSON）
+
+### 右上角「索引目录结构」面板（v0.22 新增）
+
+> 顶栏那个「143,522 个文件 · 54.5 GB」的统计按钮现在可以点了。点开从按钮正下方弹出 400px 宽的下拉面板，直接看索引库里有什么，**不触发任何磁盘扫描**。
+
+<p align="center"><img src="docs/screenshots/v0.22-panel.png" alt="索引目录结构面板" width="620"><br><sub>索引目录结构面板：点顶栏统计按钮从下方弹出，根节点是索引根，展开即按层查询索引库</sub></p>
+
+| 区域 | 内容 |
+| --- | --- |
+| 顶部栏 | 标题「索引目录结构」+ 刷新 + 在资源管理器中打开 + 极小搜索框（按目录名过滤） |
+| 主体 | 根节点是索引根（如 `D:\`），逐层展开子目录与直属文件；行高 28px，文件夹灰线图标、文件按后缀分类型图标 |
+| 底部栏 | 「当前目录包含 12 个子文件夹，340 个文件 · 22.7 GB」；根层显示「N 个索引根 · X 个文件 · 大小」 |
+
+- **按层懒加载**：展开哪层才查哪层（`tree_browse`），已加载的层缓存在前端，收起面板不销毁、再开直接复用。
+- **搜索**：输入关键字按目录名匹配（`tree_search`），命中高亮 `#E6F7FF` 背景 + 加粗，点结果自动逐级展开祖先并滚动定位。
+- **右键菜单**：打开文件位置 / 复制完整路径 / 复制文件名 / 加入工作区。
+- **状态点**：文件行右侧 6px 小圆点，绿色=已索引、灰色=未索引、红色=索引出错。
+- **收起**：点击面板外部或按 `Esc`；底栏右侧「完整视图 →」切到原来的树状图页（squarify 面积图）。
+- 视觉：白底 `#FFFFFF`、主文字 `#333333`、次要 `#999999`、边框 `#CCCCCC`、选中 `#F5F5F5`、搜索命中 `#E6F7FF`；暗色主题有独立的一套变量。
+- 后端：`tree_browse` / `tree_search` / `workspace_add` 三个 Tauri 命令；数据层用 `dir >= lo AND dir < hi` 的字符串区间做前缀裁剪，14 万文件的库上全量聚合 140ms、单层展开 40~50ms。
 
 ### 界面截图
 
@@ -206,6 +229,9 @@ npm run tauri build -- --features llama,candle,candle-cuda,custom-protocol
 <tr>
 <td><img src="docs/screenshots/v0.20-models.png" alt="模型管理"><br><sub>模型管理页：扫描模型目录、一键切换、查看维度与路径</sub></td>
 <td><img src="docs/screenshots/v0.20-search.png" alt="全文检索"><br><sub>全文检索：正文命中的片段直接显示在标题下方</sub></td>
+</tr>
+<tr>
+<td colspan="2" align="center"><img src="docs/screenshots/v0.22-panel.png" alt="索引目录结构面板" width="620"><br><sub>索引目录结构面板（v0.22）：顶栏统计按钮点开，按层读取索引库的目录树</sub></td>
 </tr>
 </table>
 
@@ -321,28 +347,28 @@ EmbeddingGemma 2 的视觉塔（`vision_tower`）在 llama.cpp 里没有可用�
 
 ```bat
 :: 扫描目录并入库（可给多个目录）
-deepaisee.exe --cli scan D:\照片 E:\资料
+DeepDark_Oracle.exe --cli scan D:\照片 E:\资料
 
 :: 建立索引（--wait 阻塞到跑完；--what 可选 auto | text | embed）
-deepaisee.exe --cli index --wait
+DeepDark_Oracle.exe --cli index --wait
 
 :: 混合检索：文件名 / 路径 / 拼音 / 全文 / 语义一起打分
-deepaisee.exe --cli search "会议纪要"
-deepaisee.exe --cli search "余弦" --limit 5
-deepaisee.exe --cli search "forest" --kind image
+DeepDark_Oracle.exe --cli search "会议纪要"
+DeepDark_Oracle.exe --cli search "余弦" --limit 5
+DeepDark_Oracle.exe --cli search "forest" --kind image
 
 :: 纯语义检索（一句话描述）
-deepaisee.exe --cli sem "怎么比较两段文字的相似程度"
+DeepDark_Oracle.exe --cli sem "怎么比较两段文字的相似程度"
 
 :: 找同类型相似文件
-deepaisee.exe --cli similar "D:\照片\forest.png"
+DeepDark_Oracle.exe --cli similar "D:\照片\forest.png"
 
 :: 库统计
-deepaisee.exe --cli stats
+DeepDark_Oracle.exe --cli stats
 
 :: 分类规则 / 局域网服务
-deepaisee.exe --cli rules
-deepaisee.exe --cli serve --port 8770
+DeepDark_Oracle.exe --cli rules
+DeepDark_Oracle.exe --cli serve --port 8770
 ```
 
 输出示例：
@@ -366,9 +392,9 @@ deepaisee.exe --cli serve --port 8770
 
 ## 六、数据目录
 
-**便携版**在 exe 同级 `data\`；**安装版**在安装目录不可写时自动回退到 `%LOCALAPPDATA%\deepaisee\data`（探测顺序：exe 同级 → LOCALAPPDATA → APPDATA → TEMP）。目录结构一致：
+**便携版**在 exe 同级 `data\`；**安装版**在安装目录不可写时自动回退到 `%LOCALAPPDATA%\DeepDark_Oracle\data`（探测顺序：exe 同级 → LOCALAPPDATA → APPDATA → TEMP）。目录结构一致：
 
-> WebView2 的用户数据目录是**单独一套**（不属于上表）：优先 exe 同级 `webview-data\`，其次 `<数据目录>\webview\`，最后 `%LOCALAPPDATA%\deepaisee\webview`；会自动挑第一个可写且不在 C 盘的位置。排障时可用环境变量 `WEBVIEW2_USER_DATA_FOLDER` 强制指定。
+> WebView2 的用户数据目录是**单独一套**（不属于上表）：优先 exe 同级 `webview-data\`，其次 `<数据目录>\webview\`，最后 `%LOCALAPPDATA%\DeepDark_Oracle\webview`；会自动挑第一个可写且不在 C 盘的位置。排障时可用环境变量 `WEBVIEW2_USER_DATA_FOLDER` 强制指定。
 
 > **插件扩展目录**：安装版会在安装根目录创建 `plugins\`（随包带一份说明文件），卸载时**保留**该目录；程序里的 `config\plugins_dir()` 已经指向它，后续插件把目录或压缩包放进去即可被发现。
 
@@ -425,7 +451,7 @@ data\
 
 ```bat
 :: 无界面自检，结果写到 exe 同级 selftest.txt
-deepaisee.exe --selftest
+DeepDark_Oracle.exe --selftest
 ```
 
 全绿标准是末尾 `通过 N 项，失败 0 项`（索引过真实文件时 N 为 16，空库时 8 项通过、8 项跳过）。它依次验证：读配置 → 开库 → 加载 GGUF →
@@ -473,7 +499,7 @@ A：CLAP 是英文音效语料训练的，只能理解**具体声音**（钢琴�
 A：视频要靠 `tools\bin\ffmpeg.exe` 抽首帧。缺 ffmpeg、或 `%TEMP%` 不可写时程序会改用 `data\tmp\` 并在失败时明确提示。确认 `tools\bin\ffmpeg.exe` 在发布目录里即可。
 
 **Q：安装版装到 D:\Apps 后，索引库在哪？**
-A：程序启动时会先试 exe 同级的 `data\`，写不进去（`Program Files`、`D:\Apps` 这类目录需要管理员权限）就自动回退到 `%LOCALAPPDATA%\deepaisee\data`。启动器的「打开数据目录」按同一顺序探测，不会打开错地方。想确认实际路径：设置 → 文件索引 → 索引数据库里显示的就是真实路径。
+A：程序启动时会先试 exe 同级的 `data\`，写不进去（`Program Files`、`D:\Apps` 这类目录需要管理员权限）就自动回退到 `%LOCALAPPDATA%\DeepDark_Oracle\data`。启动器的「打开数据目录」按同一顺序探测，不会打开错地方。想确认实际路径：设置 → 文件索引 → 索引数据库里显示的就是真实路径。
 
 **Q：视频抽帧是怎么做的？会不会很占空间？**
 A：按 `index.video_frame_interval`（默认 4 秒）的间隔切成时间窗，每个窗口按「**场景切换点 → I 帧 → 窗口中心**」的优先级挑一帧（场景切换由 ffmpeg 的 `scene` 分数检测，I 帧由 `-skip_frame nokey` 探测），再用 64 位 dHash 指纹**加平均颜色**去重（结构汉明距离 ≤ `index.video_dedup_distance` 且颜色也接近的相邻帧才丢弃 —— 只比结构的话，纯色/黑屏/幻灯片白底这些低对比画面指纹几乎一样，「红底切绿底」会被误丢）。采样间隔还会按镜头切换密度自适应：几乎不换镜头的 PPT / 网课放稀到 1.5 倍省空间，动作片 / 体育加密到 0.5 倍，但任何情况下都不低于 4 秒。抽出来的帧只用于即时计算 CLIP/媒体向量，算完就删临时文件；库里只留**特征向量和压缩缩略图**，所以索引体积不会随视频时长线性膨胀。要更细的采样就调小间隔（下限 4 秒），要控制上限就调 `index.video_max_frames`。
@@ -505,7 +531,7 @@ A：系统目录需要管理员权限。扫描时无权限的目录会被跳过�
 A：`target` 目录里有残留的锁文件，且其完整性级别高于当前进程（常见于从加固过的环境里带出来的 `target`）。不用改 ACL，直接换一个构建目标目录即可：
 
 ```bat
-set CARGO_TARGET_DIR=D:\build\deepaisee
+set CARGO_TARGET_DIR=D:\build\DeepDark_Oracle
 cd src-tauri && cargo build --release --features llama,custom-protocol
 ```
 

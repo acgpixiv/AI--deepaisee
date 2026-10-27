@@ -38,6 +38,7 @@ struct Handle {
     const llama_vocab *vocab = nullptr;
     int dim = 0;      // 输出向量维度（可能是投影后的 768）
     int hidden = 0;   // 隐层维度（512），仅用于诊断
+    int n_batch = 0;  // 单次 decode 能接受的最大 token 数（= cparams.n_batch）
 };
 
 void set_err(char *err, int err_len, const char *msg) {
@@ -179,8 +180,14 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = static_cast<uint32_t>(n_ctx > 0 ? n_ctx : 2048);
-    cparams.n_batch = 512;
-    cparams.n_ubatch = 512;
+    // 新版 llama.cpp 对 encoder 模型有硬断言：
+    //   GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens")
+    // 一旦传入的文本 token 数超过 n_ubatch，进程会被直接 abort（不是返回错误码），
+    // 表现为「索引到某个长文档时窗口突然消失」。这里把 batch 拉到上下文长度上限，
+    // 并在 ds_llama_embed 里按 n_batch 截断，保证永远不会越界。
+    const uint32_t batch_cap = std::max<uint32_t>(cparams.n_ctx, 512u);
+    cparams.n_batch = batch_cap;
+    cparams.n_ubatch = batch_cap;
     // A zero thread setting means "automatic". The previous fallback of four
     // threads left tokenisation, prompt preparation and CPU-side kernels
     // underutilised on ordinary desktop CPUs. Keep an explicit user value
@@ -211,6 +218,7 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
     // EmbeddingGemma 2 的 embedding_length = 512、embedding_length_out = 768；
     // llama_get_embeddings* 返回的是投影后的 768 维向量，若按 512 拷贝就会
     // 越界写坏堆，表现为「用一会儿莫名崩溃 0xc0000409 in ucrtbase.dll」。
+    h->n_batch = static_cast<int>(cparams.n_batch);
     h->dim = llama_model_n_embd_out(model);
     if (h->dim <= 0) {
         h->dim = llama_model_n_embd(model);
@@ -284,7 +292,14 @@ int ds_llama_embed(void *handle, const char *text, int is_query, float *out,
     }
     tokens.resize(static_cast<size_t>(got));
 
-    llama_batch batch = llama_batch_get_one(tokens.data(), got);
+    // 单条 decode 的 token 数不能超过 n_batch/n_ubatch，否则新版 llama.cpp 会在
+    // encoder 断言里直接 abort。超长文本按 batch 上限截断（embedding 的常规做法：
+    // 保留开头，开头对语义贡献最大）。
+    if (h->n_batch > 0 && got > h->n_batch) {
+        tokens.resize(static_cast<size_t>(h->n_batch));
+    }
+
+    llama_batch batch = llama_batch_get_one(tokens.data(), static_cast<int32_t>(tokens.size()));
     const int32_t rc = llama_decode(h->ctx, batch);
     if (rc != 0) {
         char buf[160];

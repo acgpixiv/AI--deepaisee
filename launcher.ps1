@@ -1,4 +1,4 @@
-﻿# deepaisee 启动器
+# DeepDark_Oracle 启动器
 # 中文界面，纯 PowerShell 实现（不用 bat 承载中文，避免 cmd 代码页问题）
 # 该文件必须保存为 UTF-8 with BOM，否则 Windows PowerShell 5.1 会按 GBK 解析出错。
 
@@ -6,17 +6,17 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Exe  = Join-Path $Root 'deepaisee.exe'
+$Exe  = Join-Path $Root 'DeepDark_Oracle.exe'
 
 # 数据目录：便携版在 exe 同级 data\；安装版装到受保护目录时，程序会回退到
-# %LOCALAPPDATA%\deepaisee\data。这里按同样的顺序探测，保证「打开数据目录」
+# %LOCALAPPDATA%\DeepDark_Oracle\data。这里按同样的顺序探测，保证「打开数据目录」
 # 和「索引库统计」指向真正在用的那一份。
 function Resolve-DataDir {
     param([string]$AppRoot)
     $candidates = @(
         (Join-Path $AppRoot 'data'),
-        (Join-Path $env:LOCALAPPDATA 'deepaisee\data'),
-        (Join-Path $env:APPDATA 'deepaisee\data')
+        (Join-Path $env:LOCALAPPDATA 'DeepDark_Oracle\data'),
+        (Join-Path $env:APPDATA 'DeepDark_Oracle\data')
     )
     foreach ($c in $candidates) {
         if (Test-Path (Join-Path $c 'index.db')) { return $c }
@@ -31,7 +31,7 @@ $Version = 'dev'
 try {
     $info = (Get-Item $Exe).VersionInfo
     if ($info.ProductVersion) {
-        # exe 里是 0.0.21，界面显示 0.21；这里统一成后者
+        # exe 里是 0.0.22，界面显示 0.22；这里统一成后者
         $v = $info.ProductVersion.Trim()
         if ($v -match '^0\.(\d+\.\d+)$') { $Version = $Matches[1] } else { $Version = $v }
     }
@@ -40,11 +40,23 @@ try {
 function Write-Head {
     Clear-Host
     Write-Host ''
-    Write-Host '  ┌──────────────────────────────────────────┐' -ForegroundColor DarkCyan
-    Write-Host '  │   deepaisee · AI 磁盘智搜                 │' -ForegroundColor Cyan
-    $vText = "  │   启动器  v$Version"
-    Write-Host ($vText + (' ' * [Math]::Max(1, 44 - $vText.Length)) + '│') -ForegroundColor DarkCyan
-    Write-Host '  └──────────────────────────────────────────┘' -ForegroundColor DarkCyan
+    # 框宽按「显示宽度」算：中文/全角算 2 列，ASCII 算 1 列，避免换名后框线错位。
+    $inner = 46
+    function Get-DisplayWidth([string]$s) {
+        $w = 0
+        foreach ($ch in $s.ToCharArray()) {
+            if ([int]$ch -gt 0x2E7F) { $w += 2 } else { $w += 1 }
+        }
+        return $w
+    }
+    function Write-BoxLine([string]$text, [string]$color) {
+        $pad = [Math]::Max(0, $inner - 3 - (Get-DisplayWidth $text))
+        Write-Host ('  │   ' + $text + (' ' * $pad) + '│') -ForegroundColor $color
+    }
+    Write-Host ('  ┌' + ('─' * $inner) + '┐') -ForegroundColor DarkCyan
+    Write-BoxLine 'DeepDark_Oracle · AI 磁盘智搜' 'Cyan'
+    Write-BoxLine "启动器  v$Version" 'DarkCyan'
+    Write-Host ('  └' + ('─' * $inner) + '┘') -ForegroundColor DarkCyan
     Write-Host ''
 }
 
@@ -60,7 +72,7 @@ function Invoke-Exe {
     param([string[]]$Arguments)
 
     if (-not (Test-Path $Exe)) {
-        Write-Host "  找不到 deepaisee.exe，请确认启动器与程序在同一目录。" -ForegroundColor Red
+        Write-Host "  找不到 DeepDark_Oracle.exe，请确认启动器与程序在同一目录。" -ForegroundColor Red
         return
     }
     # 用 cmd 起一个有控制台的进程，让 windowed 程序的 --cli 输出可以附着上来
@@ -124,7 +136,7 @@ while ($true) {
     switch ($choice.Trim()) {
         '1' {
             if (-not (Test-Path $Exe)) {
-                Write-Host '  找不到 deepaisee.exe' -ForegroundColor Red
+                Write-Host '  找不到 DeepDark_Oracle.exe' -ForegroundColor Red
                 Pause-Key; continue
             }
             Write-Host ''

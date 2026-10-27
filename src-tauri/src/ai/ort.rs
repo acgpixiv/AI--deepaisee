@@ -154,7 +154,7 @@ impl Ort {
             let mut env: OrtPtr = ptr::null_mut();
             let create_env: unsafe extern "system" fn(i32, *const c_char, *mut OrtPtr) -> Status =
                 api_fn!(api, IDX_CREATE_ENV, _);
-            let name = CString::new("deepaisee").unwrap();
+            let name = CString::new("DeepDark_Oracle").unwrap();
             check(api, create_env(3, name.as_ptr(), &mut env))?;
 
             let mut mem: OrtPtr = ptr::null_mut();

@@ -65,7 +65,7 @@ fn work_dir() -> PathBuf {
     if let Ok(cwd) = std::env::current_dir() {
         cands.push(cwd.join("data").join("tmp"));
     }
-    cands.push(std::env::temp_dir().join("deepaisee"));
+    cands.push(std::env::temp_dir().join("DeepDark_Oracle"));
     for d in cands {
         if std::fs::create_dir_all(&d).is_ok() {
             return d;

@@ -5,10 +5,10 @@ fn main() {
     // 打包版没有控制台，这是让用户/我确认「装好了能用」的唯一手段。
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--selftest") {
-        std::process::exit(deepaisee_lib::selftest::run());
+        std::process::exit(deepdark_oracle_lib::selftest::run());
     }
     if args.iter().any(|a| a == "--cli") {
-        std::process::exit(deepaisee_lib::cli::run(&args));
+        std::process::exit(deepdark_oracle_lib::cli::run(&args));
     }
     // 发布版没有控制台，panic 默认直接静默退出。装个钩子写文件，
     // 否则用户只会看到「双击后窗口闪一下就没了」。
@@ -24,5 +24,5 @@ fn main() {
         let _ = std::fs::write(dir.join("data").join("panic.log"), &msg);
         let _ = std::fs::write(dir.join("panic.log"), &msg);
     }));
-    deepaisee_lib::run()
+    deepdark_oracle_lib::run()
 }

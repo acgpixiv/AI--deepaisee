@@ -1,4 +1,4 @@
-//! 命令行接口：`deepaisee.exe --cli <子命令>`
+//! 命令行接口：`DeepDark_Oracle.exe --cli <子命令>`
 //!
 //! 打包版是 windowed 程序，没有控制台。为了让它能当 CLI 用，这里在写输出之后
 //! 用 `AttachConsole(ATTACH_PARENT_PROCESS)` 挂到调用者的控制台上——这样用户在
@@ -263,9 +263,9 @@ pub fn run(argv: &[String]) -> i32 {
 }
 
 fn print_usage() {
-    println!("deepaisee {} 命令行", crate::APP_DISPLAY_VERSION);
+    println!("DeepDark_Oracle {} 命令行", crate::APP_DISPLAY_VERSION);
     println!();
-    println!("用法：deepaisee.exe --cli <子命令> [参数]");
+    println!("用法：DeepDark_Oracle.exe --cli <子命令> [参数]");
     println!();
     println!("  scan <目录>...              扫描并入库（可多个目录）");
     println!("  search <关键词>             混合检索：文件名/路径/拼音/全文/语义");
@@ -425,7 +425,7 @@ fn cmd_similar(ctx: &Ctx, args: &[String]) -> i32 {
 fn cmd_stats(ctx: &Ctx) -> i32 {
     let total = ctx.db.count().unwrap_or(0);
     let bytes = ctx.db.total_bytes().unwrap_or(0);
-    println!("deepaisee {}", crate::APP_DISPLAY_VERSION);
+    println!("DeepDark_Oracle {}", crate::APP_DISPLAY_VERSION);
     println!("数据目录：{}", ctx.data_dir.display());
     println!("文件：{total} 个，{:.2} MB", bytes as f64 / 1_048_576.0);
     println!("正文已抽取：{}", ctx.db.count_state("text", "ok").unwrap_or(0));

@@ -921,7 +921,7 @@ mod tests {
     }
 
     fn rtf_text_of(s: &str) -> String {
-        let dir = std::env::temp_dir().join("deepaisee-rtf-test.rtf");
+        let dir = std::env::temp_dir().join("deepdark-oracle-rtf-test.rtf");
         std::fs::write(&dir, s).unwrap();
         let t = rtf_text(&dir, 1000);
         let _ = std::fs::remove_file(&dir);

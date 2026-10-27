@@ -281,7 +281,7 @@ defineExpose({ run, enterSimilar });
     </div>
     <section class="hero-search">
       <div v-if="!searched" class="hero-copy">
-        <div class="brand-name">deepaisee</div>
+        <div class="brand-name">DeepDark_Oracle</div>
         <h1>{{ typedPrompt }}<span class="caret" aria-hidden="true"></span></h1>
       </div>
       <div class="query-wrap">

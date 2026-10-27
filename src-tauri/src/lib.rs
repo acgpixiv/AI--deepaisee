@@ -1,4 +1,4 @@
-//! deepaisee —— Tauri 2 + Vue 3 + llama.cpp 的本地 AI 磁盘搜索工具。
+//! DeepDark_Oracle —— Tauri 2 + Vue 3 + llama.cpp 的本地 AI 磁盘搜索工具。
 pub mod ai;
 pub mod cli;
 pub mod cmd;
@@ -21,8 +21,8 @@ pub mod vision;
 pub mod watch;
 pub mod workspace;
 
-pub const APP_VERSION: &str = "0.0.21";
-pub const APP_DISPLAY_VERSION: &str = "0.21";
+pub const APP_VERSION: &str = "0.0.22";
+pub const APP_DISPLAY_VERSION: &str = "0.22";
 
 use std::sync::Arc;
 use tauri::Manager;
@@ -38,11 +38,11 @@ pub fn run() {
         Err(e) => {
             eprintln!("初始化失败: {e}");
             // 兜底：把错误写文件，方便无控制台的发布版排查
-            let _ = std::fs::write("deepaisee-error.txt", format!("初始化失败: {e}"));
+            let _ = std::fs::write("DeepDark_Oracle-error.txt", format!("初始化失败: {e}"));
             return;
         }
     };
-    let _ = state.db.log("app", &format!("deepaisee {} 启动", APP_DISPLAY_VERSION));
+    let _ = state.db.log("app", &format!("DeepDark_Oracle {} 启动", APP_DISPLAY_VERSION));
     let _ = state.rebuild_indexer();
     let shared = Arc::new(state);
 
@@ -190,6 +190,9 @@ pub fn run() {
             cmd::rules_apply,
             cmd::activity_list,
             cmd::tree_data,
+            cmd::tree_browse,
+            cmd::tree_search,
+            cmd::workspace_add,
             cmd::watch_start,
             cmd::watch_stop,
             cmd::watch_status,
@@ -220,7 +223,7 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("deepaisee 初始化失败")
+        .expect("DeepDark_Oracle 初始化失败")
         .run(|app_handle, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 use tauri::Manager;
@@ -247,7 +250,7 @@ fn create_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
 /// 1. 环境变量 `WEBVIEW2_USER_DATA_FOLDER`（排障时手动覆盖）
 /// 2. exe 同级 `webview-data`（便携版、安装到非系统盘时都在这里）
 /// 3. 数据目录旁的 `webview`（data_dir 已回退到用户目录时）
-/// 4. `%LOCALAPPDATA%\deepaisee\webview`（最后兜底）
+/// 4. `%LOCALAPPDATA%\DeepDark_Oracle\webview`（最后兜底）
 ///
 /// 非系统盘优先：本机实测 WebView2 数据目录落在 C: 盘 AppData 下会失败，
 /// 换到其它盘立刻正常，而普通用户的机器上两种位置都能用。
@@ -267,7 +270,7 @@ fn webview_data_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     }
     candidates.push(state.data_dir.join("webview"));
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        candidates.push(std::path::PathBuf::from(local).join("deepaisee").join("webview"));
+        candidates.push(std::path::PathBuf::from(local).join("DeepDark_Oracle").join("webview"));
     }
     let on_system_drive = |p: &std::path::Path| {
         p.to_string_lossy().to_ascii_lowercase().starts_with("c:")

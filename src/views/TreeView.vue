@@ -3,6 +3,7 @@
 import { computed, onMounted, ref } from "vue";
 import { api, type TreeNode } from "../api";
 import { humanSize, kindColor, toast } from "../store";
+import { t } from "../i18n";
 import Treemap from "../components/Treemap.vue";
 
 const depth = ref(3);
@@ -71,9 +72,9 @@ onMounted(() => load());
     <div class="bar">
       <button class="ghost" :disabled="trail.length <= 1" @click="up">↑ {{ t("上一级") }}</button>
       <div class="crumb">
-        <template v-for="(t, i) in trail" :key="t.path + i">
+        <template v-for="(crumb, i) in trail" :key="crumb.path + i">
           <span class="sep" v-if="i">/</span>
-          <span class="c" :class="{ last: i === trail.length - 1 }">{{ t.name || t("全部") }}</span>
+          <span class="c" :class="{ last: i === trail.length - 1 }">{{ crumb.name || t("全部") }}</span>
         </template>
       </div>
       <span class="grow"></span>

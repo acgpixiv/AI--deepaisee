@@ -11,11 +11,11 @@ fn main() {
     for f in ["audio_model.onnx", "text_model.onnx", "vocab.json", "merges.txt"] {
         eprintln!("  {} -> {}", f, dir.join(f).exists());
     }
-    eprintln!("dll = {:?}", deepaisee_lib::ai::clip::find_dll());
+    eprintln!("dll = {:?}", deepdark_oracle_lib::ai::clip::find_dll());
     // 分步复现 load() 内部，把吞掉的错误打出来
     {
-        use deepaisee_lib::ai::ort::Ort;
-        let dll = deepaisee_lib::ai::clip::find_dll();
+        use deepdark_oracle_lib::ai::ort::Ort;
+        let dll = deepdark_oracle_lib::ai::clip::find_dll();
         match dll.map(|d| Ort::load(&d, 8)) {
             None => eprintln!("!! 找不到 onnxruntime.dll"),
             Some(Err(e)) => eprintln!("!! Ort::load 失败：{e}"),
@@ -28,9 +28,9 @@ fn main() {
                 }
             }
         }
-        eprintln!("   bpe = {}", if deepaisee_lib::ai::bpe::Bpe::load(dir).is_some() { "OK" } else { "None" });
+        eprintln!("   bpe = {}", if deepdark_oracle_lib::ai::bpe::Bpe::load(dir).is_some() { "OK" } else { "None" });
     }
-    let m = deepaisee_lib::ai::clap::ClapModel::load(dir, 8).expect("加载 CLAP 失败");
+    let m = deepdark_oracle_lib::ai::clap::ClapModel::load(dir, 8).expect("加载 CLAP 失败");
     println!("CLAP 已加载，dim={}", m.dim());
 
     // 音频目录从第 2 个参数取；不给就只跑文本侧，音频实测自动跳过。
@@ -42,8 +42,8 @@ fn main() {
     // 决定性实验：同一段音频喂两次、不同音频对比，看输出是否真的随输入变化。
     // 若不同音频的向量几乎重合（cos≈1），说明输入张量没有真正喂进去。
     {
-        let a = deepaisee_lib::media::load_audio_48k(&audio_dir.join("piano.wav"), 10.0);
-        let b = deepaisee_lib::media::load_audio_48k(&audio_dir.join("rain.wav"), 10.0);
+        let a = deepdark_oracle_lib::media::load_audio_48k(&audio_dir.join("piano.wav"), 10.0);
+        let b = deepdark_oracle_lib::media::load_audio_48k(&audio_dir.join("rain.wav"), 10.0);
         if let (Some(pa), Some(pb)) = (a, b) {
             println!("\n=== 原始张量诊断 ===");
             for (tag, pcm) in [("piano", &pa), ("rain", &pb)] {
@@ -80,7 +80,7 @@ fn main() {
     let audio_files: &[&str] = if have_audio { &files } else { &[] };
     for f in audio_files {
         let p = audio_dir.join(f);
-        if let Some(pcm) = deepaisee_lib::media::load_audio_48k(&p, 10.0) {
+        if let Some(pcm) = deepdark_oracle_lib::media::load_audio_48k(&p, 10.0) {
             let rms = (pcm.iter().map(|x| x * x).sum::<f32>() / pcm.len().max(1) as f32).sqrt();
             let peak = pcm.iter().fold(0f32, |a, b| a.max(b.abs()));
             println!("{f}: pcm={} 样本 rms={rms:.4} peak={peak:.4}", pcm.len());

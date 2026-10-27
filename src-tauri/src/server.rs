@@ -258,7 +258,7 @@ fn mime_of(ext: &str) -> &'static str {
 const MOBILE_HTML: &str = r#"<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>deepaisee</title>
+<title>DeepDark_Oracle</title>
 <style>
 :root{--bg:#0b0f16;--panel:#121826;--border:#24304a;--text:#dbe4f3;--muted:#8ea0bf;--accent:#4f8cff}
 *{box-sizing:border-box}
@@ -281,7 +281,7 @@ button{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:1
 .snip{color:#a8b6cf;font-size:12px;margin-top:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .empty{color:var(--muted);text-align:center;padding:40px 0}
 </style></head><body>
-<header><h1>deepaisee</h1><div class="sub">局域网文件搜索</div></header>
+<header><h1>DeepDark_Oracle</h1><div class="sub">局域网文件搜索</div></header>
 <div class="search"><input id="q" placeholder="搜索文件名或内容…"><button onclick="go()">搜索</button></div>
 <div class="chips" id="chips"></div>
 <div class="list" id="list"><div class="empty">输入关键词开始搜索</div></div>

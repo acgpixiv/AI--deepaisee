@@ -297,7 +297,7 @@ onMounted(load);
       <div class="settings-sidebar-head">
         <div>
           <div class="settings-title">{{ t("设置") }}</div>
-          <div class="settings-subtitle">deepaisee</div>
+          <div class="settings-subtitle">DeepDark_Oracle</div>
         </div>
       </div>
       <nav class="settings-nav" :aria-label="t('设置分类')">

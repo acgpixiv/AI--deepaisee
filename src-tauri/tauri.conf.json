@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "deepaisee",
-  "version": "0.0.21",
-  "identifier": "com.deepaisee.desktop",
+  "productName": "DeepDark_Oracle",
+  "version": "0.0.22",
+  "identifier": "com.deepdarkoracle.desktop",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "deepaisee · AI 磁盘智搜",
+        "title": "DeepDark_Oracle · AI 磁盘智搜",
         "width": 1420,
         "height": 920,
         "minWidth": 980,
@@ -60,7 +60,7 @@
           "English"
         ],
         "displayLanguageSelector": true,
-        "startMenuFolder": "deepaisee",
+        "startMenuFolder": "DeepDark_Oracle",
         "compression": "lzma"
       }
     },

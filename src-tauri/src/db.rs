@@ -995,6 +995,72 @@ impl Db {
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect()
     }
+
+    /// 目录聚合（按路径前缀裁剪）：只统计某个目录之下的目录。
+    ///
+    /// 右上角「索引目录结构」面板每展开一层就查一次。全量 GROUP BY 在
+    /// 14 万文件的库上约 140ms；带 `dir >= ? AND dir < ?` 的前缀裁剪只需
+    /// 40~50ms，且随展开层级加深会更快。
+    ///
+    /// `prefix` 传 `D:\软件\` 这种「以反斜杠结尾」的形式；传空串表示全部。
+    pub fn dir_rollup_under(&self, prefix: &str) -> rusqlite::Result<Vec<(String, i64, i64)>> {
+        let c = self.conn.lock();
+        let (lo, hi) = dir_prefix_bounds(prefix);
+        if lo.is_empty() {
+            let mut st = c.prepare(
+                "SELECT dir, COUNT(*), COALESCE(SUM(size),0) FROM files WHERE missing=0 GROUP BY dir",
+            )?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            return rows.collect();
+        }
+        // 注意：`dir = "D:\wx"` 本身排在 `"D:\wx\"` 之前（短串在前），
+        // 只写区间会漏掉「该目录自己的直属文件」，所以要把等值单独并进来。
+        let self_dir = crate::util::norm_path(prefix);
+        let mut st = c.prepare(
+            "SELECT dir, COUNT(*), COALESCE(SUM(size),0) FROM files \
+             WHERE missing=0 AND (dir = ?3 OR (dir >= ?1 AND dir < ?2)) GROUP BY dir",
+        )?;
+        let rows =
+            st.query_map(params![lo, hi, self_dir], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect()
+    }
+
+    /// 某目录的直属文件统计：(文件数, 总大小, 已抽正文数, 已建向量数)。
+    ///
+    /// 面板的叶子节点与「当前目录包含 N 个文件」都用它，避免把 14 万行
+    /// 的文件级数据整表拉进内存。
+    pub fn dir_file_stats(&self, dir: &str) -> rusqlite::Result<(i64, i64, i64, i64)> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT COUNT(*), COALESCE(SUM(size),0),
+                    COALESCE(SUM(CASE WHEN text_state='ok' THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN embed_state='ok' THEN 1 ELSE 0 END),0)
+             FROM files WHERE missing=0 AND dir = ?1",
+        )?;
+        let row = st.query_row(params![dir], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        Ok(row)
+    }
+}
+
+/// 把一个目录前缀换算成 SQLite 的字符串区间 `[lo, hi)`。
+///
+/// SQLite 的 TEXT 比较是二进制字节序：`D:\软件\` 之后的所有路径都满足
+/// `dir >= "D:\软件\" AND dir < "D:\软件]"`（`]` 是 `\` 的下一个字节）。
+/// 传空串时返回两个空串，调用方据此走全量分支。
+fn dir_prefix_bounds(prefix: &str) -> (String, String) {
+    if prefix.trim().is_empty() {
+        return (String::new(), String::new());
+    }
+    let mut lo = crate::util::norm_path(prefix);
+    if !lo.ends_with('\\') {
+        lo.push('\\');
+    }
+    let mut hi = lo.clone();
+    hi.pop();
+    hi.push(']');
+    (lo, hi)
 }
 
 fn index_root_bounds(root: &str) -> (String, String, String) {

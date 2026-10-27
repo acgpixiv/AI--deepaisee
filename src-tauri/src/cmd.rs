@@ -24,7 +24,7 @@ pub struct AppInfo {
 #[tauri::command]
 pub fn app_info(state: State<'_, Arc<AppState>>) -> AppInfo {
     AppInfo {
-        name: "deepaisee".into(),
+        name: "DeepDark_Oracle".into(),
         version: crate::APP_VERSION.into(),
         display_version: crate::APP_DISPLAY_VERSION.into(),
         provider: state.embedder.read().info().backend,
@@ -85,11 +85,11 @@ fn apply_autostart(enabled: bool, app_dir: &std::path::Path) {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-        const VALUE: &str = "deepaisee";
+        const VALUE: &str = "DeepDark_Oracle";
 
         let mut cmd = std::process::Command::new("reg.exe");
         if enabled {
-            let exe = app_dir.join("deepaisee.exe");
+            let exe = app_dir.join("DeepDark_Oracle.exe");
             if !exe.is_file() {
                 return;
             }
@@ -969,6 +969,334 @@ pub fn rules_apply(state: State<'_, Arc<AppState>>) -> usize {
 #[tauri::command]
 pub fn activity_list(state: State<'_, Arc<AppState>>, kind: Option<String>, limit: Option<usize>) -> Vec<Activity> {
     state.db.recent_activity(limit.unwrap_or(200), kind.as_deref()).unwrap_or_default()
+}
+
+
+// ---------------------------------------------------------------- 索引目录结构面板
+//
+// 右上角「143,522 个文件 · 54.5 GB」那个按钮点开就是这块数据：它不重新扫描，
+// 只从 SQLite 的 dir 聚合里按层取，所以打开是毫秒级的。
+
+/// 面板里的一个节点（目录或文件）。
+#[derive(Serialize)]
+pub struct TreeEntry {
+    pub name: String,
+    pub path: String,
+    pub is_file: bool,
+    pub ext: String,
+    pub kind: String,
+    pub size: i64,
+    pub mtime: i64,
+    /// 目录的直属文件数；文件恒为 1。
+    pub files: i64,
+    /// 目录的直属子目录数。
+    pub dirs: i64,
+    /// 目录的递归文件总数（含所有子目录）。
+    pub total_files: i64,
+    pub total_bytes: i64,
+    /// 已抽正文或已建向量的文件数（只对文件节点有意义）。
+    pub indexed: i64,
+    /// 排队中（pending / fail）的文件数。
+    pub pending: i64,
+    /// 索引根的错误信息；普通节点为空串。
+    pub error: String,
+}
+
+/// 面板展开一层后返回的数据。
+#[derive(Serialize)]
+pub struct TreeLevel {
+    pub path: String,
+    pub name: String,
+    pub entries: Vec<TreeEntry>,
+    /// 当前目录的直属文件数 / 子目录数。
+    pub files: i64,
+    pub dirs: i64,
+    pub total_files: i64,
+    pub total_bytes: i64,
+    pub indexed: i64,
+    pub pending: i64,
+    /// 直属文件超过上限、没有列出的数量。
+    pub hidden_files: i64,
+}
+
+/// 按反斜杠切段并丢掉空段：`D:\` 得到 `["D:"]`。
+fn split_path_parts(p: &str) -> Vec<&str> {
+    p.split('\\').filter(|s| !s.is_empty()).collect()
+}
+
+/// `parts` 是否以 `prefix` 开头（Windows 路径不区分大小写）。
+fn path_starts_with(parts: &[&str], prefix: &[&str]) -> bool {
+    parts.len() >= prefix.len()
+        && prefix.iter().enumerate().all(|(i, s)| parts[i].eq_ignore_ascii_case(s))
+}
+
+fn path_display_name(path: &str) -> String {
+    match split_path_parts(path).last() {
+        // 盘符根（D:\）的最后一段是 "D:"，补回反斜杠，面板上显示成 "D:\"。
+        Some(s) if s.len() == 2 && s.ends_with(':') => format!("{s}\\"),
+        Some(s) => s.to_string(),
+        None => path.to_string(),
+    }
+}
+
+fn join_child(dir: &str, name: &str) -> String {
+    if dir.ends_with('\\') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}\\{name}")
+    }
+}
+
+/// 索引根层：每个已添加的盘符 / 根目录一个节点。
+fn tree_roots(db: &crate::db::Db) -> TreeLevel {
+    let roots = db.index_roots().unwrap_or_default();
+    let mut entries: Vec<TreeEntry> = Vec::new();
+    let mut total_files = 0i64;
+    let mut total_bytes = 0i64;
+    for r in roots {
+        let rows = db.dir_rollup_under(&r.root).unwrap_or_default();
+        let prefix_parts = split_path_parts(&r.root);
+        let mut files = 0i64;
+        let mut bytes = 0i64;
+        let mut deep_files = 0i64;
+        let mut deep_bytes = 0i64;
+        // 子目录按「第一段」去重：有些目录只有子目录、自己没有直属文件，
+        // 在 GROUP BY dir 里根本不会出现，逐行数会漏掉它们。
+        let mut child_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (dir, count, size) in &rows {
+            let parts = split_path_parts(dir);
+            if !path_starts_with(&parts, &prefix_parts) {
+                continue;
+            }
+            deep_files += *count;
+            deep_bytes += *size;
+            let rel = &parts[prefix_parts.len()..];
+            if rel.is_empty() {
+                files += *count;
+                bytes += *size;
+            } else {
+                child_names.insert(rel[0].to_lowercase());
+            }
+        }
+        let dirs = child_names.len() as i64;
+        total_files += deep_files;
+        total_bytes += deep_bytes;
+        entries.push(TreeEntry {
+            name: path_display_name(&r.root),
+            path: r.root.clone(),
+            is_file: false,
+            ext: String::new(),
+            kind: String::new(),
+            size: bytes,
+            mtime: r.last_scan,
+            files,
+            dirs,
+            total_files: deep_files,
+            total_bytes: deep_bytes,
+            indexed: 0,
+            pending: 0,
+            error: r.last_error.clone(),
+        });
+    }
+    TreeLevel {
+        path: String::new(),
+        name: String::new(),
+        entries,
+        files: 0,
+        dirs: 0,
+        total_files,
+        total_bytes,
+        indexed: 0,
+        pending: 0,
+        hidden_files: 0,
+    }
+}
+
+/// 展开某个目录：直属子目录（按名字自然排序）+ 直属文件（按修改时间倒序，最多 200 条）。
+fn tree_level(db: &crate::db::Db, path: &str, file_limit: usize) -> TreeLevel {
+    let norm = crate::util::norm_path(path);
+    let prefix_parts = split_path_parts(&norm);
+    let rows = db.dir_rollup_under(&norm).unwrap_or_default();
+
+    let mut direct_files = 0i64;
+    let mut total_files = 0i64;
+    let mut total_bytes = 0i64;
+    // 子目录：key = 小写名，value = (原始名, 完整路径, 递归文件数, 递归字节, 直属文件数)
+    let mut child_map: std::collections::BTreeMap<String, (String, String, i64, i64, i64)> =
+        std::collections::BTreeMap::new();
+    for (dir, count, size) in &rows {
+        total_files += *count;
+        total_bytes += *size;
+        let parts = split_path_parts(dir);
+        if !path_starts_with(&parts, &prefix_parts) {
+            continue;
+        }
+        let rel = &parts[prefix_parts.len()..];
+        if rel.is_empty() {
+            direct_files += *count;
+            continue;
+        }
+        let name = rel[0].to_string();
+        let key = name.to_lowercase();
+        let child_path = join_child(&norm, &name);
+        let e = child_map.entry(key).or_insert((name, child_path, 0, 0, 0));
+        e.2 += *count;
+        e.3 += *size;
+        if rel.len() == 1 {
+            e.4 += *count;
+        }
+    }
+
+    let child_count = child_map.len() as i64;
+    let mut entries: Vec<TreeEntry> = Vec::with_capacity(child_map.len() + 32);
+    for (_, (name, child_path, files, bytes, direct)) in child_map {
+        entries.push(TreeEntry {
+            name,
+            path: child_path,
+            is_file: false,
+            ext: String::new(),
+            kind: String::new(),
+            size: bytes,
+            mtime: 0,
+            files: direct,
+            dirs: 0,
+            total_files: files,
+            total_bytes: bytes,
+            indexed: 0,
+            pending: 0,
+            error: String::new(),
+        });
+    }
+
+    // 直属文件：一次查询，按修改时间倒序，超出上限的部分用 hidden_files 提示。
+    let file_rows = db.query_rows(
+        "SELECT id,path,dir,name,ext,kind,size,mtime,ctime,text_len,text_state,embed_state,thumb_key,category,tags \
+         FROM files WHERE missing=0 AND dir = ?1 ORDER BY mtime DESC LIMIT ?2",
+        vec![
+            rusqlite::types::Value::Text(norm.clone()),
+            rusqlite::types::Value::Integer(file_limit as i64),
+        ],
+    );
+    // 索引进度按「整个目录」算（含未列出的文件），否则只统计前 200 条会偏低。
+    let (_, _, dir_text_ok, dir_embed_ok) = db.dir_file_stats(&norm).unwrap_or((0, 0, 0, 0));
+    let indexed = dir_text_ok.max(dir_embed_ok);
+    let pending = (direct_files - indexed).max(0);
+    for f in &file_rows {
+        let done = f.text_state == "ok" || f.embed_state == "ok";
+        let waiting = f.text_state == "pending" || f.text_state == "fail";
+        entries.push(TreeEntry {
+            name: f.name.clone(),
+            path: f.path.clone(),
+            is_file: true,
+            ext: f.ext.clone(),
+            kind: f.kind.clone(),
+            size: f.size,
+            mtime: f.mtime,
+            files: 1,
+            dirs: 0,
+            total_files: 1,
+            total_bytes: f.size,
+            indexed: if done { 1 } else { 0 },
+            pending: if waiting { 1 } else { 0 },
+            error: String::new(),
+        });
+    }
+
+    TreeLevel {
+        path: norm.clone(),
+        name: path_display_name(&norm),
+        entries,
+        files: direct_files,
+        dirs: child_count,
+        total_files,
+        total_bytes,
+        indexed,
+        pending,
+        hidden_files: (direct_files - file_rows.len() as i64).max(0),
+    }
+}
+
+/// 右上角面板的数据入口：不传 path 就是索引根层，传了就是那一层。
+#[tauri::command]
+pub fn tree_browse(
+    state: State<'_, Arc<AppState>>,
+    path: Option<String>,
+    file_limit: Option<usize>,
+) -> Result<TreeLevel, String> {
+    let limit = file_limit.unwrap_or(200).clamp(1, 2000);
+    match path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()) {
+        Some(p) => Ok(tree_level(&state.db, &p, limit)),
+        None => Ok(tree_roots(&state.db)),
+    }
+}
+
+/// 面板内嵌搜索框：按目录名匹配，返回命中的目录（文件多的排前面）。
+#[tauri::command]
+pub fn tree_search(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    limit: Option<usize>,
+) -> Vec<TreeEntry> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let cap = limit.unwrap_or(200).clamp(1, 500);
+    let rows = match state.db.dir_rollup() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut hits: Vec<TreeEntry> = Vec::new();
+    for (dir, count, size) in rows {
+        let name = path_display_name(&dir);
+        if !name.to_lowercase().contains(&q) {
+            continue;
+        }
+        hits.push(TreeEntry {
+            name,
+            path: dir,
+            is_file: false,
+            ext: String::new(),
+            kind: String::new(),
+            size,
+            mtime: 0,
+            files: count,
+            dirs: 0,
+            total_files: count,
+            total_bytes: size,
+            indexed: 0,
+            pending: 0,
+            error: String::new(),
+        });
+    }
+    hits.sort_by(|a, b| b.total_files.cmp(&a.total_files).then(a.path.cmp(&b.path)));
+    hits.truncate(cap);
+    hits
+}
+
+/// 把某个目录加进「工作区实时检索」的目录列表（右键菜单用）。
+#[tauri::command]
+pub fn workspace_add(
+    state: State<'_, Arc<AppState>>,
+    dir: String,
+) -> Result<Vec<String>, String> {
+    let norm = crate::util::norm_path(&dir);
+    if norm.trim().is_empty() {
+        return Err("目录不能为空".into());
+    }
+    if !Path::new(&norm).is_dir() {
+        return Err(format!("目录不存在或不可访问：{norm}"));
+    }
+    let mut cfg = state.cfg.read().clone();
+    if !cfg.workspace.dirs.iter().any(|d| d.eq_ignore_ascii_case(&norm)) {
+        cfg.workspace.dirs.push(norm.clone());
+    }
+    let path = crate::config::config_path(Some(&state.app_dir));
+    cfg.save(&path).map_err(|e| format!("保存配置失败：{e}"))?;
+    let dirs = cfg.workspace.dirs.clone();
+    *state.cfg.write() = cfg;
+    let _ = state.db.log("workspace", &format!("加入工作区：{norm}"));
+    Ok(dirs)
 }
 
 // ---------------------------------------------------------------- 树状图

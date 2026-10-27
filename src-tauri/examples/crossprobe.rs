@@ -7,7 +7,7 @@
 // 「文字找图/找声」到底有没有区分度，而不是凭主观感觉。
 use std::path::Path;
 
-use deepaisee_lib::ai::{clap::ClapModel, clip::ClipModel};
+use deepdark_oracle_lib::ai::{clap::ClapModel, clip::ClipModel};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

@@ -1,7 +1,49 @@
-# deepaisee 版本说明（CHANGELOG）
+# DeepDark_Oracle 版本说明（CHANGELOG）
 
 版本号规则：对外显示 `0.01` 起、每次改动 +0.01；内部语义化版本同步为 `0.0.N`。
-本项目由 DiskSeek（Python + PySide6）重构而来，见文末「从 DiskSeek 到 deepaisee」。
+本项目由 DiskSeek（Python + PySide6）重构而来，见文末「从 DiskSeek 到 DeepDark_Oracle」。
+
+---
+
+## v0.22 — 2026-10-27
+
+**项目更名 DeepDark_Oracle + 右上角「索引目录结构」树状图面板**
+
+### 一、项目更名
+
+- 全局把 `deepaisee` 改成 `DeepDark_Oracle`：Tauri 的 `productName` / `identifier`（`com.deepdarkoracle.desktop`）/ 窗口标题、Cargo 包名与 `[lib] name`（`deepdark_oracle_lib`，`main.rs` 的 `deepdark_oracle_lib::run()` 同步）、`package.json` 的 `name`、启动器 `DeepDark_Oracle 启动器.cmd`、`launcher.ps1` 横幅、NSIS 安装目录与开始菜单目录、日志与错误文件名、CMake 工程名与 CMake 缓存目录（`.deepdark-oracle-cmake`）。
+- **刻意保留**：`src/theme.ts` 的 `localStorage` 键 `deepaisee.lang` / `deepaisee.theme`（改了会丢用户已保存的语言与主题偏好）；`CHANGELOG.md` 里的历史条目、`HANDOFF-2026-10-27.md` 等历史文档保持原文。
+
+### 二、右上角「索引目录结构」树状图面板
+
+顶栏原本只显示「143,522 个文件 · 54.5 GB」的统计按钮，现在点开就是一棵可展开的索引目录树。
+
+- **三段式面板**：顶部栏（标题 + 刷新 + 在资源管理器中打开 + 极小搜索框）/ 主体树区 / 底部统计栏（「当前目录包含 12 个子文件夹，340 个文件 · 22.7 GB」）。宽 400px、从按钮下方垂直弹出、最大高度 80vh。
+- **只读索引库，不重新扫描**：打开面板不触发任何磁盘遍历，全部数据来自 SQLite。
+- **按层懒加载**：每展开一层才查一次该层，已加载的层级缓存在前端，收起面板不销毁，再打开直接复用。
+- **搜索**：面板内搜索框按目录名匹配，命中项高亮（`#E6F7FF` 背景 + 加粗），点结果自动逐级展开祖先目录并滚动定位。
+- **右键菜单**：打开文件位置 / 复制完整路径 / 复制文件名 / 加入工作区。
+- **视觉规范**：白底 `#FFFFFF`、主文字 `#333333`、次要 `#999999`、边框 `#CCCCCC`、选中 `#F5F5F5`、行高 28px、16px 单色线性图标、按后缀分类型图标、文件行右侧小圆点表示索引状态（绿=已索引 / 灰=未索引）、悬停 Tooltip 显示完整绝对路径；暗色主题有对应的一套变量。
+- **点击面板外部或按 Esc 收起**。
+
+### 三、后端新增命令
+
+- `tree_browse(path?, file_limit?)`：不传 `path` 返回索引根层（每个已添加的盘符/根目录），传了返回该层的直属子目录 + 直属文件（按修改时间倒序，默认最多 200 条，超出用「另有 N 个文件未显示」提示）。
+- `tree_search(query, limit?)`：按目录名模糊匹配，按递归文件数倒序返回。
+- `workspace_add(dir)`：把目录加进「工作区实时检索」，供右键菜单调用。
+- `db.rs` 新增 `dir_rollup_under(prefix)` 与 `dir_file_stats(dir)`：用 `dir >= lo AND dir < hi` 的字符串区间做前缀裁剪，**14 万文件的库上全量聚合约 140ms，带前缀裁剪只要 40~50ms**，且展开越深越快。区间查询单独 OR 了 `dir = 该目录` 的等值条件——只写区间会漏掉「目录自己的直属文件」（`D:\wx` 在字节序上排在 `D:\wx\` 之前）。
+
+### 四、顺手修掉的既有问题
+
+- `src/views/TreeView.vue` 用了 `t()` 却没 import i18n；且模板里 `v-for="(t, i) in trail"` 会把 i18n 的 `t` 遮蔽成 TreeNode，切到树状图页会直接崩。已改为 `(crumb, i)` 并补上 import。
+- `i18n.ts` 里「清空」「打开失败：」两处词条重复，esbuild 构建报 Duplicate key，已合并。
+- `src-tauri/src/bin/` 下的 5 个开发探针与 `src-tauri/examples/` 完全重复，会被 tauri-bundler 当成 external binary 打进安装包；已移出到仓库根的备份目录，只保留 `examples/`。
+
+### 五、本轮编译 / 打包踩到并修掉的问题
+
+- **`windres` 打不开含中文路径的 `.ico`**：Windows GNU 工具链下 `tauri-build` 生成的 `resource.rc` 里写的是绝对路径，项目放在 `D:\软件\DeepDark_Oracle` 时 `windres` 报 `can't open icon file ...: Invalid argument`，构建直接 panic。`build.rs` 新增 `ascii_window_icon()`：图标绝对路径含非 ASCII 字符时先复制到 `OUT_DIR`（纯 ASCII）再交给 `tauri-build`；ASCII 路径下行为不变，MSVC 构建也不受影响。
+- **新版 llama.cpp 的 encoder 断言会让长文本嵌入直接 abort**：`GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens")`。原来 shim 把 `n_batch`/`n_ubatch` 写死 512，索引到长文档时 token 数超过 512 就被**直接 abort（不是返回错误码）**，表现为「窗口突然消失、没有任何日志」。现在 `n_batch`/`n_ubatch` 跟随上下文长度，并在 `ds_llama_embed` 里按 `n_batch` 截断 token，超长文本不会再打崩进程。
+- **构建环境要求（记录备查）**：本机无 MSVC，改用 `x86_64-pc-windows-gnu` + MSYS2 UCRT64（`D:\dsh-tools\msys64`）。GNU 工具链不认中文路径，`CARGO_HOME` / `RUSTUP_HOME` / `CARGO_TARGET_DIR` / `TMP` 必须全在纯 ASCII 目录，项目本身通过 `subst X:` 映射后构建。
 
 ---
 

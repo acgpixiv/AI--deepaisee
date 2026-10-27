@@ -1,6 +1,6 @@
 //! 无界面自检：验证打包版「装好了就能用」。
 //!
-//! 用法：`deepaisee.exe --selftest`
+//! 用法：`DeepDark_Oracle.exe --selftest`
 //! 结果同时写到 exe 同级 `selftest.txt`（打包版没有控制台，这是唯一可读的出口）。
 
 use std::path::PathBuf;
@@ -55,7 +55,7 @@ pub fn run() -> i32 {
     let data = data_dir(Some(&app_dir));
     let mut r = Report::new();
     r.lines.push(format!(
-        "deepaisee {} ({})",
+        "DeepDark_Oracle {} ({})",
         crate::APP_DISPLAY_VERSION,
         crate::APP_VERSION
     ));

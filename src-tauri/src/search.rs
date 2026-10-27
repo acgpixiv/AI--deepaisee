@@ -164,7 +164,7 @@ pub fn apply_enabled_root_scope(
     roots.sort_by_key(|root| root.to_ascii_lowercase());
     roots.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     q.roots = if roots.is_empty() {
-        vec!["__deepaisee_no_enabled_index_root__".into()]
+        vec!["__deepdark_oracle_no_enabled_index_root__".into()]
     } else {
         roots
     };
@@ -871,7 +871,7 @@ mod root_scope_tests {
         );
         assert_eq!(
             query_roots(&["D:\\Docs"], &["D:\\Docs", "D:\\Media"], &["D:\\Docs"]),
-            vec!["__deepaisee_no_enabled_index_root__"]
+            vec!["__deepdark_oracle_no_enabled_index_root__"]
         );
     }
 

@@ -1,4 +1,4 @@
-; deepaisee NSIS installer hooks
+; DeepDark_Oracle NSIS installer hooks
 ; ---------------------------------------------------------------------------
 ; Notes (ASCII only on purpose - NSIS parses .nsh by the ANSI codepage):
 ;  1) bundle.resources uses the map form, so the runtime dependencies land
@@ -31,14 +31,14 @@
   ; Reserved plugin / extension directory + a short readme for discoverability.
   CreateDirectory "$INSTDIR\plugins"
   FileOpen $0 "$INSTDIR\plugins\README.txt" w
-  FileWrite $0 "deepaisee plugins directory$\r$\n"
+  FileWrite $0 "DeepDark_Oracle plugins directory$\r$\n"
   FileWrite $0 "Drop a plugin folder or archive here. Uninstall keeps this directory.$\r$\n"
   FileClose $0
 
   ; Remember the layout so launchers / diagnostics can detect an installed copy.
-  WriteRegStr SHCTX "Software\deepaisee" "InstallDir" "$INSTDIR"
-  WriteRegStr SHCTX "Software\deepaisee" "PluginsDir" "$INSTDIR\plugins"
-  WriteRegStr SHCTX "Software\deepaisee" "Layout" "nsis"
+  WriteRegStr SHCTX "Software\DeepDark_Oracle" "InstallDir" "$INSTDIR"
+  WriteRegStr SHCTX "Software\DeepDark_Oracle" "PluginsDir" "$INSTDIR\plugins"
+  WriteRegStr SHCTX "Software\DeepDark_Oracle" "Layout" "nsis"
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
@@ -51,9 +51,9 @@
   Delete "$INSTDIR\nvrtc-builtins64_*.dll"
   Delete "$INSTDIR\nvJitLink_*.dll"
   Delete "$INSTDIR\vcomp140.dll"
-  DeleteRegValue SHCTX "Software\deepaisee" "InstallDir"
-  DeleteRegValue SHCTX "Software\deepaisee" "PluginsDir"
-  DeleteRegValue SHCTX "Software\deepaisee" "Layout"
+  DeleteRegValue SHCTX "Software\DeepDark_Oracle" "InstallDir"
+  DeleteRegValue SHCTX "Software\DeepDark_Oracle" "PluginsDir"
+  DeleteRegValue SHCTX "Software\DeepDark_Oracle" "Layout"
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL

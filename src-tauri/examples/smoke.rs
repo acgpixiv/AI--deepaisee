@@ -1,5 +1,5 @@
 //! 端到端冒烟：扫描 → 索引 → 全文/拼音/语义/相似检索。
-//! 不依赖 GUI，用来验证 deepaisee 后端整条链路。
+//! 不依赖 GUI，用来验证 DeepDark_Oracle 后端整条链路。
 //!
 //! 用法：
 //!   cargo run --features llama --bin smoke -- "C:\path\to\dir"
@@ -8,14 +8,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use deepaisee_lib::ai::build_embedder;
-use deepaisee_lib::config::{data_dir, AppConfig};
-use deepaisee_lib::db::Db;
-use deepaisee_lib::index::Indexer;
-use deepaisee_lib::config::ScanConfig;
-use deepaisee_lib::scan::Scanner;
-use deepaisee_lib::search::{similar, SearchEngine, SearchQuery};
-use deepaisee_lib::vector::VectorStore;
+use deepdark_oracle_lib::ai::build_embedder;
+use deepdark_oracle_lib::config::{data_dir, AppConfig};
+use deepdark_oracle_lib::db::Db;
+use deepdark_oracle_lib::index::Indexer;
+use deepdark_oracle_lib::config::ScanConfig;
+use deepdark_oracle_lib::scan::Scanner;
+use deepdark_oracle_lib::search::{similar, SearchEngine, SearchQuery};
+use deepdark_oracle_lib::vector::VectorStore;
 
 fn ok(name: &str, detail: String) -> bool {
     println!("[OK]   {name} — {detail}");
@@ -31,7 +31,7 @@ fn main() {
     // 不给目录时用临时目录下随机子目录，避免依赖任何本机路径。
     let root = std::env::args().nth(1).unwrap_or_else(|| {
         std::env::temp_dir()
-            .join(format!("deepaisee-smoke-{}", std::process::id()))
+            .join(format!("deepdark-oracle-smoke-{}", std::process::id()))
             .to_string_lossy()
             .to_string()
     });
@@ -40,7 +40,7 @@ fn main() {
     let _ = std::fs::remove_dir_all(&data);
     std::fs::create_dir_all(&data).unwrap();
 
-    let mut cfg = AppConfig::load(&deepaisee_lib::config::config_path(Some(&app_dir)));
+    let mut cfg = AppConfig::load(&deepdark_oracle_lib::config::config_path(Some(&app_dir)));
     // 冒烟用独立目录，别污染正式库
     let db = Arc::new(Db::open(&data.join("index.db")).unwrap());
     db.migrate().unwrap();
@@ -91,9 +91,9 @@ fn main() {
     // 但空库仍要建出来，否则 SearchEngine 拿不到引用。
     let clip_space = Arc::new(VectorStore::open(&data.join("vectors_clip"), 512).unwrap());
     let audio_space = Arc::new(VectorStore::open(&data.join("vectors_audio"), 512).unwrap());
-    let media_emb: Arc<dyn deepaisee_lib::ai::Embedder> =
-        Arc::new(deepaisee_lib::ai::hash::HashEmbedder::new());
-    let emb: Arc<dyn deepaisee_lib::ai::Embedder> = Arc::from(emb);
+    let media_emb: Arc<dyn deepdark_oracle_lib::ai::Embedder> =
+        Arc::new(deepdark_oracle_lib::ai::hash::HashEmbedder::new());
+    let emb: Arc<dyn deepdark_oracle_lib::ai::Embedder> = Arc::from(emb);
 
     // ---------- 3. 索引（文本 + 缩略图 + 向量）
     let t = Instant::now();

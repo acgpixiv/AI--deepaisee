@@ -3,7 +3,7 @@
 // 用法：melprobe <模型根目录> <音频文件>
 use std::path::Path;
 
-use deepaisee_lib::ai::{clap::ClapModel, clip::ClipModel};
+use deepdark_oracle_lib::ai::{clap::ClapModel, clip::ClipModel};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -15,7 +15,7 @@ fn main() {
     let audio = Path::new(&args[2]);
 
     let clap = ClapModel::load(&root.join("clap"), 8).expect("CLAP 未加载");
-    let pcm = deepaisee_lib::media::load_audio_48k(audio, 10.0).expect("读不出音频");
+    let pcm = deepdark_oracle_lib::media::load_audio_48k(audio, 10.0).expect("读不出音频");
     println!("pcm_len={}", pcm.len());
     let mel = clap.debug_mel(&pcm);
     println!("mel_len={}", mel.len());
@@ -47,7 +47,7 @@ fn main() {
     }
     println!("--- tokens ---");
     for p in prompts {
-        let ids = deepaisee_lib::ai::bpe::debug_tokens(p, 12);
+        let ids = deepdark_oracle_lib::ai::bpe::debug_tokens(p, 12);
         println!("{p} => {ids:?}");
     }
 

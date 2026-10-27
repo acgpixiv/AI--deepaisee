@@ -1,9 +1,9 @@
 {
-  "name": "deepaisee",
+  "name": "deepdark-oracle",
   "private": true,
-  "version": "0.0.21",
+  "version": "0.0.22",
   "type": "module",
-  "description": "deepaisee — AI 磁盘智能检索（Tauri 2 + Vue 3 + llama.cpp）",
+  "description": "DeepDark_Oracle — AI 磁盘智能检索（Tauri 2 + Vue 3 + llama.cpp）",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

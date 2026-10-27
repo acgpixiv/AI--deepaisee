@@ -189,6 +189,44 @@ export interface TreeNode {
   children: TreeNode[];
 }
 
+/** 右上角「索引目录结构」面板的一个节点（目录或文件）。 */
+export interface TreeEntry {
+  name: string;
+  path: string;
+  is_file: boolean;
+  ext: string;
+  kind: string;
+  size: number;
+  mtime: number;
+  /** 直属文件数（目录）；文件为 1 */
+  files: number;
+  /** 直属子目录数（目录） */
+  dirs: number;
+  /** 递归文件数（目录） */
+  total_files: number;
+  /** 递归字节数（目录） */
+  total_bytes: number;
+  /** 已索引条目数（目录按整目录算） */
+  indexed: number;
+  /** 待索引条目数（目录按整目录算） */
+  pending: number;
+  error: string;
+}
+
+/** 面板里「某一层」的展开结果。 */
+export interface TreeLevel {
+  path: string;
+  name: string;
+  entries: TreeEntry[];
+  files: number;
+  dirs: number;
+  total_files: number;
+  total_bytes: number;
+  indexed: number;
+  pending: number;
+  hidden_files: number;
+}
+
 export interface WatchStatus {
   running: boolean;
   roots: number;
@@ -319,6 +357,13 @@ export const api = {
 
   treeData: (root?: string, depth = 3) =>
     invoke<TreeNode>("tree_data", { root, depth }),
+
+  /** 索引目录结构面板：不传 path 取索引根层，传 path 展开该目录。 */
+  treeBrowse: (path?: string, fileLimit = 200) =>
+    invoke<TreeLevel>("tree_browse", { path, fileLimit }),
+  treeSearch: (query: string, limit = 200) =>
+    invoke<TreeEntry[]>("tree_search", { query, limit }),
+  workspaceAdd: (dir: string) => invoke<string[]>("workspace_add", { dir }),
 
   watchStart: () => invoke<number>("watch_start"),
   watchStop: () => invoke<void>("watch_stop"),

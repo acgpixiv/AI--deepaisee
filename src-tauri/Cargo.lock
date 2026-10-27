@@ -3,6 +3,38 @@
 version = 3
 
 [[package]]
+name = "DeepDark_Oracle"
+version = "0.0.22"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "cmake",
+ "dirs 5.0.1",
+ "embeddinggemma-2",
+ "encoding_rs",
+ "image",
+ "libc",
+ "lopdf",
+ "notify",
+ "open",
+ "parking_lot",
+ "pdf-extract",
+ "pinyin",
+ "rayon",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "strsim",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tokio",
+ "walkdir",
+ "zip 2.6.1",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -876,38 +908,6 @@ dependencies = [
  "libc",
  "libdbus-sys",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "deepaisee"
-version = "0.0.21"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "chrono",
- "cmake",
- "dirs 5.0.1",
- "embeddinggemma-2",
- "encoding_rs",
- "image",
- "libc",
- "lopdf",
- "notify",
- "open",
- "parking_lot",
- "pdf-extract",
- "pinyin",
- "rayon",
- "rusqlite",
- "serde",
- "serde_json",
- "strsim",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tokio",
- "walkdir",
- "zip 2.6.1",
 ]
 
 [[package]]

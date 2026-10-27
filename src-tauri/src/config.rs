@@ -316,7 +316,7 @@ impl AppConfig {
 
 /// 数据目录解析：优先 exe 同级 data/（便携模式）；如果该位置不可写
 /// （典型场景：NSIS 安装到 Program Files），回退到用户可写目录
-/// %LOCALAPPDATA%\deepaisee\data，保证索引库/配置/模型缓存总能落盘。
+/// %LOCALAPPDATA%\DeepDark_Oracle\data，保证索引库/配置/模型缓存总能落盘。
 static DATA_DIR_CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 pub fn data_dir(app_dir: Option<&Path>) -> PathBuf {
@@ -341,9 +341,9 @@ fn resolve_data_dir(app_dir: Option<&Path>) -> PathBuf {
         }
     }
     let fallback = std::env::var_os("LOCALAPPDATA")
-        .map(|p| PathBuf::from(p).join("deepaisee").join("data"))
-        .or_else(|| std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("deepaisee").join("data")))
-        .unwrap_or_else(|| std::env::temp_dir().join("deepaisee").join("data"));
+        .map(|p| PathBuf::from(p).join("DeepDark_Oracle").join("data"))
+        .or_else(|| std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("DeepDark_Oracle").join("data")))
+        .unwrap_or_else(|| std::env::temp_dir().join("DeepDark_Oracle").join("data"));
     let _ = std::fs::create_dir_all(&fallback);
     fallback
 }
