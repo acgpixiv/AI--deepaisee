@@ -1,8 +1,10 @@
-# deepaisee 交接说明
+# DeepDark_Oracle 交接说明
 
 ## 交接范围
 
-这是昨晚到今天对 `AI--deepaisee` 的集中改造结果。项目仍是 Tauri 2 + Rust 后端 + Vue 3/Vite 前端的本地离线磁盘检索工具。当前工作区有大量未提交改动，接手前不要使用 `git reset --hard` 或批量覆盖文件。
+这是昨晚到今天对 `AI--deepaisee` 的集中改造结果。项目仍是 Tauri 2 + Rust 后端 + Vue 3/Vite 前端的本地离线磁盘检索工具。接手前不要使用 `git reset --hard`、`git clean -fd` 或批量覆盖文件。
+
+> **v0.22 更新（2026-10-27）**：项目已从 `deepaisee` 改名为 **DeepDark_Oracle**，远程仓库地址仍是 `AI--deepaisee`。本文档以下章节描述的是 v0.21 及更早的架构与取舍，仍然有效；v0.22 的增量见文末「v0.22 增量」一节。v0.22 的改动已经提交并推送，工作区是干净的。
 
 ## 总体架构变化
 
@@ -92,7 +94,7 @@
 开发构建：
 
 ```powershell
-cd E:\项目\AI--deepaisee
+cd <项目根目录>
 npm run build
 cargo check --manifest-path src-tauri/Cargo.toml --all-targets
 ```
@@ -132,11 +134,54 @@ npm run tauri build -- --features llama,candle,custom-protocol
 - PDF 卡片和浮窗使用系统 WebView PDF viewer，详细查看仍应双击打开系统默认程序。
 - 现有部分源码历史上存在中文编码显示异常，接手时不要做全项目编码重写，避免引入大范围无关 diff。
 - 模型和向量空间切换后需要按日志提示重新建立对应向量；不要直接混用不同维度的向量文件。
-- 当前工作区不是干净 Git 状态，所有改动尚未形成正式提交。
-- `deepaisee.exe` 在工作区状态中出现过二进制删除/大小变为 0 的记录，交接人提交前应单独确认这是否为预期，不能盲目提交。
+- ~~当前工作区不是干净 Git 状态~~：v0.22 已提交并推送，工作区干净。
+- 仓库根的可执行文件已改名为 `DeepDark_Oracle.exe`（v0.22 便携版）。
 
 ## 安全注意事项
 
 - 不要使用 `git reset --hard`、`git clean -fd` 或批量永久删除命令。
 - 删除索引数据、模型或缓存前，优先移动到回收站或由用户明确确认。
 - 不要把模型、索引数据库、CUDA Toolkit 和开发工具一起提交到 Git。
+
+
+---
+
+## v0.22 增量（2026-10-27）
+
+### 改名
+
+全局把 `deepaisee` 改成 `DeepDark_Oracle`：productName / identifier（`com.deepdarkoracle.desktop`）/ 窗口标题 / Cargo 包名与 lib 名（`deepdark_oracle_lib`）/ 启动器文件名 / 安装器与 NSIS 钩子 / 数据目录回退路径（`%LOCALAPPDATA%\DeepDark_Oracle`）/ 日志与 panic 文件名。
+
+**有意保留旧名的地方**：`src/theme.ts` 里的 localStorage key `deepaisee.lang` / `deepaisee.theme`（改了会丢用户已保存的语言和主题偏好）；`DEEPAISEE_*` 系列构建期环境变量名（内部变量，不影响用户可见名称）；CHANGELOG 与历史文档里的旧名。
+
+### 右上角「索引目录结构」面板
+
+顶栏原来只读的索引统计按钮（`N 个文件 · X GB`）改成下拉触发器，点开从按钮正下方弹出 400px 面板，**不触发任何磁盘扫描**，只读索引库。
+
+- 新组件 `src/components/IndexTreePanel.vue`：三段式（标题栏 + 搜索框 / 树主体 / 统计底栏），**按层懒加载**，展开哪层才查哪层，已加载层缓存在前端，收起不销毁。
+- 视觉：白底 `#FFFFFF`、主文字 `#333333`、次要 `#999999`、边框 `#CCCCCC`、选中 `#F5F5F5`、搜索命中 `#E6F7FF`；行高 28px；暗色主题有独立变量。
+- 交互：目录搜索（匹配目录名，命中自动逐级展开祖先并滚动定位）、右键菜单（打开文件位置 / 复制完整路径 / 复制文件名 / 加入工作区）、文件行右侧 6px 状态点（绿=已索引、灰=未索引、红=索引出错）、`Esc` 或点面板外收起、底栏「完整视图 →」跳到原来的 squarify 树状图页。
+
+### 后端新增命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `tree_browse(path, file_limit)` | 返回某一层的目录与直属文件（`path` 为空时返回索引根列表） |
+| `tree_search(query, limit)` | 按目录名在 `dir` 聚合结果里搜索 |
+| `workspace_add(dir)` | 把一个目录加入工作区配置 |
+
+数据层没有全量扫表：`db.rs` 新增 `dir_rollup_under(prefix)` 用 `dir >= lo AND dir < hi` 做字符串区间裁剪，并单独 OR 上「目录自身」的等值条件（否则会漏掉该目录的直属文件，因为 `D:\wx` 在排序上排在 `D:\wx\` 之前）。实测 24 万文件的库上全量聚合 140ms、单层展开 40~50ms。
+
+### 顺手修掉的既有问题
+
+1. **llama.cpp encoder ubatch 断言导致进程静默退出**：`native/llama_shim.cpp` 把 `cparams.n_batch/n_ubatch` 写死成 512，新版 llama.cpp 对 encoder 模型加了 `GGML_ASSERT(cparams.n_ubatch >= n_tokens)`，索引长文档时直接 abort（没有 panic 日志、没有报错弹窗，窗口直接消失）。改成按 `n_ctx` 取 `batch_cap`，并在 embed 时把超长 token 序列截到 `n_batch`。
+2. **中文路径下 windres 打不开 `icon.ico`**：`tauri-build` 会把图标的绝对路径写进 `resource.rc`，MinGW `windres` 不能处理非 ASCII 路径 → 构建 panic。`build.rs` 里改成先把 `icon.ico` 复制到 ASCII 的 `OUT_DIR` 再用。
+3. **`TreeView.vue` 的两个 bug**：缺 `import { t } from "../i18n"`；模板 `v-for="(t, i) in trail"` 遮蔽了 i18n 的 `t`，导致 `t("全部")` 把 TreeNode 当函数调用直接崩。
+4. **`src-tauri/src/bin/` 下 5 个开发探针**：和 `examples/` 里的同名文件重复，但 `tauri-bundler` 会把 `src/bin/*.rs` 全部当 external binary 打进安装包。已删除 `src/bin/`，只保留 `examples/`。
+
+### 构建与安装包
+
+- 产物：`DeepDark_Oracle_0.0.22_x64-setup.exe`，682 MB（NSIS，含模型、ffmpeg、ONNX Runtime、5 个 DLL）。
+- 本机无 MSVC，改用 GNU 工具链（`x86_64-pc-windows-gnu` + MSYS2 UCRT64 的 gcc 16.2 / cmake 4.4 / ninja 1.13）跑通。两条硬约束写在 README「验证记录」里：`CARGO_HOME`/`RUSTUP_HOME`/`CARGO_TARGET_DIR`/`TMP` 必须纯 ASCII；`PATH` 要有 `<msys64>\ucrt64\bin`。
+- 构建命令：`cargo build --release --no-default-features --features llama,candle,custom-protocol`。
+- 已验证：安装包静默安装（默认装到 `D:\Apps\DeepDark_Oracle`）→ 启动 → 面板可用 → 卸载清注册表；包内 exe `--selftest` 通过 8 项、失败 0、跳过 8；实跑 24 万文件索引库，面板逐层展开与统计数字正确。
