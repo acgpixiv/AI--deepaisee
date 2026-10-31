@@ -21,8 +21,8 @@ pub mod vision;
 pub mod watch;
 pub mod workspace;
 
-pub const APP_VERSION: &str = "0.0.22";
-pub const APP_DISPLAY_VERSION: &str = "0.22";
+pub const APP_VERSION: &str = "0.0.23";
+pub const APP_DISPLAY_VERSION: &str = "0.23";
 
 use std::sync::Arc;
 use tauri::Manager;
@@ -46,7 +46,8 @@ pub fn run() {
     let _ = state.rebuild_indexer();
     let shared = Arc::new(state);
 
-    // 后台自动加载嵌入模型（llama.cpp 加载 GGUF 约 0.5~2 秒，不阻塞窗口出现）
+    // Model loading is explicit: opening the app must not initialize a model.
+    #[cfg(any())]
     {
         let st = Arc::clone(&shared);
         std::thread::spawn(move || {
@@ -82,14 +83,9 @@ pub fn run() {
             }
             if cfg.model.auto_load && !cfg.model.embed_model.trim().is_empty() {
                 std::thread::sleep(std::time::Duration::from_millis(600));
-                match crate::ai::build_embedder_with_batch(&cfg.model, cfg.index.batch_size) {
+                match crate::ai::build_embedder_with_index(&cfg.model, &cfg.index, cfg.index.batch_size) {
                     Ok(emb) => {
                         let emb: Arc<dyn crate::ai::Embedder> = Arc::from(emb);
-                        let emb = crate::ai::maybe_replicate(
-                            emb,
-                            &cfg.model,
-                            cfg.index.batch_size,
-                        );
                         let dim = emb.dim();
                         let info = emb.info();
                         let shared_media = info.backend == "candle"
@@ -181,9 +177,11 @@ pub fn run() {
             cmd::model_import,
             cmd::model_import_folder,
             cmd::open_path,
+            cmd::open_indexed_path,
             cmd::reveal_path,
             cmd::rename_path,
             cmd::ensure_preview,
+            cmd::save_pdf_thumbnail,
             cmd::op_export,
             cmd::rules_list,
             cmd::rules_save,
@@ -193,6 +191,12 @@ pub fn run() {
             cmd::tree_browse,
             cmd::tree_search,
             cmd::workspace_add,
+            cmd::workspace_state,
+            cmd::workspace_remember,
+            cmd::workspace_set_active,
+            cmd::workspace_remove,
+            cmd::workspace_set_startup,
+            cmd::available_drives,
             cmd::watch_start,
             cmd::watch_stop,
             cmd::watch_status,
@@ -204,6 +208,8 @@ pub fn run() {
             cmd::data_dir_path,
             cmd::extension_status,
             cmd::extension_install,
+            cmd::extension_update,
+            cmd::extension_remove,
         ])
         .setup(|app| {
             // 主窗口在 setup 里手动创建：`tauri.conf.json` 的 `dataDirectory`
@@ -318,7 +324,7 @@ fn schedule_startup_scan(app: &tauri::AppHandle) {
         if !state.cfg.read().ui.auto_scan_on_start {
             return;
         }
-        match cmd::start_scan(state.inner(), None, None) {
+        match cmd::start_scan(state.inner(), None, None, true) {
             Ok(()) => {
                 let _ = state.db.log("scan", "启动时自动扫描已开始");
             }

@@ -79,6 +79,8 @@ pub struct IndexRoot {
     pub last_scan: i64,
     pub files: i64,
     pub bytes: i64,
+    pub discovered_files: i64,
+    pub discovered_bytes: i64,
     pub added: i64,
     pub updated: i64,
     pub skipped: i64,
@@ -181,11 +183,31 @@ impl Db {
                 skipped INTEGER NOT NULL DEFAULT 0,
                 errors INTEGER NOT NULL DEFAULT 0,
                 missing INTEGER NOT NULL DEFAULT 0,
+                discovered_files INTEGER NOT NULL DEFAULT 0,
+                discovered_bytes INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS doc_pages(
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                page_no INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                raw TEXT NOT NULL,
+                UNIQUE(file_id, page_no)
+            );
+            CREATE INDEX IF NOT EXISTS ix_doc_pages_file ON doc_pages(file_id, page_no);
+            CREATE VIRTUAL TABLE IF NOT EXISTS page_docs USING fts5(
+                file_id UNINDEXED,
+                page_no UNINDEXED,
+                name,
+                body,
+                raw
             );
             "#,
         )?;
         let _ = c.execute("ALTER TABLE index_roots ADD COLUMN last_error TEXT NOT NULL DEFAULT ''", []);
+        let _ = c.execute("ALTER TABLE index_roots ADD COLUMN discovered_files INTEGER NOT NULL DEFAULT 0", []);
+        let _ = c.execute("ALTER TABLE index_roots ADD COLUMN discovered_bytes INTEGER NOT NULL DEFAULT 0", []);
         // 历史遗留：早期版本按原始字符串存 path，用户粘贴 C:/a/b 与 walkdir 的 C:\a\b
         // 会被当成两个文件。这里把正斜杠统一成反斜杠；若统一后撞了 UNIQUE，
         // 说明是重复行，直接删掉后来者（保留 id 小的、状态更完整的）。
@@ -272,10 +294,17 @@ impl Db {
                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending','pending',?9,?10,0)
                ON CONFLICT(path) DO UPDATE SET
                  dir=excluded.dir, name=excluded.name, ext=excluded.ext, kind=excluded.kind,
-                 size=excluded.size, mtime=excluded.mtime, ctime=excluded.ctime, missing=0"#,
+                 size=excluded.size, mtime=excluded.mtime, ctime=excluded.ctime, missing=0,
+                 thumb_key=CASE WHEN files.size=excluded.size AND files.mtime=excluded.mtime THEN files.thumb_key ELSE NULL END,
+                 text_len=0, text_state='pending', embed_state='pending'"#,
             params![f.path, f.dir, f.name, f.ext, f.kind, f.size, f.mtime, f.ctime, f.category, f.tags],
         )?;
-        Ok(c.last_insert_rowid())
+        // A changed file must not keep stale full-text content while it waits
+        // for the next incremental indexing pass.
+        c.execute("DELETE FROM docs WHERE rowid=(SELECT id FROM files WHERE path=?1)", params![f.path])?;
+        c.execute("DELETE FROM page_docs WHERE file_id=(SELECT id FROM files WHERE path=?1)", params![f.path])?;
+        c.execute("DELETE FROM doc_pages WHERE file_id=(SELECT id FROM files WHERE path=?1)", params![f.path])?;
+        c.query_row("SELECT id FROM files WHERE path=?1", params![f.path], |row| row.get(0))
     }
 
     pub fn get_by_path(&self, path: &str) -> rusqlite::Result<Option<FileRow>> {
@@ -432,10 +461,65 @@ impl Db {
         let tx = c.transaction()?;
         for id in ids {
             tx.execute("DELETE FROM docs WHERE rowid=?1", params![id])?;
+            tx.execute("DELETE FROM page_docs WHERE file_id=?1", params![id.to_string()])?;
+            tx.execute("DELETE FROM doc_pages WHERE file_id=?1", params![id])?;
             tx.execute("DELETE FROM files WHERE id=?1", params![id])?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Remove all indexed files below a scan root and return their ids so the
+    /// in-memory vector stores can discard the same slots. Roots that remain
+    /// configured are protected, which matters when users configure nested
+    /// scan directories and later remove only the parent entry.
+    pub fn remove_scan_root(&self, root: &str, keep_roots: &[String]) -> rusqlite::Result<Vec<i64>> {
+        let (_, lower, upper) = index_root_bounds(root);
+        let keep: Vec<String> = keep_roots
+            .iter()
+            .map(|item| crate::util::norm_path(item).to_ascii_lowercase())
+            .collect();
+        let c = self.conn.lock();
+        let mut ids = Vec::new();
+        {
+            let mut st = c.prepare(
+                "SELECT id,path FROM files WHERE path >= ?1 AND path < ?2",
+            )?;
+            let rows = st.query_map(params![lower, upper], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, path) = row?;
+                let normalized = crate::util::norm_path(&path).to_ascii_lowercase();
+                let protected = keep.iter().any(|candidate| {
+                    normalized == *candidate
+                        || normalized.starts_with(&format!("{}\\", candidate.trim_end_matches('\\')))
+                });
+                if !protected {
+                    ids.push(id);
+                }
+            }
+        }
+        if ids.is_empty() {
+            c.execute(
+                "DELETE FROM index_roots WHERE lower(root)=lower(?1)",
+                params![crate::util::norm_path(root)],
+            )?;
+            return Ok(ids);
+        }
+        let tx = c.unchecked_transaction()?;
+        for id in &ids {
+            tx.execute("DELETE FROM docs WHERE rowid=?1", params![id])?;
+            tx.execute("DELETE FROM page_docs WHERE file_id=?1", params![id.to_string()])?;
+            tx.execute("DELETE FROM doc_pages WHERE file_id=?1", params![id])?;
+            tx.execute("DELETE FROM files WHERE id=?1", params![id])?;
+        }
+        tx.execute(
+            "DELETE FROM index_roots WHERE lower(root)=lower(?1)",
+            params![crate::util::norm_path(root)],
+        )?;
+        tx.commit()?;
+        Ok(ids)
     }
 
     // ---------------- 全文索引
@@ -449,11 +533,44 @@ impl Db {
             "INSERT INTO docs(rowid, name, body, raw) VALUES(?1,?2,?3,?4)",
             params![file_id, name, body, raw],
         )?;
+        // Keep a page-level copy alongside the file aggregate. Form-feed is
+        // emitted by the PDF/PPTX extractors; long unpaged Office/text files
+        // are split into stable bounded chunks so every document has a useful
+        // page number without changing the existing file-level FTS contract.
+        c.execute("DELETE FROM page_docs WHERE file_id=?1", params![file_id.to_string()])?;
+        c.execute("DELETE FROM doc_pages WHERE file_id=?1", params![file_id])?;
+        for (page_no, page) in page_chunks(raw).into_iter().enumerate() {
+            let page_no = page_no as i64 + 1;
+            let page_body = crate::util::index_text(&page);
+            c.execute(
+                "INSERT INTO doc_pages(file_id,page_no,body,raw) VALUES(?1,?2,?3,?4)",
+                params![file_id, page_no, page_body, page],
+            )?;
+            c.execute(
+                "INSERT INTO page_docs(file_id,page_no,name,body,raw) VALUES(?1,?2,?3,?4,?5)",
+                params![file_id.to_string(), page_no.to_string(), name, page_body, page],
+            )?;
+        }
         c.execute(
             "UPDATE files SET text_len=?1, text_state='ok' WHERE id=?2",
             params![raw.chars().count() as i64, file_id],
         )?;
         Ok(())
+    }
+
+    /// Search the page-level FTS index. The caller can use `page_no` to
+    /// surface the exact document page while retaining file-level ranking.
+    pub fn search_pages_fts(&self, expr: &str, limit: usize) -> rusqlite::Result<Vec<(i64, i64, f64)>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT CAST(p.file_id AS INTEGER), CAST(p.page_no AS INTEGER), bm25(page_docs,3.0,1.0,0.0) \
+             FROM page_docs p JOIN files f ON f.id=CAST(p.file_id AS INTEGER) AND f.missing=0 \
+             WHERE page_docs MATCH ?1 ORDER BY 3 LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![expr, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        rows.collect()
     }
 
     pub fn get_doc_raw(&self, file_id: i64) -> rusqlite::Result<Option<String>> {
@@ -785,17 +902,20 @@ impl Db {
         skipped: i64,
         errors: i64,
         missing: i64,
+        discovered_files: i64,
+        discovered_bytes: i64,
         last_error: &str,
     ) -> rusqlite::Result<()> {
         let root = crate::util::norm_path(root);
         let c = self.conn.lock();
         c.execute(
-            "INSERT INTO index_roots(root,last_scan,files,bytes,added,updated,skipped,errors,missing,last_error)\
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)\
+            "INSERT INTO index_roots(root,last_scan,files,bytes,added,updated,skipped,errors,missing,discovered_files,discovered_bytes,last_error)\
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)\
              ON CONFLICT(root) DO UPDATE SET last_scan=excluded.last_scan,files=excluded.files,\
              bytes=excluded.bytes,added=excluded.added,updated=excluded.updated,skipped=excluded.skipped,\
-             errors=excluded.errors,missing=excluded.missing,last_error=excluded.last_error",
-            params![root, last_scan, files, bytes, added, updated, skipped, errors, missing, last_error],
+             errors=excluded.errors,missing=excluded.missing,discovered_files=excluded.discovered_files,\
+             discovered_bytes=excluded.discovered_bytes,last_error=excluded.last_error",
+            params![root, last_scan, files, bytes, added, updated, skipped, errors, missing, discovered_files, discovered_bytes, last_error],
         )?;
         Ok(())
     }
@@ -842,15 +962,16 @@ impl Db {
     pub fn index_roots(&self) -> rusqlite::Result<Vec<IndexRoot>> {
         let c = self.conn.lock();
         let mut st = c.prepare(
-            "SELECT root,enabled,last_scan,added,updated,skipped,errors,missing,last_error \
+            "SELECT root,enabled,last_scan,discovered_files,discovered_bytes,added,updated,skipped,errors,missing,last_error \
              FROM index_roots ORDER BY root",
         )?;
         let rows = st.query_map([], |r| {
             Ok(IndexRoot {
                 root: r.get(0)?, enabled: r.get::<_, i64>(1)? != 0, last_scan: r.get(2)?,
-                files: 0, bytes: 0, added: r.get(3)?, updated: r.get(4)?,
-                skipped: r.get(5)?, errors: r.get(6)?, missing: r.get(7)?, text_ok: 0,
-                last_error: r.get(8)?, embed_ok: 0, completed: 0, text_pending: 0, embed_pending: 0, kinds: Vec::new(),
+                files: 0, bytes: 0, discovered_files: r.get(3)?, discovered_bytes: r.get(4)?,
+                added: r.get(5)?, updated: r.get(6)?, skipped: r.get(7)?, errors: r.get(8)?,
+                missing: r.get(9)?, text_ok: 0, last_error: r.get(10)?, embed_ok: 0,
+                completed: 0, text_pending: 0, embed_pending: 0, kinds: Vec::new(),
             })
         })?;
         let mut roots = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -946,7 +1067,7 @@ impl Db {
     pub fn clear_all(&self) -> rusqlite::Result<()> {
         let c = self.conn.lock();
         c.execute_batch(
-            "DELETE FROM files; DELETE FROM docs; DELETE FROM activity;",
+            "DELETE FROM files; DELETE FROM docs; DELETE FROM page_docs; DELETE FROM doc_pages; DELETE FROM index_roots; DELETE FROM activity;",
         )?;
         Ok(())
     }
@@ -1063,6 +1184,27 @@ fn dir_prefix_bounds(prefix: &str) -> (String, String) {
     (lo, hi)
 }
 
+fn page_chunks(raw: &str) -> Vec<String> {
+    const CHUNK_CHARS: usize = 4_000;
+    let explicit: Vec<String> = raw
+        .split('\u{c}')
+        .map(|part| part.trim().to_owned())
+        .collect();
+    if raw.contains('\u{c}') {
+        return explicit;
+    }
+    let source = explicit.first().map(String::as_str).unwrap_or(raw.trim());
+    if source.is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<char> = source.chars().collect();
+    chars
+        .chunks(CHUNK_CHARS)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .filter(|part| !part.trim().is_empty())
+        .collect()
+}
+
 fn index_root_bounds(root: &str) -> (String, String, String) {
     let exact = crate::util::norm_path(root);
     let mut lower = exact.clone();
@@ -1130,6 +1272,44 @@ mod index_progress_tests {
     }
 
     #[test]
+    fn changed_file_is_marked_pending_for_incremental_reindex() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut file = FileRow::new("C:\\docs\\changed.txt");
+        let id = db.upsert_file(&file).unwrap();
+        db.set_doc(id, "changed.txt", "old body", "old body").unwrap();
+        db.set_state(id, "embed", "ok").unwrap();
+
+        file.size = 42;
+        file.mtime += 1;
+        let same_id = db.upsert_file(&file).unwrap();
+        assert_eq!(same_id, id);
+        let saved = db.get_by_id(id).unwrap().unwrap();
+        assert_eq!(saved.text_state, "pending");
+        assert_eq!(saved.embed_state, "pending");
+        assert_eq!(saved.text_len, 0);
+        assert!(db.get_doc_raw(id).unwrap().is_none());
+        assert_eq!(db.index_progress("auto").unwrap(), (1, 0));
+    }
+
+    #[test]
+    fn page_text_is_indexed_and_replaced_with_the_document() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let id = db.upsert_file(&FileRow::new("C:\\docs\\paged.pdf")).unwrap();
+
+        db.set_doc(id, "paged.pdf", "page one\u{c}\u{c}page three", "page one\u{c}\u{c}page three")
+            .unwrap();
+        let first = db.search_pages_fts("three", 10).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, id);
+        assert_eq!(first[0].1, 3);
+
+        db.set_doc(id, "paged.pdf", "replacement", "replacement")
+            .unwrap();
+        assert!(db.search_pages_fts("three", 10).unwrap().is_empty());
+        assert_eq!(db.search_pages_fts("replacement", 10).unwrap().len(), 1);
+    }
+
+    #[test]
     fn index_root_stats_are_isolated_for_similar_roots() {
         let db = Db::open(Path::new(":memory:")).unwrap();
         let roots = vec!["C:\\docs-a\\".to_string(), "C:\\docs-b".to_string()];
@@ -1160,5 +1340,10 @@ mod index_progress_tests {
         assert_eq!(stats[1].root, "C:\\docs-b");
         assert_eq!(stats[1].files, 1);
         assert_eq!(stats[1].bytes, 17);
+
+        db.upsert_index_root("C:\\docs-a", 123, 2, 24, 1, 0, 0, 0, 0, 9, 99, "").unwrap();
+        let stats = db.index_roots().unwrap();
+        assert_eq!(stats[0].discovered_files, 9);
+        assert_eq!(stats[0].discovered_bytes, 99);
     }
 }

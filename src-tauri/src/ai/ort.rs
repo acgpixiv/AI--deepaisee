@@ -18,6 +18,7 @@ use std::sync::Arc;
 extern "system" {
     fn LoadLibraryW(name: *const u16) -> *mut c_void;
     fn GetProcAddress(h: *mut c_void, name: *const u8) -> *mut c_void;
+    fn FreeLibrary(h: *mut c_void) -> i32;
 }
 
 type Status = *mut c_void;
@@ -122,6 +123,9 @@ impl Drop for Inner {
             }
             if !self.env.is_null() {
                 release_env(self.env);
+            }
+            if !self._dll.is_null() {
+                FreeLibrary(self._dll);
             }
         }
     }

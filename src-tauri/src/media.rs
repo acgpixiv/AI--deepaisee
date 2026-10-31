@@ -1,6 +1,7 @@
 //! 媒体处理：用内置 ffmpeg 抽帧/解码音频，生成缩略图。
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -50,6 +51,39 @@ fn hidden(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+fn ffmpeg_cuda_decode_available(ff: &Path) -> bool {
+    static CUDA_AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *CUDA_AVAILABLE.get_or_init(|| {
+        let Ok(output) = hidden(
+            Command::new(ff)
+                .args(["-hide_banner", "-hwaccels"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .output() else {
+            return false;
+        };
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        text.lines().any(|line| line.trim().eq_ignore_ascii_case("cuda"))
+    })
+}
+
+fn run_video_ffmpeg<F>(ff: &Path, mut build: F) -> std::io::Result<Output>
+where
+    F: FnMut(bool) -> Command,
+{
+    let use_cuda = ffmpeg_cuda_decode_available(ff);
+    let first = hidden(&mut build(use_cuda)).output()?;
+    if first.status.success() || !use_cuda {
+        return Ok(first);
+    }
+    hidden(&mut build(false)).output()
+}
+
 /// 临时工作目录：优先 exe 同级的 `data/tmp`，退回系统 %TEMP%。
 ///
 /// 为什么要自己找：有些机器的 %TEMP%（漫游配置文件损坏 / 安全软件锁目录）
@@ -78,8 +112,8 @@ fn work_dir() -> PathBuf {
 pub fn sample_video_frames(path: &Path, count: usize, max_side: u32) -> Vec<PathBuf> {
     let Some(ff) = ffmpeg_path() else { return vec![] };
     let base = work_dir();
-    sweep_old_frames(&base);
     let tmp = base.join(format!("frames-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
     if std::fs::create_dir_all(&tmp).is_err() {
         return vec![];
     }
@@ -117,7 +151,7 @@ pub fn sample_video_frames(path: &Path, count: usize, max_side: u32) -> Vec<Path
 /// 场景切换优先、图像指纹去重、总帧数封顶。
 #[derive(Debug, Clone, Copy)]
 pub struct FramePlan {
-    /// 相邻采样点的最小时间间隔（秒），内部强制不低于 4 秒。
+    /// 相邻采样点的时间间隔（秒）。1 秒对应 EmbeddingGemma2 的默认 1 FPS。
     pub interval: f32,
     /// 单个视频最多保留多少帧。
     pub max_frames: u32,
@@ -129,7 +163,7 @@ pub struct FramePlan {
 
 impl Default for FramePlan {
     fn default() -> Self {
-        Self { interval: 4.0, max_frames: 64, max_side: 256, dedup_distance: 6 }
+        Self { interval: 1.0, max_frames: 64, max_side: 256, dedup_distance: 6 }
     }
 }
 
@@ -162,20 +196,19 @@ fn parse_showinfo_times(text: &str) -> Vec<f64> {
 /// 失败时返回空列表，调用方退回均匀采样（不能因为探测失败就不抽帧）。
 fn video_keyframe_times(path: &Path) -> Vec<f64> {
     let Some(ff) = ffmpeg_path() else { return vec![] };
-    let out = hidden(
-        Command::new(&ff)
-            .args(["-hide_banner", "-nostats", "-loglevel", "info", "-skip_frame", "nokey", "-i"])
-            .arg(path)
-            .args([
-                "-vf",
-                "select=eq(pict_type\\,I),showinfo",
-                "-an",
-                "-f",
-                "null",
-                "-",
-            ]),
-    )
-    .output();
+    let out = run_video_ffmpeg(&ff, |cuda| {
+        let mut command = Command::new(&ff);
+        command.args(["-hide_banner", "-nostats", "-loglevel", "info"]);
+        if cuda { command.args(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]); }
+        command.args(["-skip_frame", "nokey", "-i"]).arg(path);
+        let filter = if cuda {
+            "hwdownload,format=nv12,select=eq(pict_type\\,I),showinfo"
+        } else {
+            "select=eq(pict_type\\,I),showinfo"
+        };
+        command.args(["-vf", filter, "-an", "-f", "null", "-"]);
+        command
+    });
     let Ok(out) = out else { return vec![] };
     parse_showinfo_times(&String::from_utf8_lossy(&out.stderr))
 }
@@ -193,20 +226,19 @@ fn video_scene_change_times(path: &Path, dur: f64) -> Vec<f64> {
         return vec![];
     }
     let Some(ff) = ffmpeg_path() else { return vec![] };
-    let out = hidden(
-        Command::new(&ff)
-            .args(["-hide_banner", "-nostats", "-loglevel", "info", "-i"])
-            .arg(path)
-            .args([
-                "-vf",
-                "fps=2,scale=160:-2,select='gt(scene\\,0.4)',showinfo",
-                "-an",
-                "-f",
-                "null",
-                "-",
-            ]),
-    )
-    .output();
+    let out = run_video_ffmpeg(&ff, |cuda| {
+        let mut command = Command::new(&ff);
+        command.args(["-hide_banner", "-nostats", "-loglevel", "info"]);
+        if cuda { command.args(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]); }
+        command.arg("-i").arg(path);
+        let filter = if cuda {
+            "hwdownload,format=nv12,fps=2,scale=160:-2,select='gt(scene\\,0.4)',showinfo"
+        } else {
+            "fps=2,scale=160:-2,select='gt(scene\\,0.4)',showinfo"
+        };
+        command.args(["-vf", filter, "-an", "-f", "null", "-"]);
+        command
+    });
     let Ok(out) = out else { return vec![] };
     parse_showinfo_times(&String::from_utf8_lossy(&out.stderr))
 }
@@ -217,19 +249,19 @@ fn video_scene_change_times(path: &Path, dur: f64) -> Vec<f64> {
 /// - 换镜头很频繁（动作片 / 体育）：缩到 0.5 倍，尽量不漏关键画面；
 /// - 中间档保持配置值。
 ///
-/// 需求要求「至少每 4 秒一帧」，所以任何情况下都不低于 4 秒。
+/// 采样密度由专业配置控制，帧数上限负责约束长视频的成本。
 fn adaptive_interval(base: f64, dur: f64, scene_count: usize) -> f64 {
     if dur < 1.0 {
-        return base.max(4.0);
+        return base.max(0.1);
     }
     if scene_count == 0 {
-        return (base * 1.5).max(4.0);
+        return (base * 1.5).max(0.1);
     }
     let per_minute = scene_count as f64 * 60.0 / dur;
     if per_minute >= 8.0 {
-        return (base * 0.5).max(4.0);
+        return (base * 0.5).max(0.1);
     }
-    base.max(4.0)
+    base.max(0.1)
 }
 
 /// 在指定时间点抽一帧到 `dest`。
@@ -238,17 +270,19 @@ fn grab_frame(ff: &Path, src: &Path, seconds: f64, max_side: u32, dest: &Path) -
         "scale='min({m},iw)':'min({m},ih)':force_original_aspect_ratio=decrease",
         m = max_side
     );
-    hidden(
-        Command::new(ff)
-            .args(["-y", "-ss", &format!("{seconds:.3}"), "-i"])
-            .arg(src)
-            .args(["-frames:v", "1", "-vf", &scale, "-q:v", "4"])
+    run_video_ffmpeg(ff, |cuda| {
+        let mut command = Command::new(ff);
+        command.args(["-y", "-ss", &format!("{seconds:.3}")]);
+        if cuda { command.args(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]); }
+        command.arg("-i").arg(src);
+        let filter = if cuda { format!("hwdownload,format=nv12,{scale}") } else { scale.clone() };
+        command.args(["-frames:v", "1", "-vf", &filter, "-q:v", "4"])
             .arg(dest)
             .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    )
-    .status()
-    .map(|s| s.success())
+            .stderr(Stdio::null());
+        command
+    })
+    .map(|output| output.status.success())
     .unwrap_or(false)
         && dest.is_file()
 }
@@ -321,8 +355,8 @@ fn color_distance(a: [u8; 3], b: [u8; 3]) -> u32 {
 pub fn sample_video_frames_smart(path: &Path, plan: FramePlan) -> Vec<PathBuf> {
     let Some(ff) = ffmpeg_path() else { return vec![] };
     let base = work_dir();
-    sweep_old_frames(&base);
-    let tmp = base.join(format!("frames-{}", std::process::id()));
+    let tmp = base.join(format!("frames-smart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
     if std::fs::create_dir_all(&tmp).is_err() {
         return vec![];
     }
@@ -332,8 +366,8 @@ pub fn sample_video_frames_smart(path: &Path, plan: FramePlan) -> Vec<PathBuf> {
     let keys = video_keyframe_times(path);
     let scenes = video_scene_change_times(path, dur);
 
-    // 需求明确「至少每 4 秒一帧」，这里兜住配置里填了 0/负数的情况。
-    let interval = adaptive_interval((plan.interval as f64).max(4.0), dur, scenes.len());
+    // 兜住配置里填了 0/负数的情况；1 秒即按 1 FPS 采样。
+    let interval = adaptive_interval((plan.interval as f64).max(0.1), dur, scenes.len());
     // 排障开关：设了 DEEPAISEE_DEBUG_FRAMES 就把探测结果打到 stderr。
     if std::env::var_os("DEEPAISEE_DEBUG_FRAMES").is_some() {
         eprintln!(
@@ -399,27 +433,84 @@ pub fn sample_video_frames_smart(path: &Path, plan: FramePlan) -> Vec<PathBuf> {
     }
     out
 }
+
+/// Sample a single video window at the requested 1 FPS policy. The window is
+/// kept separate from the scene-aware sampler because multimodal embedding
+/// needs the frame timestamps to line up with the audio segment.
+pub fn sample_video_frames_window(
+    path: &Path,
+    start_seconds: f64,
+    duration_seconds: f64,
+    max_side: u32,
+) -> Vec<PathBuf> {
+    let Some(ff) = ffmpeg_path() else { return Vec::new() };
+    let base = work_dir();
+    let tmp = base.join(format!(
+        "frames-window-{}-{}",
+        std::process::id(),
+        (start_seconds.max(0.0) * 1000.0).round() as u64
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    if std::fs::create_dir_all(&tmp).is_err() {
+        return Vec::new();
+    }
+    let count = duration_seconds.ceil().clamp(1.0, 30.0) as usize;
+    let scale = format!(
+        "scale='min({m},iw)':'min({m},ih)':force_original_aspect_ratio=decrease",
+        m = max_side.max(64)
+    );
+    let output = run_video_ffmpeg(&ff, |cuda| {
+        let mut command = Command::new(&ff);
+        command.args(["-hide_banner", "-loglevel", "error", "-y", "-ss", &format!("{start_seconds:.3}")]);
+        if cuda { command.args(["-hwaccel", "cuda"]); }
+        command.arg("-i").arg(path);
+        let filter = if cuda {
+            format!("fps=1,hwdownload,format=nv12,{scale}")
+        } else {
+            format!("fps=1,{scale}")
+        };
+        command.args(["-t", &format!("{duration_seconds:.3}"), "-vf", &filter, "-q:v", "4"])
+            .arg(tmp.join("f-%03d.jpg"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    });
+    if output.map(|value| value.status.success()).unwrap_or(false) {
+        let mut frames: Vec<PathBuf> = std::fs::read_dir(&tmp)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect();
+        frames.sort();
+        frames.truncate(count);
+        if !frames.is_empty() {
+            return frames;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    Vec::new()
+}
 /// 清掉上次运行残留的 `frames-<pid>` 目录。
 ///
 /// 每个进程只用自己的 pid 目录，正常结束会删；但程序被强杀 / 崩溃时
 /// 目录会留下来，日积月累能堆出几百兆的 jpg。启动新一轮抽帧时顺手清掉
 /// 那些「不是当前进程」的旧目录（失败也无所谓，下次再清）。
-fn sweep_old_frames(base: &Path) {
-    let Ok(rd) = std::fs::read_dir(base) else { return };
-    let me = format!("frames-{}", std::process::id());
-    for e in rd.flatten() {
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("frames-") && name != me {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
-    }
-}
+// Window-specific frame directories are removed after decoding, so no global
+// sweep is needed and concurrent video jobs cannot delete one another's data.
 
 /// 视频时长（秒）。
 pub fn video_duration(path: &Path) -> Option<f64> {
     let ff = ffmpeg_path()?;
-    let out = hidden(Command::new(&ff).arg("-i").arg(path).args(["-f", "null", "-"]))
+    // Inspect container timestamps without decoding the entire stream.
+    let out = hidden(
+        Command::new(&ff)
+            .args(["-hide_banner", "-i"])
+            .arg(path)
+            .args(["-map", "0:v:0?", "-c", "copy", "-f", "null", "-"]),
+    )
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stderr);
@@ -440,14 +531,22 @@ pub fn video_duration(path: &Path) -> Option<f64> {
 
 /// 把音频转成 16k 单声道 f32 采样。
 pub fn load_audio(path: &Path, seconds: f64) -> Option<Vec<f32>> {
+    load_audio_at_rate(path, seconds, 16_000)
+}
+
+/// Decode mono little-endian PCM at the sample rate declared by the active
+/// multimodal projector. EmbeddingGemma2 uses 16 kHz; other mtmd projectors
+/// may declare a different rate.
+pub fn load_audio_at_rate(path: &Path, seconds: f64, sample_rate: u32) -> Option<Vec<f32>> {
     let ff = ffmpeg_path()?;
+    let sample_rate = sample_rate.clamp(8_000, 192_000);
     let out = hidden(
         Command::new(&ff)
             .arg("-v")
             .arg("quiet")
             .args(["-i"])
             .arg(path)
-            .args(["-t", &format!("{seconds:.2}"), "-ac", "1", "-ar", "16000", "-f", "f32le", "-"]),
+            .args(["-t", &format!("{seconds:.2}"), "-ac", "1", "-ar", &sample_rate.to_string(), "-f", "f32le", "-"]),
     )
     .output()
     .ok()?;
@@ -462,6 +561,45 @@ pub fn load_audio(path: &Path, seconds: f64) -> Option<Vec<f32>> {
         v.push(f32::from_le_bytes(b));
     }
     Some(v)
+}
+
+/// Decode the audio track aligned to a video window. EmbeddingGemma2 expects
+/// mono 16 kHz PCM, and the model itself caps a clip at 30 seconds.
+pub fn load_audio_segment(path: &Path, start_seconds: f64, seconds: f64) -> Option<Vec<f32>> {
+    load_audio_segment_at_rate(path, start_seconds, seconds, 16_000)
+}
+
+/// Decode one video-window audio track at the projector's required rate.
+pub fn load_audio_segment_at_rate(
+    path: &Path,
+    start_seconds: f64,
+    seconds: f64,
+    sample_rate: u32,
+) -> Option<Vec<f32>> {
+    let ff = ffmpeg_path()?;
+    let duration = seconds.clamp(0.25, 30.0);
+    let sample_rate = sample_rate.clamp(8_000, 192_000);
+    let out = hidden(
+        Command::new(&ff)
+            .arg("-v")
+            .arg("quiet")
+            .arg("-ss")
+            .arg(format!("{start_seconds:.3}"))
+            .arg("-i")
+            .arg(path)
+            .args(["-t", &format!("{duration:.2}"), "-ac", "1", "-ar", &sample_rate.to_string(), "-f", "f32le", "-"]),
+    )
+    .output()
+    .ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    let bytes = out.stdout;
+    let mut samples = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Some(samples)
 }
 
 /// 把音频转成 48k 单声道 f32 采样（CLAP 的输入采样率）。
@@ -530,10 +668,10 @@ pub fn make_thumb(src: &Path, dest: &Path, size: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Generate a first-page/embedded-image thumbnail for document cards.
-/// PDF extraction already decodes common raster streams, while DOCX stores
-/// previewable images under `word/media`. Unsupported documents simply fall
-/// back to the file-type icon in the gallery.
+/// Generate document thumbnails when a document contains a usable image.
+/// PDFs are rendered by PDF.js in the gallery so scanned pages and vector
+/// covers are represented correctly; DOCX stores previewable images under
+/// `word/media`.
 pub fn make_document_thumb(src: &Path, dest: &Path, size: u32) -> bool {
     let ext = src
         .extension()
@@ -541,7 +679,10 @@ pub fn make_document_thumb(src: &Path, dest: &Path, size: u32) -> bool {
         .unwrap_or_default()
         .to_ascii_lowercase();
     let image = if ext == "pdf" {
-        crate::textract::pdf_images(src, 1).into_iter().next()
+        // PDF thumbnails must show a rendered page, not whichever embedded
+        // image object happens to appear first. The gallery renders page 1
+        // through PDF.js and persists that cover in the thumbnail cache.
+        None
     } else if ext == "docx" {
         let Some(file) = std::fs::File::open(src).ok() else { return false };
         let Ok(mut archive) = zip::ZipArchive::new(file) else { return false };
@@ -568,6 +709,16 @@ pub fn make_document_thumb(src: &Path, dest: &Path, size: u32) -> bool {
         None
     };
     let Some(image) = image else { return false };
+    save_document_thumb_image(&image, dest, size)
+}
+
+/// Save an already decoded document page as a gallery thumbnail.
+pub fn save_document_thumb_image(image: &image::DynamicImage, dest: &Path, size: u32) -> bool {
+    if let Some(parent) = dest.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
     let image = image.thumbnail(size, size);
     image.save_with_format(dest, image::ImageFormat::Jpeg).is_ok() && dest.is_file()
 }

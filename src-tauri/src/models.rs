@@ -21,12 +21,13 @@ pub struct ModelEntry {
     pub kind_label: String,
     /// 是否是当前加载的嵌入模型
     pub active: bool,
-    /// `gguf` 或 `safetensors`。safetensors 需要转换/其它推理后端才能加载。
+    /// `gguf` 或 `safetensors`。
     pub format: String,
+    pub files_complete: bool,
     pub direct_loadable: bool,
     pub model_dir: String,
     /// 模型本身声明的输入模态：text / image / audio / video。
-    /// 这只描述权重能力；是否能在当前后端运行仍由 direct_loadable 决定。
+    /// 这只描述权重能力；是否能在当前构建运行由 files_complete/direct_loadable 决定。
     pub modalities: Vec<String>,
     /// 可接手该模型的推理适配器（只表示候选，不表示扩展已安装）。
     pub candidate_backends: Vec<String>,
@@ -51,6 +52,7 @@ pub struct ModelImportResult {
     pub files: Vec<ModelImportFile>,
     pub primary_model: String,
     pub primary_kind: String,
+    pub files_complete: bool,
     pub direct_loadable: bool,
     pub needs_conversion: bool,
     pub warnings: Vec<String>,
@@ -120,6 +122,51 @@ fn candidate_backends(format: &str, config: &str) -> Vec<String> {
         "safetensors" => vec!["python".into()],
         _ => Vec::new(),
     }
+}
+
+/// Return the capabilities that can be declared cheaply while scanning a
+/// model directory.  GGUF keeps the text tower and the multimodal projector
+/// in separate files, so the GGUF weight itself cannot describe image/audio
+/// support.  A sibling `mmproj` is the package-level signal; the native
+/// llama.cpp loader still performs the authoritative capability check when the
+/// model is activated.
+fn gguf_modalities(path: &Path, kind: &str) -> Vec<String> {
+    if kind != "embed" {
+        return Vec::new();
+    }
+    let mut modalities = vec!["text".to_string()];
+    let Some(parent) = path.parent() else {
+        return modalities;
+    };
+    let has_projector = std::fs::read_dir(parent)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            let candidate = entry.path();
+            candidate.is_file()
+                && candidate
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("gguf"))
+                && candidate
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| {
+                        let name = value.to_ascii_lowercase();
+                        name.contains("mmproj") || name.contains("projector")
+                    })
+                    .unwrap_or(false)
+        });
+    if has_projector {
+        // EmbeddingGemma 2's official projector carries the aligned vision
+        // and audio towers.  Video is represented by sampled image frames in
+        // mtmd, so it shares the vision capability. For other GGUF families,
+        // runtime mtmd detection may narrow this declaration after loading.
+        modalities.extend(["image".into(), "audio".into(), "video".into()]);
+    }
+    modalities
 }
 
 /// GGUF 头部里的显示名（只读前 256KB）。
@@ -249,6 +296,24 @@ fn model_format(path: &Path) -> String {
     path.extension().and_then(|x| x.to_str()).unwrap_or("").to_lowercase()
 }
 
+fn model_files_complete(path: &Path, format: &str) -> bool {
+    if format == "gguf" {
+        return path.is_file();
+    }
+    if format != "safetensors" {
+        return false;
+    }
+    let Some(dir) = path.parent() else { return false };
+    crate::ai::safetensors_package_complete(dir)
+}
+
+fn candle_model_loadable(path: &Path, format: &str, embedding_gemma: bool) -> bool {
+    format == "gguf"
+        || (cfg!(feature = "candle-cuda")
+            && embedding_gemma
+            && path.parent().is_some_and(|dir| dir.join("tokenizer.json").is_file()))
+}
+
 fn model_file_kind(path: &Path, config: &str) -> (&'static str, &'static str) {
     classify_with_config(path.to_string_lossy().as_ref(), config)
 }
@@ -313,7 +378,11 @@ pub fn scan(cfg: &ModelConfig, extra_dirs: &[PathBuf]) -> Vec<ModelEntry> {
                 && (configured == norm(&path_s)
                     || (Path::new(&cfg.embed_model).is_dir()
                         && configured == norm(&model_dir)));
-            let modalities = detect_modalities(&config, &processor, is_gguf && kind == "embed");
+            let modalities = if is_gguf {
+                gguf_modalities(p, kind)
+            } else {
+                detect_modalities(&config, &processor, false)
+            };
             let candidate_backends = candidate_backends(
                 if is_gguf { "gguf" } else { "safetensors" },
                 &format!("{}\n{}", config, processor),
@@ -332,8 +401,9 @@ pub fn scan(cfg: &ModelConfig, extra_dirs: &[PathBuf]) -> Vec<ModelEntry> {
                 kind_label: kind_label.to_string(),
                 active,
                 format: if is_gguf { "gguf".into() } else { "safetensors".into() },
-                direct_loadable: is_gguf
-                    || (cfg!(feature = "candle") && embedding_gemma),
+                files_complete: model_files_complete(&p, if is_gguf { "gguf" } else { "safetensors" }),
+                direct_loadable: model_files_complete(&p, if is_gguf { "gguf" } else { "safetensors" })
+                    && candle_model_loadable(&p, if is_gguf { "gguf" } else { "safetensors" }, embedding_gemma),
                 model_dir,
                 modalities,
                 candidate_backends,
@@ -497,9 +567,14 @@ pub fn import_folder(src: &str, dir: &Path) -> Result<ModelImportResult, String>
         let cfg = config_by_dir.get(candidate.parent().unwrap_or(source)).map(String::as_str).unwrap_or("").to_lowercase();
         let is_weight = candidate.extension().map(|x| x.eq_ignore_ascii_case("gguf") || x.eq_ignore_ascii_case("safetensors")).unwrap_or(false);
         if is_weight {
-            let fallback_text = candidate.extension().map(|x| x.eq_ignore_ascii_case("gguf")).unwrap_or(false)
-                && classify_with_config(&candidate.to_string_lossy(), &cfg).0 == "embed";
-            for modality in detect_modalities(&cfg, "", fallback_text) {
+            let format = candidate.extension().and_then(|x| x.to_str()).unwrap_or_default().to_ascii_lowercase();
+            let kind = classify_with_config(&candidate.to_string_lossy(), &cfg).0;
+            let detected = if format == "gguf" {
+                gguf_modalities(candidate, kind)
+            } else {
+                detect_modalities(&cfg, "", false)
+            };
+            for modality in detected {
                 if !modalities.iter().any(|m| m == &modality) { modalities.push(modality); }
             }
             for backend in candidate_backends(
@@ -540,8 +615,12 @@ pub fn import_folder(src: &str, dir: &Path) -> Result<ModelImportResult, String>
             let (kind, kind_label) = model_file_kind(&src_file, parent_cfg);
             let format = model_format(&src_file);
             let cfg_lower = parent_cfg.to_lowercase();
-            let fallback_text = format == "gguf" && classify_with_config(&src_file.to_string_lossy(), &cfg_lower).0 == "embed";
-            for modality in detect_modalities(&cfg_lower, "", fallback_text) {
+            let detected = if format == "gguf" {
+                gguf_modalities(&src_file, kind)
+            } else {
+                detect_modalities(&cfg_lower, "", false)
+            };
+            for modality in detected {
                 if !modalities.iter().any(|m| m == &modality) { modalities.push(modality); }
             }
             if architecture.is_empty() {
@@ -567,10 +646,14 @@ pub fn import_folder(src: &str, dir: &Path) -> Result<ModelImportResult, String>
             let dest_s = dest_file.to_string_lossy().replace('/', "\\");
             files.push(ModelImportFile { path: dest_s.clone(), relative_path: rel_s.clone(), format: format.clone(), kind: kind.into(), kind_label: kind_label.into(), size });
             let is_weight = format == "gguf" || format == "safetensors";
-            let prefer_this = primary.as_ref().map(|x| {
+            // `mmproj` is often larger than the text GGUF (for example, the
+            // EmbeddingGemma projector is close to 1 GB). It is a companion
+            // encoder and must never win the primary-model selection by size.
+            let prefer_this = kind != "projector" && primary.as_ref().map(|x| {
                 let current_is_gguf = x.2 == "gguf";
                 let candidate_is_gguf = format == "gguf";
-                candidate_is_gguf && !current_is_gguf || candidate_is_gguf == current_is_gguf && size > x.3
+                candidate_is_gguf && !current_is_gguf
+                    || candidate_is_gguf == current_is_gguf && size > x.3
             }).unwrap_or(true);
             if is_weight && prefer_this {
                 primary = Some((dest_file, kind.into(), format, size));
@@ -589,10 +672,21 @@ pub fn import_folder(src: &str, dir: &Path) -> Result<ModelImportResult, String>
     let Some((primary_path, primary_kind, primary_format, _)) = primary else {
         return Err("没有可识别的模型权重文件".into());
     };
-    let direct_loadable = primary_format == "gguf"
-        || (cfg!(feature = "candle") && architecture == "EmbeddingGemma2Model");
+    let files_complete = model_files_complete(&primary_path, &primary_format);
+    let direct_loadable = files_complete
+        && candle_model_loadable(
+            &primary_path,
+            &primary_format,
+            architecture == "EmbeddingGemma2Model",
+        );
     if !direct_loadable {
-        warnings.push("已识别 safetensors 权重并完成导入，但当前构建缺少匹配的原生加载组件；请安装可选扩展或导入 GGUF。".into());
+        if !files_complete {
+            warnings.push("已识别 safetensors 权重，但模型目录缺少 config/tokenizer/权重分片文件。".into());
+        } else if backends.iter().any(|backend| backend == "candle") {
+            warnings.push("模型文件完整；当前构建未启用 Candle CUDA 推理后端。".into());
+        } else {
+            warnings.push("已识别 safetensors 权重，但当前架构没有已集成的原生推理后端。".into());
+        }
         if architecture == "EmbeddingGemma2Model" {
             let detail = if modalities.iter().any(|m| m == "image") || modalities.iter().any(|m| m == "audio") {
                 "，配置还声明了图像、音频和视频能力；完整多模态运行需要对应的配套组件"
@@ -614,7 +708,8 @@ pub fn import_folder(src: &str, dir: &Path) -> Result<ModelImportResult, String>
         primary_model: primary_path.to_string_lossy().replace('/', "\\"),
         primary_kind,
         direct_loadable,
-        needs_conversion: !direct_loadable,
+        needs_conversion: !direct_loadable && !backends.iter().any(|backend| backend == "candle"),
+        files_complete,
         warnings,
         architecture,
         components,
@@ -638,8 +733,18 @@ pub fn model_dir(app_dir: &Path, data_dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{candidate_backends, classify_with_config, detect_modalities, supported_model_file};
-    use std::path::Path;
+    use super::{candidate_backends, candle_model_loadable, classify_with_config, detect_modalities, model_files_complete, supported_model_file};
+    use std::path::{Path, PathBuf};
+
+    fn fixture_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deepaisee-model-check-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn recognizes_embedding_gemma_safetensors_from_config() {
@@ -691,5 +796,82 @@ mod tests {
             ["candle", "python"]
         );
         assert_eq!(candidate_backends("safetensors", "{}"), ["python"]);
+    }
+
+    #[test]
+    fn checks_safetensors_package_files_independently_from_backend_support() {
+        let dir = fixture_dir("single");
+        let weights = dir.join("model.safetensors");
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(&weights, "weights").unwrap();
+        assert!(model_files_complete(&weights, "safetensors"));
+
+        std::fs::remove_file(dir.join("tokenizer.json")).unwrap();
+        assert!(!model_files_complete(&weights, "safetensors"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn accepts_descriptive_single_safetensors_filename() {
+        let dir = fixture_dir("descriptive-single");
+        let weights = dir.join("embeddinggemma-2-bf16.safetensors");
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(&weights, "weights").unwrap();
+        assert!(model_files_complete(&weights, "safetensors"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checks_every_safetensors_shard_from_the_index() {
+        let dir = fixture_dir("shards");
+        let first = dir.join("model-00001-of-00002.safetensors");
+        let second = dir.join("model-00002-of-00002.safetensors");
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        std::fs::write(dir.join("tokenizer.model"), "tokenizer").unwrap();
+        std::fs::write(&first, "one").unwrap();
+        std::fs::write(&second, "two").unwrap();
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#,
+        ).unwrap();
+        assert!(model_files_complete(&first, "safetensors"));
+
+        std::fs::remove_file(second).unwrap();
+        assert!(!model_files_complete(&first, "safetensors"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_shard_index_overrides_a_single_file_looking_checkpoint() {
+        let dir = fixture_dir("invalid-index");
+        let weights = dir.join("model.safetensors");
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(&weights, "weights").unwrap();
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(!model_files_complete(&weights, "safetensors"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn native_candle_loadability_requires_the_fast_tokenizer() {
+        let dir = fixture_dir("fast-tokenizer");
+        let weights = dir.join("model.safetensors");
+        std::fs::write(&weights, "weights").unwrap();
+        std::fs::write(dir.join("tokenizer.model"), "sentencepiece").unwrap();
+        assert!(!candle_model_loadable(&weights, "safetensors", true));
+
+        std::fs::write(dir.join("tokenizer.json"), "{} ").unwrap();
+        assert_eq!(
+            candle_model_loadable(&weights, "safetensors", true),
+            cfg!(feature = "candle-cuda")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

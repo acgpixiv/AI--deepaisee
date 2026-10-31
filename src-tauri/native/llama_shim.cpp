@@ -6,13 +6,23 @@
 // 这里用 C++ 直接包含 llama.h 编译，只向 Rust 暴露 5 个简单函数。
 
 #include "llama.h"
+#include "llama-model.h"
+#include "mtmd.h"
+#include "ggml-backend.h"
 
 #include <cmath>
+#include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
+#include <filesystem>
+#include <limits>
 #include <mutex>
+#include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,6 +30,27 @@
 namespace {
 
 std::once_flag backend_init_once;
+constexpr uint32_t kMaxBatchSequences = 32;
+std::mutex model_create_mutex;
+std::mutex model_log_mutex;
+std::string model_log_messages;
+
+void capture_model_log(ggml_log_level level, const char * text, void *) {
+    if (level < GGML_LOG_LEVEL_WARN || !text) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(model_log_mutex);
+    if (model_log_messages.size() < 8192) {
+        model_log_messages.append(text, std::min<size_t>(std::strlen(text), 8192 - model_log_messages.size()));
+    }
+}
+
+std::string take_model_log() {
+    std::lock_guard<std::mutex> lock(model_log_mutex);
+    std::string result;
+    result.swap(model_log_messages);
+    return result;
+}
 
 void ensure_backend_initialized() {
     std::call_once(backend_init_once, [] {
@@ -32,13 +63,44 @@ void ensure_backend_initialized() {
     });
 }
 
-struct Handle {
+struct SharedModel {
+    std::atomic<uint32_t> references{1};
     llama_model *model = nullptr;
+    std::string path;
+    std::string backend_device;
+};
+
+struct Handle {
+    SharedModel *shared = nullptr;
     llama_context *ctx = nullptr;
+    mtmd_context *mtmd = nullptr;
     const llama_vocab *vocab = nullptr;
+    int input_dim = 0;
+    uint32_t max_sequences = 1;
+    bool vision = false;
+    bool audio = false;
+    std::string multimodal_detail = "same-folder mmproj not found";
     int dim = 0;      // 输出向量维度（可能是投影后的 768）
-    int hidden = 0;   // 隐层维度（512），仅用于诊断
     int n_batch = 0;  // 单次 decode 能接受的最大 token 数（= cparams.n_batch）
+};
+
+void retain_shared_model(SharedModel *shared) {
+    if (shared) shared->references.fetch_add(1, std::memory_order_relaxed);
+}
+
+void release_shared_model(SharedModel *shared) {
+    if (!shared || shared->references.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    if (shared->model) llama_model_free(shared->model);
+    delete shared;
+}
+
+struct ds_llama_media_item {
+    int type; // 1 = RGB image, 2 = mono F32 audio
+    const void *data;
+    size_t length; // image bytes or audio samples
+    uint32_t width;
+    uint32_t height;
+    int token_budget;
 };
 
 void set_err(char *err, int err_len, const char *msg) {
@@ -56,6 +118,431 @@ std::string device_key(ggml_backend_dev_t dev) {
     key.push_back('|');
     key += props.device_id && *props.device_id ? props.device_id : (name ? name : "unknown");
     return key;
+}
+
+std::string lowercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+std::optional<std::filesystem::path> find_mmproj(const char *model_path) {
+    std::error_code ec;
+    const std::filesystem::path model = std::filesystem::u8path(model_path);
+    std::vector<std::filesystem::path> candidates;
+    for (std::filesystem::directory_iterator it(model.parent_path(), ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) {
+            continue;
+        }
+        const auto path = it->path();
+        if (lowercase(path.extension().string()) != ".gguf") {
+            continue;
+        }
+        const auto name = lowercase(path.filename().u8string());
+        if (name.find("mmproj") != std::string::npos || name.find("projector") != std::string::npos) {
+            candidates.push_back(path);
+        }
+    }
+    if (candidates.empty()) {
+        return std::nullopt;
+    }
+    std::sort(candidates.begin(), candidates.end());
+    const auto model_stem = lowercase(model.stem().u8string());
+    const auto match = std::find_if(candidates.begin(), candidates.end(), [&](const auto &candidate) {
+        return lowercase(candidate.filename().u8string()).find(model_stem) != std::string::npos;
+    });
+    if (match != candidates.end()) {
+        return *match;
+    }
+    // A single companion can be paired safely even when its filename does not
+    // repeat the model stem. With several projectors, guessing would silently
+    // attach the wrong vision/audio tower, so report text-only capability.
+    return candidates.size() == 1 ? std::optional<std::filesystem::path>(candidates.front())
+                                  : std::nullopt;
+}
+
+bool append_embedding_row(Handle *h, llama_token token, std::vector<float> &destination) {
+    const ggml_tensor *table = h->shared && h->shared->model ? h->shared->model->tok_embd : nullptr;
+    if (!table || token < 0 || token >= table->ne[1] || table->ne[0] != h->input_dim) {
+        return false;
+    }
+    const size_t row_bytes = ggml_row_size(table->type, table->ne[0]);
+    const size_t offset = static_cast<size_t>(token) * table->nb[1];
+    std::vector<uint8_t> raw(row_bytes);
+    ggml_backend_tensor_get(table, raw.data(), offset, row_bytes);
+    std::vector<float> row(static_cast<size_t>(h->input_dim));
+    if (table->type == GGML_TYPE_F32) {
+        std::memcpy(row.data(), raw.data(), row_bytes);
+    } else {
+        const auto *traits = ggml_get_type_traits(table->type);
+        if (!traits || !traits->to_float) {
+            return false;
+        }
+        traits->to_float(raw.data(), row.data(), h->input_dim);
+    }
+    destination.insert(destination.end(), row.begin(), row.end());
+    return true;
+}
+
+int run_embedding_input(Handle *h, const std::vector<float> &input, float *out,
+                        char *err, int err_len) {
+    if (input.empty() || input.size() % static_cast<size_t>(h->input_dim) != 0) {
+        set_err(err, err_len, "mixed input has invalid embedding width");
+        return -1;
+    }
+    const size_t n_tokens = input.size() / static_cast<size_t>(h->input_dim);
+    if (n_tokens > static_cast<size_t>(h->n_batch) || n_tokens > static_cast<size_t>(INT32_MAX)) {
+        set_err(err, err_len, "mixed media input exceeds model context");
+        return -1;
+    }
+    llama_batch batch = llama_batch_init(static_cast<int32_t>(n_tokens), h->input_dim, 1);
+    if (!batch.embd || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+        llama_batch_free(batch);
+        set_err(err, err_len, "failed to allocate mixed embedding batch");
+        return -1;
+    }
+    batch.n_tokens = static_cast<int32_t>(n_tokens);
+    std::memcpy(batch.embd, input.data(), input.size() * sizeof(float));
+    for (size_t i = 0; i < n_tokens; ++i) {
+        batch.pos[i] = static_cast<llama_pos>(i);
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = i + 1 == n_tokens ? 1 : 0;
+    }
+    const int32_t rc = llama_decode(h->ctx, batch);
+    llama_batch_free(batch);
+    if (rc != 0) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "llama_decode mixed media returned %d", rc);
+        set_err(err, err_len, buf);
+        llama_memory_t mem = llama_get_memory(h->ctx);
+        if (mem) llama_memory_clear(mem, true);
+        return -1;
+    }
+    float *embedding = llama_get_embeddings_seq(h->ctx, 0);
+    if (!embedding) {
+        embedding = llama_get_embeddings(h->ctx);
+    }
+    if (!embedding) {
+        set_err(err, err_len, "EmbeddingGemma2 returned no pooled embedding");
+        llama_memory_t mem = llama_get_memory(h->ctx);
+        if (mem) llama_memory_clear(mem, true);
+        return -1;
+    }
+    double norm_squared = 0.0;
+    for (int i = 0; i < h->dim; ++i) {
+        norm_squared += static_cast<double>(embedding[i]) * embedding[i];
+    }
+    if (!std::isfinite(norm_squared) || norm_squared <= 1e-20) {
+        set_err(err, err_len, "EmbeddingGemma2 returned a non-finite or zero vector");
+        llama_memory_t mem = llama_get_memory(h->ctx);
+        if (mem) llama_memory_clear(mem, true);
+        return -1;
+    }
+    const float inverse_norm = static_cast<float>(1.0 / std::sqrt(norm_squared));
+    for (int i = 0; i < h->dim; ++i) {
+        out[i] = embedding[i] * inverse_norm;
+    }
+    llama_memory_t mem = llama_get_memory(h->ctx);
+    if (mem) llama_memory_clear(mem, true);
+    return h->dim;
+}
+
+int run_embedding_inputs(Handle *h, const std::vector<std::vector<float>> &inputs,
+                         float *out, int out_stride, char *err, int err_len) {
+    if (inputs.empty() || inputs.size() > h->max_sequences || !out || out_stride < h->dim) {
+        set_err(err, err_len, "invalid mixed embedding batch arguments");
+        return -1;
+    }
+
+    size_t total_tokens = 0;
+    for (const auto &input : inputs) {
+        if (input.empty() || input.size() % static_cast<size_t>(h->input_dim) != 0) {
+            set_err(err, err_len, "mixed input has invalid embedding width");
+            return -1;
+        }
+        const size_t tokens = input.size() / static_cast<size_t>(h->input_dim);
+        if (tokens > static_cast<size_t>(h->n_batch) ||
+            total_tokens > static_cast<size_t>(h->n_batch) - tokens) {
+            set_err(err, err_len, "mixed media batch exceeds model batch context");
+            return -1;
+        }
+        total_tokens += tokens;
+    }
+    if (total_tokens > static_cast<size_t>(INT32_MAX)) {
+        set_err(err, err_len, "mixed media batch token count overflow");
+        return -1;
+    }
+
+    llama_batch batch = llama_batch_init(static_cast<int32_t>(total_tokens), h->input_dim,
+                                         static_cast<int32_t>(inputs.size()));
+    if (!batch.embd || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+        llama_batch_free(batch);
+        set_err(err, err_len, "failed to allocate mixed embedding batch");
+        return -1;
+    }
+    batch.n_tokens = static_cast<int32_t>(total_tokens);
+    size_t cursor = 0;
+    for (size_t seq = 0; seq < inputs.size(); ++seq) {
+        const auto &input = inputs[seq];
+        const size_t tokens = input.size() / static_cast<size_t>(h->input_dim);
+        std::memcpy(batch.embd + cursor * static_cast<size_t>(h->input_dim),
+                    input.data(), input.size() * sizeof(float));
+        for (size_t pos = 0; pos < tokens; ++pos, ++cursor) {
+            batch.pos[cursor] = static_cast<llama_pos>(pos);
+            batch.n_seq_id[cursor] = 1;
+            batch.seq_id[cursor][0] = static_cast<llama_seq_id>(seq);
+            batch.logits[cursor] = pos + 1 == tokens ? 1 : 0;
+        }
+    }
+
+    const int32_t rc = llama_decode(h->ctx, batch);
+    llama_batch_free(batch);
+    if (rc != 0) {
+        char detail[160];
+        std::snprintf(detail, sizeof(detail), "llama_decode mixed media batch returned %d", rc);
+        set_err(err, err_len, detail);
+        llama_memory_t mem = llama_get_memory(h->ctx);
+        if (mem) llama_memory_clear(mem, true);
+        return -1;
+    }
+
+    for (size_t seq = 0; seq < inputs.size(); ++seq) {
+        float *embedding = llama_get_embeddings_seq(h->ctx, static_cast<llama_seq_id>(seq));
+        if (!embedding) {
+            set_err(err, err_len, "EmbeddingGemma2 returned no mixed sequence embedding");
+            llama_memory_t mem = llama_get_memory(h->ctx);
+            if (mem) llama_memory_clear(mem, true);
+            return -1;
+        }
+        double norm_squared = 0.0;
+        for (int i = 0; i < h->dim; ++i) {
+            norm_squared += static_cast<double>(embedding[i]) * embedding[i];
+        }
+        if (!std::isfinite(norm_squared) || norm_squared <= 1e-20) {
+            set_err(err, err_len, "EmbeddingGemma2 returned a non-finite or zero mixed vector");
+            llama_memory_t mem = llama_get_memory(h->ctx);
+            if (mem) llama_memory_clear(mem, true);
+            return -1;
+        }
+        const float inverse_norm = static_cast<float>(1.0 / std::sqrt(norm_squared));
+        float *destination = out + seq * static_cast<size_t>(out_stride);
+        for (int i = 0; i < h->dim; ++i) {
+            destination[i] = embedding[i] * inverse_norm;
+        }
+    }
+
+    llama_memory_t mem = llama_get_memory(h->ctx);
+    if (mem) llama_memory_clear(mem, true);
+    return static_cast<int>(inputs.size());
+}
+
+struct MtmdChunksDeleter {
+    void operator()(mtmd_input_chunks *chunks) const {
+        if (chunks) mtmd_input_chunks_free(chunks);
+    }
+};
+
+struct MtmdBatchDeleter {
+    void operator()(mtmd_batch *batch) const {
+        if (batch) mtmd_batch_free(batch);
+    }
+};
+
+struct MediaSequence {
+    std::unique_ptr<mtmd_input_chunks, MtmdChunksDeleter> chunks;
+    const mtmd_input_chunk *media_chunk = nullptr;
+    std::vector<float> projected;
+};
+
+bool encode_media_batch(Handle *h, std::vector<MediaSequence *> sequences,
+                        char *err, int err_len) {
+    if (sequences.empty()) {
+        return true;
+    }
+    std::unique_ptr<mtmd_batch, MtmdBatchDeleter> batch(mtmd_batch_init(h->mtmd));
+    if (!batch) {
+        set_err(err, err_len, "failed to allocate mtmd media batch");
+        return false;
+    }
+    std::vector<MediaSequence *> accepted;
+    accepted.reserve(sequences.size());
+    for (MediaSequence *sequence : sequences) {
+        if (!sequence || !sequence->media_chunk) {
+            set_err(err, err_len, "invalid mtmd media sequence");
+            return false;
+        }
+        const int32_t add = mtmd_batch_add_chunk(batch.get(), sequence->media_chunk);
+        if (add == 0) {
+            accepted.push_back(sequence);
+            continue;
+        }
+        if (add != 2 && add != 3) {
+            set_err(err, err_len, "mtmd rejected a media batch chunk");
+            return false;
+        }
+
+        // A projector may not support batching, or the image shape/token
+        // budget may differ. Flush the compatible prefix and retry the
+        // current chunk in a fresh batch. This preserves correctness for
+        // older mmproj files while allowing supported encoders to run one
+        // GPU graph for many images.
+        if (!accepted.empty()) {
+            if (mtmd_batch_encode(batch.get()) != 0) {
+                set_err(err, err_len, "mmproj failed to encode a media batch");
+                return false;
+            }
+            for (MediaSequence *item : accepted) {
+                const size_t token_count = mtmd_input_chunk_get_n_tokens(item->media_chunk);
+                const float *output = mtmd_batch_get_output_embd(batch.get(), item->media_chunk);
+                if (!output || token_count == 0) {
+                    set_err(err, err_len, "mmproj returned an empty media batch output");
+                    return false;
+                }
+                item->projected.assign(output,
+                    output + token_count * static_cast<size_t>(h->input_dim));
+            }
+            batch.reset(mtmd_batch_init(h->mtmd));
+            if (!batch) {
+                set_err(err, err_len, "failed to allocate mtmd media batch");
+                return false;
+            }
+            accepted.clear();
+        }
+        const int32_t retry = mtmd_batch_add_chunk(batch.get(), sequence->media_chunk);
+        if (retry != 0) {
+            set_err(err, err_len, "mmproj cannot encode this media input");
+            return false;
+        }
+        accepted.push_back(sequence);
+    }
+
+    if (!accepted.empty()) {
+        if (mtmd_batch_encode(batch.get()) != 0) {
+            set_err(err, err_len, "mmproj failed to encode the final media batch");
+            return false;
+        }
+        for (MediaSequence *item : accepted) {
+            const size_t token_count = mtmd_input_chunk_get_n_tokens(item->media_chunk);
+            const float *output = mtmd_batch_get_output_embd(batch.get(), item->media_chunk);
+            if (!output || token_count == 0) {
+                set_err(err, err_len, "mmproj returned an empty media batch output");
+                return false;
+            }
+            item->projected.assign(output,
+                output + token_count * static_cast<size_t>(h->input_dim));
+        }
+    }
+    return true;
+}
+
+bool prepare_media_sequence(Handle *h, const ds_llama_media_item &item,
+                            MediaSequence &sequence,
+                            char *err, int err_len) {
+    if (!item.data || item.length == 0) {
+        set_err(err, err_len, "media item is empty");
+        return false;
+    }
+    mtmd_bitmap *bitmap = nullptr;
+    if (item.type == 1) {
+        if (!h->vision || item.width == 0 || item.height == 0 ||
+            item.length != static_cast<size_t>(item.width) * item.height * 3) {
+            set_err(err, err_len, "GGUF mmproj does not support this RGB image input");
+            return false;
+        }
+        bitmap = mtmd_bitmap_init(item.width, item.height,
+                                  static_cast<const unsigned char *>(item.data));
+    } else if (item.type == 2) {
+        if (!h->audio) {
+            set_err(err, err_len, "GGUF mmproj does not include an audio encoder");
+            return false;
+        }
+        bitmap = mtmd_bitmap_init_from_audio(item.length,
+                                             static_cast<const float *>(item.data));
+    } else {
+        set_err(err, err_len, "unknown GGUF media type");
+        return false;
+    }
+    if (!bitmap) {
+        set_err(err, err_len, "failed to allocate mtmd bitmap");
+        return false;
+    }
+
+    const char *marker = mtmd_get_marker(h->mtmd);
+    std::string prompt = "title: none | text: ";
+    prompt += marker ? marker : "<|image|>";
+    prompt.push_back('\n');
+    mtmd_input_text text{prompt.c_str(), prompt.size(), true, true};
+    const mtmd_bitmap *view = bitmap;
+    auto *chunks = mtmd_input_chunks_init();
+    if (!chunks) {
+        mtmd_bitmap_free(bitmap);
+        set_err(err, err_len, "failed to allocate mtmd chunks");
+        return false;
+    }
+    const int32_t tokenized = mtmd_tokenize(h->mtmd, chunks, &text, &view, 1);
+    mtmd_bitmap_free(bitmap);
+    if (tokenized != 0) {
+        mtmd_input_chunks_free(chunks);
+        set_err(err, err_len, "mtmd_tokenize failed to prepare media input");
+        return false;
+    }
+    sequence.chunks.reset(chunks);
+    for (size_t i = 0; i < mtmd_input_chunks_size(chunks); ++i) {
+        const mtmd_input_chunk *chunk = mtmd_input_chunks_get(chunks, i);
+        if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            if (sequence.media_chunk) {
+                set_err(err, err_len, "this media input requires multiple chunks; use the mixed media path");
+                return false;
+            }
+            sequence.media_chunk = chunk;
+        }
+    }
+    if (!sequence.media_chunk) {
+        set_err(err, err_len, "mtmd did not return a media chunk");
+        return false;
+    }
+    return true;
+}
+
+bool build_media_embedding_input(Handle *h, MediaSequence &sequence,
+                                 std::vector<float> &input,
+                                 char *err, int err_len) {
+    input.clear();
+    const auto *chunks = sequence.chunks.get();
+    if (!chunks || !sequence.media_chunk || sequence.projected.empty()) {
+        set_err(err, err_len, "media sequence is not encoded");
+        return false;
+    }
+    for (size_t i = 0; i < mtmd_input_chunks_size(chunks); ++i) {
+        const mtmd_input_chunk *chunk = mtmd_input_chunks_get(chunks, i);
+        if (mtmd_input_chunk_get_type(chunk) == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            size_t count = 0;
+            const llama_token *tokens = mtmd_input_chunk_get_tokens_text(chunk, &count);
+            if (!tokens) {
+                set_err(err, err_len, "mtmd returned invalid media text tokens");
+                return false;
+            }
+            for (size_t j = 0; j < count; ++j) {
+                if (input.size() / static_cast<size_t>(h->input_dim) >=
+                        static_cast<size_t>(h->n_batch) ||
+                    !append_embedding_row(h, tokens[j], input)) {
+                    set_err(err, err_len, "failed to read media prompt token embedding");
+                    return false;
+                }
+            }
+        } else if (chunk == sequence.media_chunk) {
+            const size_t count = sequence.projected.size() / static_cast<size_t>(h->input_dim);
+            if (input.size() / static_cast<size_t>(h->input_dim) + count >
+                    static_cast<size_t>(h->n_batch)) {
+                set_err(err, err_len, "media sequence exceeds model context");
+                return false;
+            }
+            input.insert(input.end(), sequence.projected.begin(), sequence.projected.end());
+        }
+    }
+    return !input.empty();
 }
 
 }  // namespace
@@ -139,13 +626,16 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
     ensure_backend_initialized();
     // llama.cpp 默认把 graph/内存布局逐行打到 stderr（一次编码上千行），
     // 桌面端没有控制台，这些日志会拖慢编码并污染日志文件，直接静音。
-    llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
+    std::lock_guard<std::mutex> create_lock(model_create_mutex);
+    take_model_log();
+    llama_log_set(capture_model_log, nullptr);
 
     llama_model_params mparams = llama_model_default_params();
     // CPU model-layer execution is intentionally disabled. `-1` means all
     // layers are assigned to the selected GGML accelerator.
     mparams.n_gpu_layers = -1;
     ggml_backend_dev_t selected_devices[2] = { nullptr, nullptr };
+    ggml_backend_dev_t selected_device = nullptr;
     if (device_name && *device_name) {
         ggml_backend_dev_t selected = nullptr;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -166,6 +656,7 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
             set_err(err, err_len, "鎸囧畾璁惧涓嶆槸 GPU 鎴栭泦鎴愭樉鍗�");
             return nullptr;
         }
+        selected_device = selected;
         selected_devices[0] = selected;
         mparams.devices = selected_devices;
         mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
@@ -174,7 +665,10 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
 
     llama_model *model = llama_model_load_from_file(model_path, mparams);
     if (!model) {
-        set_err(err, err_len, "llama_model_load_from_file 失败（文件不存在或不是合法 GGUF）");
+        const auto detail = take_model_log();
+        set_err(err, err_len, detail.empty()
+            ? "llama_model_load_from_file failed; verify the GGUF architecture and tensor layout"
+            : detail.c_str());
         return nullptr;
     }
 
@@ -185,9 +679,21 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
     // 一旦传入的文本 token 数超过 n_ubatch，进程会被直接 abort（不是返回错误码），
     // 表现为「索引到某个长文档时窗口突然消失」。这里把 batch 拉到上下文长度上限，
     // 并在 ds_llama_embed 里按 n_batch 截断，保证永远不会越界。
-    const uint32_t batch_cap = std::max<uint32_t>(cparams.n_ctx, 512u);
-    cparams.n_batch = batch_cap;
-    cparams.n_ubatch = batch_cap;
+    const uint32_t sequence_context = std::max<uint32_t>(cparams.n_ctx, 512u);
+    // Encoder-style embedding models have no KV cache and can share one
+    // context across a larger number of independent sequence IDs. Causal
+    // GGUF models retain a conservative sequence count so we do not silently
+    // allocate dozens of full KV contexts.
+    const bool non_causal = !model->hparams.causal_attn;
+    const uint32_t max_sequences = non_causal ? kMaxBatchSequences : 4u;
+    cparams.n_seq_max = max_sequences;
+    // Non-causal EmbeddingGemma has no KV cache, so one 8192-token budget can
+    // be shared by all sequence IDs. Causal models retain a per-sequence
+    // context and a smaller sequence cap to bound KV memory.
+    cparams.kv_unified = non_causal;
+    cparams.n_ctx = non_causal ? sequence_context : sequence_context * max_sequences;
+    cparams.n_batch = sequence_context;
+    cparams.n_ubatch = sequence_context;
     // A zero thread setting means "automatic". The previous fallback of four
     // threads left tokenisation, prompt preparation and CPU-side kernels
     // underutilised on ordinary desktop CPUs. Keep an explicit user value
@@ -203,17 +709,65 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
     cparams.pooling_type = LLAMA_POOLING_TYPE_MEAN;
     cparams.offload_kqv = true;
 
+    mtmd_context *mmproj = nullptr;
+    std::string multimodal_detail = "同目录未找到 mmproj，当前仅支持文本";
+    const auto mmproj_path = find_mmproj(model_path);
+    if (mmproj_path) {
+        mtmd_context_params mmparams = mtmd_context_params_default();
+        mmparams.use_gpu = selected_device != nullptr;
+        mmparams.backend_device = selected_device ? ggml_backend_dev_name(selected_device) : nullptr;
+        mmparams.print_timings = false;
+        mmparams.warmup = false;
+        mmparams.n_threads = threads;
+        mmparams.image_max_tokens = 1120;
+        mmparams.batch_max_tokens = static_cast<int32_t>(cparams.n_batch);
+        mtmd_log_set(capture_model_log, nullptr);
+        const auto mmproj_utf8_path = mmproj_path->u8string();
+        mmproj = mtmd_init_from_file(mmproj_utf8_path.c_str(), model, mmparams);
+        if (mmproj) {
+            const bool has_vision = mtmd_support_vision(mmproj);
+            const bool has_audio = mtmd_support_audio(mmproj);
+            if (has_vision || has_audio) {
+                multimodal_detail = "已加载配套 mmproj";
+                if (has_vision) multimodal_detail += "，支持图像及视频抽帧";
+                if (has_audio) multimodal_detail += "，支持音频";
+            } else {
+                mtmd_free(mmproj);
+                mmproj = nullptr;
+                multimodal_detail = "mmproj 未声明可用的图像或音频编码器";
+            }
+        } else {
+            const auto detail = take_model_log();
+            multimodal_detail = "mmproj 加载失败";
+            if (!detail.empty()) multimodal_detail += "：" + detail;
+        }
+    }
+
     llama_context *ctx = llama_init_from_model(model, cparams);
     if (!ctx) {
+        if (mmproj) mtmd_free(mmproj);
         llama_model_free(model);
-        set_err(err, err_len, "llama_init_from_model 失败（显存不足或上下文参数不支持）");
+        const auto detail = take_model_log();
+        set_err(err, err_len, detail.empty()
+            ? "llama_init_from_model failed; available GPU memory or context settings may be insufficient"
+            : detail.c_str());
         return nullptr;
     }
 
     auto *h = new Handle();
-    h->model = model;
+    auto *shared = new SharedModel();
+    shared->model = model;
+    shared->path = model_path;
+    if (selected_device) shared->backend_device = ggml_backend_dev_name(selected_device);
+    h->shared = shared;
     h->ctx = ctx;
+    h->mtmd = mmproj;
     h->vocab = llama_model_get_vocab(model);
+    h->input_dim = llama_model_n_embd_inp(model);
+    h->max_sequences = max_sequences;
+    h->vision = mmproj && mtmd_support_vision(mmproj);
+    h->audio = mmproj && mtmd_support_audio(mmproj);
+    h->multimodal_detail = std::move(multimodal_detail);
     // 注意：要用 **输出** 维度，不是隐层维度。
     // EmbeddingGemma 2 的 embedding_length = 512、embedding_length_out = 768；
     // llama_get_embeddings* 返回的是投影后的 768 维向量，若按 512 拷贝就会
@@ -225,9 +779,125 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
     }
     if (h->dim <= 0) {
         llama_free(ctx);
-        llama_model_free(model);
+        release_shared_model(shared);
         delete h;
         set_err(err, err_len, "模型未报告 embedding 维度");
+        return nullptr;
+    }
+    return h;
+}
+
+// Create a second execution context against the same immutable llama_model.
+// Every context has independent llama/mtmd state; only the read-only model
+// weights are shared. This function never serializes inference calls.
+void *ds_llama_duplicate_context(void *source, int n_ctx, int n_threads,
+                                 int with_multimodal, char *err, int err_len) {
+    auto *parent = static_cast<Handle *>(source);
+    if (!parent || !parent->shared || !parent->shared->model) {
+        set_err(err, err_len, "shared GGUF model handle is invalid");
+        return nullptr;
+    }
+    auto *shared = parent->shared;
+    auto *model = shared->model;
+    const int threads = n_threads > 0
+        ? n_threads
+        : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = static_cast<uint32_t>(n_ctx > 0 ? n_ctx : 2048);
+    const uint32_t sequence_context = std::max<uint32_t>(cparams.n_ctx, 512u);
+    const bool non_causal = !model->hparams.causal_attn;
+    const uint32_t max_sequences = non_causal ? kMaxBatchSequences : 4u;
+    cparams.n_seq_max = max_sequences;
+    cparams.kv_unified = non_causal;
+    cparams.n_ctx = non_causal ? sequence_context : sequence_context * max_sequences;
+    cparams.n_batch = sequence_context;
+    cparams.n_ubatch = sequence_context;
+    cparams.n_threads = threads;
+    cparams.n_threads_batch = n_threads > 0
+        ? n_threads
+        : std::max(threads, std::min(threads * 2, 64));
+    cparams.embeddings = true;
+    cparams.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+    cparams.offload_kqv = true;
+
+    mtmd_context *mmproj = nullptr;
+    std::string detail = "text context; multimodal projection disabled";
+    if (with_multimodal) {
+        ggml_backend_dev_t selected_device = nullptr;
+        if (!shared->backend_device.empty()) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                auto candidate = ggml_backend_dev_get(i);
+                if (shared->backend_device == ggml_backend_dev_name(candidate)) {
+                    selected_device = candidate;
+                    break;
+                }
+            }
+        }
+        const auto mmproj_path = find_mmproj(shared->path.c_str());
+        detail = "same-folder mmproj not found; text only";
+        if (mmproj_path) {
+            mtmd_context_params mmparams = mtmd_context_params_default();
+            mmparams.use_gpu = selected_device != nullptr;
+            mmparams.backend_device = selected_device ? ggml_backend_dev_name(selected_device) : nullptr;
+            mmparams.print_timings = false;
+            mmparams.warmup = false;
+            mmparams.n_threads = threads;
+            mmparams.image_max_tokens = 1120;
+            mmparams.batch_max_tokens = static_cast<int32_t>(cparams.n_batch);
+            mtmd_log_set(capture_model_log, nullptr);
+            const auto path = mmproj_path->u8string();
+            mmproj = mtmd_init_from_file(path.c_str(), model, mmparams);
+            if (mmproj) {
+                const bool vision = mtmd_support_vision(mmproj);
+                const bool audio = mtmd_support_audio(mmproj);
+                if (vision || audio) {
+                    detail = "mmproj loaded";
+                    if (vision) detail += "; image and video frames supported";
+                    if (audio) detail += "; audio supported";
+                } else {
+                    mtmd_free(mmproj);
+                    mmproj = nullptr;
+                    detail = "mmproj has no usable image or audio encoder";
+                }
+            } else {
+                const auto log = take_model_log();
+                detail = "mmproj load failed";
+                if (!log.empty()) detail += ": " + log;
+            }
+        }
+    }
+
+    llama_context *ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        if (mmproj) mtmd_free(mmproj);
+        const auto log = take_model_log();
+        set_err(err, err_len, log.empty()
+            ? "llama_init_from_model failed for shared model context"
+            : log.c_str());
+        return nullptr;
+    }
+
+    auto *h = new Handle();
+    h->shared = shared;
+    retain_shared_model(shared);
+    h->ctx = ctx;
+    h->mtmd = mmproj;
+    h->vocab = llama_model_get_vocab(model);
+    h->input_dim = llama_model_n_embd_inp(model);
+    h->max_sequences = max_sequences;
+    h->vision = mmproj && mtmd_support_vision(mmproj);
+    h->audio = mmproj && mtmd_support_audio(mmproj);
+    h->multimodal_detail = std::move(detail);
+    h->n_batch = static_cast<int>(cparams.n_batch);
+    h->dim = llama_model_n_embd_out(model);
+    if (h->dim <= 0) h->dim = llama_model_n_embd(model);
+    if (h->dim <= 0) {
+        llama_free(ctx);
+        if (mmproj) mtmd_free(mmproj);
+        release_shared_model(shared);
+        delete h;
+        set_err(err, err_len, "model did not report an embedding dimension");
         return nullptr;
     }
     return h;
@@ -236,6 +906,211 @@ void *ds_llama_create(const char *model_path, int n_ctx, int n_threads,
 int ds_llama_dim(void *handle) {
     auto *h = static_cast<Handle *>(handle);
     return h ? h->dim : 0;
+}
+
+int ds_llama_capabilities(void *handle) {
+    auto *h = static_cast<Handle *>(handle);
+    if (!h) return 0;
+    int result = 1; // text
+    if (h->vision) result |= 2 | 8; // image and frame-based video
+    if (h->audio) result |= 4;
+    return result;
+}
+
+void ds_llama_detail(void *handle, char *out, int out_len) {
+    auto *h = static_cast<Handle *>(handle);
+    if (!h || !out || out_len <= 0) return;
+    std::snprintf(out, static_cast<size_t>(out_len), "%s", h->multimodal_detail.c_str());
+}
+
+int ds_llama_audio_sample_rate(void *handle) {
+    auto *h = static_cast<Handle *>(handle);
+    return h && h->mtmd && h->audio ? mtmd_get_audio_sample_rate(h->mtmd) : -1;
+}
+
+int ds_llama_embed_media(void *handle, const ds_llama_media_item *items, int count,
+                         float *out, int out_len, char *err, int err_len) {
+    auto *h = static_cast<Handle *>(handle);
+    if (!h || !h->ctx || !h->mtmd || !items || count <= 0 || !out || out_len < h->dim) {
+        set_err(err, err_len, "GGUF mmproj handle or media arguments are invalid");
+        return -1;
+    }
+    std::vector<mtmd_bitmap *> bitmaps;
+    bitmaps.reserve(static_cast<size_t>(count));
+    std::string prompt = "title: none | text: ";
+    int image_budget = 0;
+    auto free_bitmaps = [&] {
+        for (auto *bitmap : bitmaps) mtmd_bitmap_free(bitmap);
+        bitmaps.clear();
+    };
+    for (int i = 0; i < count; ++i) {
+        const auto &item = items[i];
+        mtmd_bitmap *bitmap = nullptr;
+        if (!item.data || item.length == 0) {
+            free_bitmaps();
+            set_err(err, err_len, "media item is empty");
+            return -1;
+        }
+        if (item.type == 1) {
+            if (!h->vision || item.width == 0 || item.height == 0 ||
+                item.length != static_cast<size_t>(item.width) * item.height * 3) {
+                free_bitmaps();
+                set_err(err, err_len, "GGUF mmproj does not support this RGB image input");
+                return -1;
+            }
+            if (item.token_budget > 0) {
+                if (image_budget != 0 && image_budget != item.token_budget) {
+                    free_bitmaps();
+                    set_err(err, err_len, "one mixed request must use a single image token budget");
+                    return -1;
+                }
+                image_budget = item.token_budget;
+            }
+            bitmap = mtmd_bitmap_init(item.width, item.height,
+                                      static_cast<const unsigned char *>(item.data));
+        } else if (item.type == 2) {
+            if (!h->audio) {
+                free_bitmaps();
+                set_err(err, err_len, "GGUF mmproj does not include an audio encoder");
+                return -1;
+            }
+            bitmap = mtmd_bitmap_init_from_audio(item.length, static_cast<const float *>(item.data));
+        } else {
+            free_bitmaps();
+            set_err(err, err_len, "unknown GGUF media type");
+            return -1;
+        }
+        if (!bitmap) {
+            free_bitmaps();
+            set_err(err, err_len, "failed to allocate mtmd bitmap");
+            return -1;
+        }
+        bitmaps.push_back(bitmap);
+        prompt += mtmd_get_marker(h->mtmd);
+        prompt.push_back('\n');
+    }
+    if (image_budget > 0) {
+        mtmd_set_image_max_tokens(h->mtmd, image_budget);
+    }
+    mtmd_input_chunks *chunks = mtmd_input_chunks_init();
+    if (!chunks) {
+        free_bitmaps();
+        set_err(err, err_len, "failed to allocate mtmd chunks");
+        return -1;
+    }
+    mtmd_input_text text{prompt.c_str(), prompt.size(), true, true};
+    std::vector<const mtmd_bitmap *> bitmap_views;
+    bitmap_views.reserve(bitmaps.size());
+    for (auto *bitmap : bitmaps) bitmap_views.push_back(bitmap);
+    const int32_t tokenize_result = mtmd_tokenize(
+        h->mtmd, chunks, &text, bitmap_views.data(), bitmap_views.size());
+    free_bitmaps();
+    if (tokenize_result != 0) {
+        mtmd_input_chunks_free(chunks);
+        set_err(err, err_len, "mtmd_tokenize failed to prepare the mixed media sequence");
+        return -1;
+    }
+    std::vector<float> input;
+    for (size_t index = 0; index < mtmd_input_chunks_size(chunks); ++index) {
+        const mtmd_input_chunk *chunk = mtmd_input_chunks_get(chunks, index);
+        const auto type = mtmd_input_chunk_get_type(chunk);
+        if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+            size_t token_count = 0;
+            const llama_token *tokens = mtmd_input_chunk_get_tokens_text(chunk, &token_count);
+            if (!tokens) {
+                mtmd_input_chunks_free(chunks);
+                set_err(err, err_len, "mtmd returned an invalid text chunk");
+                return -1;
+            }
+            for (size_t token = 0; token < token_count; ++token) {
+                if (input.size() / static_cast<size_t>(h->input_dim) >= static_cast<size_t>(h->n_batch) ||
+                    !append_embedding_row(h, tokens[token], input)) {
+                    mtmd_input_chunks_free(chunks);
+                    set_err(err, err_len, "failed to read a GGUF token embedding row or context is full");
+                    return -1;
+                }
+            }
+        } else {
+            if (mtmd_encode_chunk(h->mtmd, chunk) != 0) {
+                mtmd_input_chunks_free(chunks);
+                set_err(err, err_len, "mmproj failed to encode a media chunk");
+                return -1;
+            }
+            const size_t token_count = mtmd_input_chunk_get_n_tokens(chunk);
+            const float *media = mtmd_get_output_embd(h->mtmd);
+            const size_t current_tokens = input.size() / static_cast<size_t>(h->input_dim);
+            if (!media || token_count > static_cast<size_t>(h->n_batch) - current_tokens) {
+                mtmd_input_chunks_free(chunks);
+                char detail[200];
+                std::snprintf(detail, sizeof(detail),
+                    "projected media exceeds model context: chunk=%zu accumulated=%zu limit=%d data=%s",
+                    token_count, current_tokens, h->n_batch, media ? "present" : "missing");
+                set_err(err, err_len, detail);
+                return -1;
+            }
+            input.insert(input.end(), media, media + token_count * static_cast<size_t>(h->input_dim));
+        }
+    }
+    mtmd_input_chunks_free(chunks);
+    return run_embedding_input(h, input, out, err, err_len);
+}
+
+// Each item is an independent image, not a frame in one shared video sequence.
+// Project compatible images together, then pool separate text-model sequences.
+int ds_llama_embed_media_batch(void *handle, const ds_llama_media_item *items, int count,
+                               float *out, int out_stride, char *err, int err_len) {
+    auto *h = static_cast<Handle *>(handle);
+    if (!h || !h->ctx || !h->mtmd || !items || count <= 0 ||
+        count > static_cast<int>(h->max_sequences) || !out || out_stride < h->dim) {
+        set_err(err, err_len, "GGUF mmproj handle or media batch arguments are invalid");
+        return -1;
+    }
+    std::vector<MediaSequence> sequences(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        if (items[i].type != 1) {
+            set_err(err, err_len, "independent media batching currently accepts RGB images only");
+            return -1;
+        }
+        mtmd_set_image_max_tokens(h->mtmd, items[i].token_budget > 0 ? items[i].token_budget : 1120);
+        if (!prepare_media_sequence(h, items[i], sequences[static_cast<size_t>(i)], err, err_len)) {
+            return -1;
+        }
+    }
+    std::vector<MediaSequence *> pending;
+    pending.reserve(sequences.size());
+    for (auto &sequence : sequences) pending.push_back(&sequence);
+    if (!encode_media_batch(h, pending, err, err_len)) {
+        return -1;
+    }
+
+    std::vector<std::vector<float>> inputs;
+    inputs.reserve(sequences.size());
+    size_t tokens = 0;
+    int output_offset = 0;
+    for (auto &sequence : sequences) {
+        std::vector<float> input;
+        if (!build_media_embedding_input(h, sequence, input, err, err_len)) {
+            return -1;
+        }
+        const size_t item_tokens = input.size() / static_cast<size_t>(h->input_dim);
+        if (!inputs.empty() && tokens + item_tokens > static_cast<size_t>(h->n_batch)) {
+            const int written = run_embedding_inputs(h, inputs,
+                out + static_cast<size_t>(output_offset) * out_stride, out_stride, err, err_len);
+            if (written < 0) return -1;
+            output_offset += written;
+            inputs.clear();
+            tokens = 0;
+        }
+        tokens += item_tokens;
+        inputs.push_back(std::move(input));
+    }
+    if (!inputs.empty()) {
+        const int written = run_embedding_inputs(h, inputs,
+            out + static_cast<size_t>(output_offset) * out_stride, out_stride, err, err_len);
+        if (written < 0) return -1;
+        output_offset += written;
+    }
+    return output_offset;
 }
 
 // 对一段文本求 embedding。is_query != 0 时按查询侧处理。
@@ -337,6 +1212,121 @@ int ds_llama_embed(void *handle, const char *text, int is_query, float *out,
     return h->dim;
 }
 
+// Encode several independent texts in one llama.cpp batch. Every text gets a
+// separate sequence id, so the embedding context is shared without loading a
+// second model or serialising GPU work through repeated single-token calls.
+int ds_llama_embed_batch(void *handle, const char **texts, int count,
+                         float *out, int out_stride, char *err, int err_len) {
+    auto *h = static_cast<Handle *>(handle);
+    if (!h || !h->ctx || !h->vocab) {
+        set_err(err, err_len, "handle invalid");
+        return -1;
+    }
+    if (!texts || count <= 0 || count > static_cast<int>(h->max_sequences) || !out || out_stride < h->dim) {
+        set_err(err, err_len, "invalid batch arguments");
+        return -1;
+    }
+
+    std::vector<std::vector<llama_token>> token_lists;
+    token_lists.reserve(static_cast<size_t>(count));
+    size_t total_tokens = 0;
+    for (int i = 0; i < count; ++i) {
+        const char *body = texts[i] ? texts[i] : "";
+        if (!*body) {
+            set_err(err, err_len, "text is empty");
+            return -1;
+        }
+        std::string src = "title: none | text: ";
+        src += body;
+        int32_t n = llama_tokenize(h->vocab, src.c_str(), static_cast<int32_t>(src.size()),
+                                   nullptr, 0, true, false);
+        if (n == INT32_MIN) {
+            set_err(err, err_len, "tokenization overflow");
+            return -1;
+        }
+        if (n < 0) n = -n;
+        if (n <= 0) {
+            set_err(err, err_len, "tokenization returned no tokens");
+            return -1;
+        }
+        std::vector<llama_token> tokens(static_cast<size_t>(n));
+        const int32_t got = llama_tokenize(h->vocab, src.c_str(), static_cast<int32_t>(src.size()),
+                                           tokens.data(), n, true, false);
+        if (got <= 0) {
+            set_err(err, err_len, "tokenization failed");
+            return -1;
+        }
+        tokens.resize(static_cast<size_t>(got));
+        if (h->n_batch > 0 && tokens.size() > static_cast<size_t>(h->n_batch)) {
+            set_err(err, err_len, "one text exceeds the model batch context");
+            return -1;
+        }
+        total_tokens += tokens.size();
+        token_lists.push_back(std::move(tokens));
+    }
+    if (h->n_batch > 0 && total_tokens > static_cast<size_t>(h->n_batch)) {
+        set_err(err, err_len, "batch exceeds the model context");
+        return -1;
+    }
+
+    llama_batch batch = llama_batch_init(static_cast<int32_t>(total_tokens), 0, count);
+    if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+        llama_batch_free(batch);
+        set_err(err, err_len, "failed to allocate llama batch");
+        return -1;
+    }
+    batch.n_tokens = static_cast<int32_t>(total_tokens);
+    size_t cursor = 0;
+    for (int i = 0; i < count; ++i) {
+        const auto &tokens = token_lists[static_cast<size_t>(i)];
+        for (size_t pos = 0; pos < tokens.size(); ++pos, ++cursor) {
+            batch.token[cursor] = tokens[pos];
+            batch.pos[cursor] = static_cast<llama_pos>(pos);
+            batch.n_seq_id[cursor] = 1;
+            // llama_batch_init owns each seq_id array and llama_batch_free
+            // releases it. Write into that allocation instead of replacing
+            // the pointer with a temporary vector address.
+            batch.seq_id[cursor][0] = static_cast<llama_seq_id>(i);
+            batch.logits[cursor] = pos + 1 == tokens.size() ? 1 : 0;
+        }
+    }
+
+    const auto clear_context = [h]() {
+        llama_memory_t mem = llama_get_memory(h->ctx);
+        if (mem) llama_memory_clear(mem, true);
+    };
+    const int32_t rc = llama_decode(h->ctx, batch);
+    if (rc != 0) {
+        llama_batch_free(batch);
+        clear_context();
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "llama_decode returned %d", rc);
+        set_err(err, err_len, buf);
+        return -1;
+    }
+    for (int i = 0; i < count; ++i) {
+        float *emb = llama_get_embeddings_seq(h->ctx, static_cast<llama_seq_id>(i));
+        if (!emb) {
+            llama_batch_free(batch);
+            clear_context();
+            set_err(err, err_len, "model returned no sequence embedding");
+            return -1;
+        }
+        double sum = 0.0;
+        for (int j = 0; j < h->dim; ++j) {
+            sum += static_cast<double>(emb[j]) * static_cast<double>(emb[j]);
+        }
+        const double norm = std::sqrt(sum);
+        const float inv = norm > 1e-12 ? static_cast<float>(1.0 / norm) : 0.0f;
+        for (int j = 0; j < h->dim; ++j) {
+            out[static_cast<size_t>(i) * static_cast<size_t>(out_stride) + static_cast<size_t>(j)] = emb[j] * inv;
+        }
+    }
+    llama_batch_free(batch);
+    clear_context();
+    return count;
+}
+
 void ds_llama_free(void *handle) {
     auto *h = static_cast<Handle *>(handle);
     if (!h) {
@@ -345,9 +1335,10 @@ void ds_llama_free(void *handle) {
     if (h->ctx) {
         llama_free(h->ctx);
     }
-    if (h->model) {
-        llama_model_free(h->model);
+    if (h->mtmd) {
+        mtmd_free(h->mtmd);
     }
+    release_shared_model(h->shared);
     delete h;
 }
 

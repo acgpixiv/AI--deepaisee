@@ -35,6 +35,8 @@ const dataDir = ref("");
 const watchRootsText = ref("");
 const excludeDirsText = ref("");
 const loading = ref(false);
+const clearConfirmOpen = ref(false);
+const clearBusy = ref(false);
 
 const newRule = ref<Rule>({
   id: 0,
@@ -97,6 +99,11 @@ async function saveFileConfig(): Promise<boolean> {
     index: {
       max_text_chars: cfg.value.index.max_text_chars,
       image_max_side: cfg.value.index.image_max_side,
+      image_token_budget: cfg.value.index.image_token_budget,
+      pdf_image_token_budget: cfg.value.index.pdf_image_token_budget,
+      video_token_budget: cfg.value.index.video_token_budget,
+      vision_encoder: cfg.value.index.vision_encoder,
+      audio_encoder: cfg.value.index.audio_encoder,
       video_frames: cfg.value.index.video_frames,
       video_frame_interval: cfg.value.index.video_frame_interval,
       video_max_frames: cfg.value.index.video_max_frames,
@@ -123,6 +130,8 @@ async function saveFileConfig(): Promise<boolean> {
 /** 通用配置：界面、启动行为和「工作区」目录。 */
 async function saveGeneralConfig(): Promise<boolean> {
   if (!cfg.value) return false;
+  const startupScope = String(cfg.value.workspace?.startup_scope ?? "remember");
+  const startupPath = String(cfg.value.workspace?.startup_path ?? "");
   const ok = await savePatch({
     ui: {
       language: cfg.value.ui.language,
@@ -133,6 +142,11 @@ async function saveGeneralConfig(): Promise<boolean> {
       auto_scan_on_start: cfg.value.ui.auto_scan_on_start,
       notify_file_changes: cfg.value.ui.notify_file_changes,
       default_search_mode: cfg.value.ui.default_search_mode,
+      professional_mode: cfg.value.ui.professional_mode,
+    },
+    model: {
+      parallel_mode: cfg.value.model.parallel_mode,
+      parallel_threads: cfg.value.model.parallel_threads,
     },
     workspace: {
       dirs: (cfg.value.workspace?.dirs as string[]) ?? [],
@@ -140,8 +154,23 @@ async function saveGeneralConfig(): Promise<boolean> {
       live_extract: cfg.value.workspace?.live_extract ?? true,
       max_file_mb: cfg.value.workspace?.max_file_mb ?? 64,
       depth: cfg.value.workspace?.depth ?? 4,
+      recent_paths: (cfg.value.workspace?.recent_paths as string[]) ?? [],
+      pinned_paths: (cfg.value.workspace?.pinned_paths as string[]) ?? [],
+      startup_scope: cfg.value.workspace?.startup_scope ?? "remember",
+      startup_path: cfg.value.workspace?.startup_path ?? "",
+      last_scope: cfg.value.workspace?.last_scope ?? "indexed",
+      last_path: cfg.value.workspace?.last_path ?? "",
     },
   }, "通用设置已保存");
+  if (ok) {
+    try {
+      const workspace = await api.workspaceSetStartup(startupScope, startupPath || undefined);
+      if (cfg.value) cfg.value.workspace = { ...cfg.value.workspace, ...workspace };
+    } catch {
+      toast(t("保存启动搜索范围失败"), "error");
+      return false;
+    }
+  }
   // 注意：必须传入 ui，否则 applyAppearance 会用默认值（system / zh）把刚保存的语言和主题覆盖掉。
   if (ok) await applyAppearance(cfg.value?.ui);
   return ok;
@@ -158,6 +187,7 @@ async function saveModelConfig(): Promise<boolean> {
       context_size: cfg.value.model.context_size,
       auto_load: cfg.value.model.auto_load,
       parallel_mode: cfg.value.model.parallel_mode,
+      parallel_threads: cfg.value.model.parallel_threads,
       clip_dir: cfg.value.model.clip_dir,
       clip_enabled: cfg.value.model.clip_enabled,
       clap_dir: cfg.value.model.clap_dir,
@@ -276,13 +306,22 @@ async function vacuum() {
 }
 
 async function clearAll() {
-  if (!confirm(t("确定清空全部索引？文件本身不会被删除。"))) return;
+  if (clearBusy.value) return;
+  clearConfirmOpen.value = true;
+}
+
+async function confirmClearAll() {
+  if (clearBusy.value) return;
+  clearBusy.value = true;
   try {
     await api.dbClear();
+    clearConfirmOpen.value = false;
     toast(t("索引已清空"), "ok");
     await refreshStats();
   } catch (error) {
     toast(`${t("清空失败：")}${error}`, "error");
+  } finally {
+    clearBusy.value = false;
   }
 }
 
@@ -376,6 +415,18 @@ onMounted(load);
         <SettingsExtensionTab v-if="activeTab === 'extensions'" />
       </div>
     </section>
+
+    <div v-if="clearConfirmOpen" class="clear-modal-backdrop" role="presentation" @click.self="clearConfirmOpen = false">
+      <section class="clear-modal" role="dialog" aria-modal="true" :aria-label="t('确认清空索引')">
+        <button class="clear-modal-close" type="button" :title="t('关闭')" @click="clearConfirmOpen = false">×</button>
+        <h2>{{ t("确认清空索引") }}</h2>
+        <p>{{ t("这会删除本地索引、正文和向量数据，但不会删除原始文件。清空后需要重新建立索引。") }}</p>
+        <div class="clear-modal-actions">
+          <button type="button" class="secondary-button" :disabled="clearBusy" @click="clearConfirmOpen = false">{{ t("取消") }}</button>
+          <button type="button" class="clear-danger-button" :disabled="clearBusy" @click="confirmClearAll">{{ clearBusy ? t("正在清空…") : t("确认清空") }}</button>
+        </div>
+      </section>
+    </div>
   </div>
 </template>
 
@@ -397,6 +448,14 @@ onMounted(load);
 .settings-main-head p { margin: 6px 0 0; color: #849087; font-size: 12px; }
 .settings-scroll { flex: 1; min-height: 0; overflow: auto; padding: 18px clamp(18px, 4vw, 58px) 38px; }
 .settings-loading { display: grid; place-items: center; flex: 1; color: var(--muted); font-size: 12px; }
+.clear-modal-backdrop { position: fixed; inset: 0; z-index: 400; display: grid; place-items: center; padding: 18px; background: rgba(0,0,0,.35); backdrop-filter: blur(5px); }
+.clear-modal { position: relative; width: min(470px, calc(100vw - 36px)); padding: 24px; border: 2px solid #b52525; border-radius: 4px; background: #fff; color: #111; box-shadow: 0 20px 55px rgba(0,0,0,.24); }
+.clear-modal h2 { margin: 0 0 10px; font-size: 18px; color: #8f1d1d; }
+.clear-modal p { margin: 0; color: #333; font-size: 12px; line-height: 1.7; }
+.clear-modal-close { position: absolute; top: 8px; right: 10px; padding: 0 3px; border: 0; background: transparent; color: #8f1d1d; font-size: 22px; line-height: 1; }
+.clear-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; }
+.clear-danger-button { padding: 7px 14px; border: 1px solid #b52525; border-radius: 2px; background: #fff; color: #b52525; }
+.clear-danger-button:hover { background: #fff0f0; }
 .settings-scroll :deep(.embedded-view) { height: auto; min-height: 0; margin-bottom: 16px; }
 .settings-scroll :deep(.embedded-view .view) { height: auto; min-height: 0; overflow: visible; }
 .settings-scroll :deep(.embedded-view .list) { flex: none; min-height: 0; max-height: none; overflow: visible; }
@@ -407,6 +466,88 @@ onMounted(load);
 .settings-scroll :deep(.form-grid) { display: grid; gap: 12px; }
 .settings-scroll :deep(.form-grid.three) { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .settings-scroll :deep(label) { display: flex; flex-direction: column; gap: 6px; color: #9aa59d; font-size: 11px; }
+.settings-scroll :deep(.check-label),
+.settings-scroll :deep(.extension-chip) {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+.settings-scroll :deep(.extension-chip) {
+  display: inline-flex;
+  width: auto;
+  white-space: nowrap;
+}
+.settings-scroll :deep(label.extension-chip) {
+  display: inline-flex;
+  flex-direction: row !important;
+  align-items: center;
+  justify-content: flex-start;
+  width: auto;
+  min-height: 18px;
+  white-space: nowrap;
+}
+.settings-scroll :deep(.extension-chip input[type="checkbox"]) {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  padding: 0;
+  margin: 0;
+  border: 1px solid #111;
+  border-radius: 0;
+  background: #fff;
+  accent-color: transparent;
+  color: #fff;
+}
+.settings-scroll :deep(.extension-chip input[type="checkbox"]:checked) {
+  background: #111;
+}
+.settings-scroll :deep(.extension-chip input[type="checkbox"]:checked::after) {
+  width: auto;
+  height: auto;
+  border: 0;
+  transform: none;
+  content: "✓";
+  display: block;
+  color: #fff;
+  text-align: center;
+  font-size: 11px;
+  line-height: 12px;
+  font-weight: 700;
+}
+.settings-scroll :deep(.switch-row input[type="checkbox"]),
+.settings-scroll :deep(.check-label input[type="checkbox"]) {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  margin: 0;
+  border: 1px solid #111;
+  border-radius: 0;
+  background: #fff;
+  accent-color: transparent;
+  color: #fff;
+}
+.settings-scroll :deep(.switch-row input[type="checkbox"]:checked),
+.settings-scroll :deep(.check-label input[type="checkbox"]:checked) {
+  background: #111;
+}
+.settings-scroll :deep(.switch-row input[type="checkbox"]:checked::after),
+.settings-scroll :deep(.check-label input[type="checkbox"]:checked::after) {
+  width: auto;
+  height: auto;
+  border: 0;
+  transform: none;
+  content: "✓";
+  display: block;
+  color: #fff;
+  text-align: center;
+  font-size: 12px;
+  line-height: 14px;
+  font-weight: 700;
+}
 .settings-scroll :deep(label small) { color: var(--muted); font-size: 10px; line-height: 1.35; }
 .settings-scroll :deep(label input), .settings-scroll :deep(label select), .settings-scroll :deep(textarea) { width: 100%; min-width: 0; }
 .settings-scroll :deep(textarea) { resize: vertical; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; color: var(--text); font: inherit; outline: none; }

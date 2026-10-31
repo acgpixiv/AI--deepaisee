@@ -6,10 +6,24 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::sync::Mutex;
 
+use rayon::prelude::*;
+
 use super::{l2_normalize, EmbedInfo, Embedder};
+
+const MAX_NATIVE_BATCH_SEQUENCES: usize = 32;
 
 #[allow(non_camel_case_types)]
 type c_void = std::ffi::c_void;
+
+#[repr(C)]
+struct NativeMediaItem {
+    kind: c_int,
+    data: *const c_void,
+    length: usize,
+    width: u32,
+    height: u32,
+    token_budget: c_int,
+}
 
 extern "C" {
     fn ds_llama_create(
@@ -17,6 +31,14 @@ extern "C" {
         n_ctx: c_int,
         n_threads: c_int,
         device_name: *const c_char,
+        err: *mut c_char,
+        err_len: c_int,
+    ) -> *mut c_void;
+    fn ds_llama_duplicate_context(
+        source: *mut c_void,
+        n_ctx: c_int,
+        n_threads: c_int,
+        with_multimodal: c_int,
         err: *mut c_char,
         err_len: c_int,
     ) -> *mut c_void;
@@ -38,12 +60,42 @@ extern "C" {
         device_type: *mut c_int,
     ) -> c_int;
     fn ds_llama_dim(handle: *mut c_void) -> c_int;
+    fn ds_llama_capabilities(handle: *mut c_void) -> c_int;
+    fn ds_llama_detail(handle: *mut c_void, out: *mut c_char, out_len: c_int);
+    fn ds_llama_audio_sample_rate(handle: *mut c_void) -> c_int;
+    fn ds_llama_embed_media(
+        handle: *mut c_void,
+        items: *const NativeMediaItem,
+        count: c_int,
+        out: *mut f32,
+        out_len: c_int,
+        err: *mut c_char,
+        err_len: c_int,
+    ) -> c_int;
+    fn ds_llama_embed_media_batch(
+        handle: *mut c_void,
+        items: *const NativeMediaItem,
+        count: c_int,
+        out: *mut f32,
+        out_stride: c_int,
+        err: *mut c_char,
+        err_len: c_int,
+    ) -> c_int;
     fn ds_llama_embed(
         handle: *mut c_void,
         text: *const c_char,
         is_query: c_int,
         out: *mut f32,
         out_len: c_int,
+        err: *mut c_char,
+        err_len: c_int,
+    ) -> c_int;
+    fn ds_llama_embed_batch(
+        handle: *mut c_void,
+        texts: *const *const c_char,
+        count: c_int,
+        out: *mut f32,
+        out_stride: c_int,
         err: *mut c_char,
         err_len: c_int,
     ) -> c_int;
@@ -229,7 +281,6 @@ fn error_message(err: &[u8]) -> String {
 struct Handle(*mut c_void);
 
 unsafe impl Send for Handle {}
-unsafe impl Sync for Handle {}
 
 impl Drop for Handle {
     fn drop(&mut self) {
@@ -241,11 +292,17 @@ impl Drop for Handle {
 }
 
 pub struct LlamaEmbedder {
-    handle: Mutex<Handle>,
+    text_handle: Mutex<Handle>,
+    media_handle: Mutex<Handle>,
     dim: usize,
     context_tokens: usize,
     model_name: String,
     device: String,
+}
+
+fn native_media_error(err: &[u8], fallback: &str) -> String {
+    let detail = c_buf_string(err);
+    if detail.is_empty() { fallback.to_string() } else { detail }
 }
 
 impl LlamaEmbedder {
@@ -300,14 +357,14 @@ impl LlamaEmbedder {
                 .max(1)
         };
         let mut err = vec![0u8; 512];
-        let raw = create_handle(
+        let media_raw = create_handle(
             c_path.as_ptr(),
             n_ctx,
             effective_threads,
             device_name.as_ref(),
             &mut err,
         );
-        if raw.is_null() {
+        if media_raw.is_null() {
             let msg = error_message(&err);
             let target = selected
                 .as_ref()
@@ -315,9 +372,28 @@ impl LlamaEmbedder {
                 .unwrap_or_else(|| "CPU".into());
             return Err(format!("在 {target} 上加载 GGUF 失败：{msg}"));
         }
-        let dim = unsafe { ds_llama_dim(raw) };
+        let mut text_err = vec![0u8; 512];
+        let text_raw = unsafe {
+            ds_llama_duplicate_context(
+                media_raw,
+                n_ctx,
+                effective_threads,
+                0,
+                text_err.as_mut_ptr() as *mut c_char,
+                text_err.len() as c_int,
+            )
+        };
+        if text_raw.is_null() {
+            let message = error_message(&text_err);
+            unsafe { ds_llama_free(media_raw) };
+            return Err(format!("Creating dedicated GGUF text context failed: {message}"));
+        }
+        let dim = unsafe { ds_llama_dim(media_raw) };
         if dim <= 0 {
-            unsafe { ds_llama_free(raw) };
+            unsafe {
+                ds_llama_free(text_raw);
+                ds_llama_free(media_raw);
+            }
             return Err("模型未报告 embedding 维度".into());
         }
         let name = std::path::Path::new(model_path)
@@ -325,7 +401,8 @@ impl LlamaEmbedder {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "gguf".into());
         Ok(Self {
-            handle: Mutex::new(Handle(raw)),
+            text_handle: Mutex::new(Handle(text_raw)),
+            media_handle: Mutex::new(Handle(media_raw)),
             dim: dim as usize,
             context_tokens: n_ctx.max(256) as usize,
             model_name: name,
@@ -337,7 +414,7 @@ impl LlamaEmbedder {
         let c_text = CString::new(text).map_err(|_| "文本含 NUL 字节".to_string())?;
         let mut out = vec![0f32; self.dim];
         let mut err = vec![0u8; 512];
-        let guard = self.handle.lock().unwrap();
+        let guard = self.text_handle.lock().unwrap();
         let n = unsafe {
             ds_llama_embed(
                 guard.0,
@@ -359,23 +436,189 @@ impl LlamaEmbedder {
         l2_normalize(&mut v);
         Ok(v)
     }
+
+    fn embed_native_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let c_texts: Vec<CString> = texts
+            .iter()
+            .map(|text| CString::new(text.as_str()).map_err(|_| "文本含 NUL 字节".to_string()))
+            .collect::<Result<_, _>>()?;
+        let pointers: Vec<*const c_char> = c_texts.iter().map(|text| text.as_ptr()).collect();
+        let mut output = vec![0.0f32; texts.len() * self.dim];
+        let mut err = vec![0u8; 512];
+        let guard = self.text_handle.lock().unwrap();
+        let n = unsafe {
+            ds_llama_embed_batch(
+                guard.0,
+                pointers.as_ptr(),
+                pointers.len() as c_int,
+                output.as_mut_ptr(),
+                self.dim as c_int,
+                err.as_mut_ptr() as *mut c_char,
+                err.len() as c_int,
+            )
+        };
+        if n < 0 || n as usize != texts.len() {
+            let detail = unsafe { CStr::from_ptr(err.as_ptr() as *const c_char) }
+                .to_string_lossy()
+                .to_string();
+            return Err(if detail.is_empty() { "GGUF 批处理失败".into() } else { detail });
+        }
+        Ok(output
+            .chunks_exact(self.dim)
+            .map(|chunk| chunk.to_vec())
+            .collect())
+    }
+
+    fn embed_native_media(&self, items: &[NativeMediaItem]) -> Result<Vec<f32>, String> {
+        if items.is_empty() { return Err("没有可编码的媒体输入".into()); }
+        let mut output = vec![0.0f32; self.dim];
+        let mut err = vec![0u8; 1024];
+        let guard = self.media_handle.lock().map_err(|error| error.to_string())?;
+        let n = unsafe {
+            ds_llama_embed_media(guard.0, items.as_ptr(), items.len() as c_int,
+                output.as_mut_ptr(), output.len() as c_int,
+                err.as_mut_ptr() as *mut c_char, err.len() as c_int)
+        };
+        if n < 0 || n as usize != self.dim {
+            return Err(native_media_error(&err, "GGUF mmproj 媒体编码失败"));
+        }
+        l2_normalize(&mut output);
+        Ok(output)
+    }
+
+    fn embed_native_media_batch(
+        &self,
+        images: &[Vec<u8>],
+        widths: &[u32],
+        heights: &[u32],
+        token_budget: c_int,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        if images.is_empty() || images.len() != widths.len() || images.len() != heights.len() {
+            return Err("GGUF 媒体批次参数不一致".into());
+        }
+        let items: Vec<NativeMediaItem> = images
+            .iter()
+            .zip(widths.iter().zip(heights))
+            .map(|(data, (&width, &height))| NativeMediaItem {
+                kind: 1,
+                data: data.as_ptr() as *const c_void,
+                length: data.len(),
+                width,
+                height,
+                token_budget,
+            })
+            .collect();
+        let mut output = vec![0.0f32; images.len() * self.dim];
+        let mut err = vec![0u8; 1024];
+        let guard = self.media_handle.lock().map_err(|error| error.to_string())?;
+        let n = unsafe {
+            ds_llama_embed_media_batch(
+                guard.0,
+                items.as_ptr(),
+                items.len() as c_int,
+                output.as_mut_ptr(),
+                self.dim as c_int,
+                err.as_mut_ptr() as *mut c_char,
+                err.len() as c_int,
+            )
+        };
+        if n < 0 || n as usize != images.len() {
+            return Err(native_media_error(&err, "GGUF 图片批量编码失败"));
+        }
+        Ok(output
+            .chunks_exact(self.dim)
+            .map(|chunk| {
+                let mut vector = chunk.to_vec();
+                l2_normalize(&mut vector);
+                vector
+            })
+            .collect())
+    }
+
+    fn embed_rgb_batch(
+        &self,
+        images: &[image::RgbImage],
+        token_budget: c_int,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let data: Vec<Vec<u8>> = images.iter().map(|image| image.as_raw().clone()).collect();
+        let widths: Vec<u32> = images.iter().map(|image| image.width()).collect();
+        let heights: Vec<u32> = images.iter().map(|image| image.height()).collect();
+        self.embed_native_media_batch(&data, &widths, &heights, token_budget)
+    }
+
+    fn embed_image_data_refs_batch(
+        &self,
+        images: &[&image::DynamicImage],
+        token_budget: c_int,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        // The projector and encoder share the model's 8192-token budget. Leave
+        // room for the text prefix and avoid oversized mtmd graphs for high
+        // resolution standalone images.
+        let per_image = (self.context_tokens / (token_budget.max(1) as usize + 32))
+            .clamp(1, 32);
+        let mut output = Vec::with_capacity(images.len());
+        for group in images.chunks(per_image) {
+            let rgb: Vec<image::RgbImage> = group
+                .par_iter()
+                .map(|image| image.to_rgb8())
+                .collect();
+            output.extend(self.embed_rgb_batch(&rgb, token_budget)?);
+        }
+        Ok(output)
+    }
+
+    fn embed_text_batch_adaptive(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        match self.embed_native_batch(texts) {
+            Ok(vectors) => Ok(vectors),
+            Err(_) if texts.len() > 1 => {
+                let middle = texts.len() / 2;
+                let mut first = self.embed_text_batch_adaptive(&texts[..middle])?;
+                first.extend(self.embed_text_batch_adaptive(&texts[middle..])?);
+                Ok(first)
+            }
+            Err(_) => texts
+                .iter()
+                .map(|text| self.embed_one(text, false))
+                .collect(),
+        }
+    }
+
+    fn audio_sample_rate(&self) -> u32 {
+        let guard = self.media_handle.lock().unwrap();
+        let rate = unsafe { ds_llama_audio_sample_rate(guard.0) };
+        if rate > 0 { rate as u32 } else { 16_000 }
+    }
 }
 
 impl Embedder for LlamaEmbedder {
     fn info(&self) -> EmbedInfo {
+        let (capabilities, detail) = {
+            let guard = self.media_handle.lock().unwrap();
+            let mut buffer = vec![0u8; 512];
+            let capabilities = unsafe { ds_llama_capabilities(guard.0) };
+            unsafe { ds_llama_detail(guard.0, buffer.as_mut_ptr() as *mut c_char, buffer.len() as c_int) };
+            (capabilities, c_buf_string(&buffer))
+        };
+        let mut modalities = vec!["text".into()];
+        if capabilities & 2 != 0 { modalities.push("image".into()); }
+        if capabilities & 4 != 0 { modalities.push("audio".into()); }
+        if capabilities & 8 != 0 { modalities.push("video".into()); }
         EmbedInfo {
             backend: "llama.cpp".into(),
             model: self.model_name.clone(),
             dim: self.dim,
             device: self.device.clone(),
-            // llama.cpp 只处理文本；图片/音频/视频由 hash 兜底
-            modalities: vec!["text".into()],
+            // The native mtmd path reports the actual projector capabilities;
+            // models without a matching mmproj remain text-only.
+            modalities,
             ready: true,
-            detail: if self.device.eq_ignore_ascii_case("cpu") {
-                "llama.cpp GGUF · CPU 推理（没有可用加速后端）".to_string()
-            } else {
-                format!("llama.cpp GGUF · {} · 全部模型层运行于 GPU", self.device)
-            },
+            detail: format!("llama.cpp GGUF · {} · {}", self.device, if detail.is_empty() { "文本" } else { detail.as_str() }),
         }
     }
 
@@ -395,8 +638,11 @@ impl Embedder for LlamaEmbedder {
 
     fn embed_text_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
         const OVERLAP_CHARS: usize = 128;
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
         let max_chars = self.context_tokens.saturating_div(2).max(128);
-        let mut result = Vec::with_capacity(texts.len());
+        let mut chunks_by_text = Vec::with_capacity(texts.len());
         for text in texts {
             let chars: Vec<char> = text.chars().collect();
             let mut chunks = Vec::new();
@@ -413,34 +659,149 @@ impl Embedder for LlamaEmbedder {
                     start = end.saturating_sub(OVERLAP_CHARS);
                 }
             }
-            let mut merged = vec![0.0f32; self.dim];
-            for chunk in &chunks {
-                let vector = self.embed_one(chunk, false)?;
-                for (dst, value) in merged.iter_mut().zip(vector) {
-                    *dst += value;
-                }
-            }
-            let count = chunks.len() as f32;
-            for value in &mut merged {
-                *value /= count;
-            }
-            l2_normalize(&mut merged);
-            result.push(merged);
+            chunks_by_text.push(chunks);
         }
-        Ok(result)
+
+        let mut flat_chunks = Vec::new();
+        let mut owners = Vec::new();
+        for (owner, chunks) in chunks_by_text.iter().enumerate() {
+            for chunk in chunks {
+                owners.push(owner);
+                flat_chunks.push(chunk.clone());
+            }
+        }
+        let mut sums = vec![vec![0.0f32; self.dim]; texts.len()];
+        let mut counts = vec![0usize; texts.len()];
+        let mut start = 0usize;
+        while start < flat_chunks.len() {
+            let mut end = start;
+            let mut estimated_tokens = 0usize;
+            while end < flat_chunks.len() && end - start < MAX_NATIVE_BATCH_SEQUENCES {
+                let cost = flat_chunks[end].chars().count().saturating_add(32);
+                if end > start && estimated_tokens.saturating_add(cost) > self.context_tokens {
+                    break;
+                }
+                estimated_tokens = estimated_tokens.saturating_add(cost);
+                end += 1;
+            }
+            let vectors = self.embed_text_batch_adaptive(&flat_chunks[start..end])?;
+            for (offset, vector) in vectors.into_iter().enumerate() {
+                let owner = owners[start + offset];
+                for (sum, value) in sums[owner].iter_mut().zip(vector) {
+                    *sum += value;
+                }
+                counts[owner] += 1;
+            }
+            start = end;
+        }
+
+        for (sum, count) in sums.iter_mut().zip(counts) {
+            if count == 0 {
+                return Err("文档没有可编码的文本片段".into());
+            }
+            for value in &mut *sum {
+                *value /= count as f32;
+            }
+            l2_normalize(sum);
+        }
+        Ok(sums)
     }
 
-    fn embed_image(&self, _path: &std::path::Path) -> Result<Vec<f32>, String> {
-        Err("llama.cpp 后端不支持图片，请改用哈希基线".into())
+    fn embed_image(&self, path: &std::path::Path) -> Result<Vec<f32>, String> {
+        let image = image::open(path).map_err(|error| format!("图片读取失败：{error}"))?;
+        self.embed_image_data(&image)
     }
 
-    fn embed_audio(&self, _path: &std::path::Path) -> Result<Vec<f32>, String> {
-        Err("llama.cpp 后端不支持音频，请改用哈希基线".into())
+    fn embed_image_data(&self, image: &image::DynamicImage) -> Result<Vec<f32>, String> {
+        let rgb = image.to_rgb8();
+        let item = NativeMediaItem { kind: 1, data: rgb.as_ptr() as *const c_void,
+            length: rgb.len(), width: rgb.width(), height: rgb.height(), token_budget: 1120 };
+        self.embed_native_media(std::slice::from_ref(&item))
     }
 
-    fn embed_video(&self, _path: &std::path::Path) -> Result<Vec<f32>, String> {
-        Err("llama.cpp 后端不支持视频，请改用哈希基线".into())
+    fn embed_pdf_image_data(&self, image: &image::DynamicImage) -> Result<Vec<f32>, String> {
+        let rgb = image.to_rgb8();
+        let item = NativeMediaItem { kind: 1, data: rgb.as_ptr() as *const c_void,
+            length: rgb.len(), width: rgb.width(), height: rgb.height(), token_budget: 280 };
+        self.embed_native_media(std::slice::from_ref(&item))
     }
+
+    fn embed_image_batch(&self, paths: &[&std::path::Path]) -> Result<Vec<Vec<f32>>, String> {
+        let images: Vec<image::DynamicImage> = paths
+            .par_iter()
+            .map(|path| image::open(path).map_err(|error| format!("图片读取失败：{error}")))
+            .collect::<Result<_, _>>()?;
+        let refs: Vec<&image::DynamicImage> = images.iter().collect();
+        self.embed_image_data_refs_batch(&refs, 1120)
+    }
+
+    fn embed_image_data_batch(
+        &self,
+        images: &[&image::DynamicImage],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        self.embed_image_data_refs_batch(images, 1120)
+    }
+
+    fn embed_pdf_image_data_batch(
+        &self,
+        images: &[&image::DynamicImage],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        self.embed_image_data_refs_batch(images, 280)
+    }
+
+    fn embed_audio(&self, path: &std::path::Path) -> Result<Vec<f32>, String> {
+        let samples = crate::media::load_audio_at_rate(path, 30.0, self.audio_sample_rate())
+            .ok_or("音频解码失败（需要 ffmpeg）")?;
+        let item = NativeMediaItem { kind: 2, data: samples.as_ptr() as *const c_void,
+            length: samples.len(), width: 0, height: 0, token_budget: 0 };
+        self.embed_native_media(std::slice::from_ref(&item))
+    }
+
+    fn embed_video(&self, path: &std::path::Path) -> Result<Vec<f32>, String> {
+        let vectors = self.embed_video_segments(path)?;
+        let mut merged = vec![0.0f32; self.dim];
+        for vector in &vectors { for (dst, value) in merged.iter_mut().zip(vector) { *dst += value; } }
+        let count = vectors.len() as f32;
+        for value in &mut merged { *value /= count; }
+        l2_normalize(&mut merged);
+        Ok(merged)
+    }
+
+    fn embed_video_segments(&self, path: &std::path::Path) -> Result<Vec<Vec<f32>>, String> {
+        let duration = crate::media::video_duration(path).unwrap_or(0.0).max(0.1);
+        let mut vectors = Vec::new();
+        let mut start = 0.0f64;
+        while start < duration {
+            let window = (duration - start).min(30.0);
+            let frame_paths = crate::media::sample_video_frames_window(path, start, window, 1024);
+            let mut images = Vec::new();
+            for frame in &frame_paths {
+                if let Ok(image) = image::open(frame) { images.push(image.to_rgb8()); }
+                let _ = std::fs::remove_file(frame);
+            }
+            if let Some(parent) = frame_paths.first().and_then(|frame| frame.parent()) { let _ = std::fs::remove_dir_all(parent); }
+            let audio = crate::media::load_audio_segment_at_rate(
+                path,
+                start,
+                window,
+                self.audio_sample_rate(),
+            );
+            let mut items = Vec::with_capacity(images.len() + usize::from(audio.is_some()));
+            for image in &images {
+                items.push(NativeMediaItem { kind: 1, data: image.as_ptr() as *const c_void,
+                    length: image.len(), width: image.width(), height: image.height(), token_budget: 140 });
+            }
+            if let Some(samples) = audio.as_ref() {
+                items.push(NativeMediaItem { kind: 2, data: samples.as_ptr() as *const c_void,
+                    length: samples.len(), width: 0, height: 0, token_budget: 0 });
+            }
+            if !items.is_empty() { vectors.push(self.embed_native_media(&items)?); }
+            start += 30.0;
+        }
+        if vectors.is_empty() { return Err("视频未能解码出图像帧或音频轨".into()); }
+        Ok(vectors)
+    }
+
 }
 
 #[cfg(test)]

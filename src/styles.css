@@ -55,6 +55,44 @@ input, select {
 }
 input:focus, select:focus { border-color: var(--accent); }
 
+/* Flat black/white checkbox used consistently across settings and results. */
+input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  display: inline-grid;
+  place-content: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  margin: 0;
+  padding: 0;
+  border: 1px solid #111;
+  border-radius: 0;
+  background: #fff;
+  color: #fff;
+  vertical-align: middle;
+  cursor: pointer;
+}
+input[type="checkbox"]::after {
+  content: "";
+  width: 8px;
+  height: 4px;
+  border-left: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(-45deg) scale(0);
+  transition: transform .12s ease;
+}
+input[type="checkbox"]:checked {
+  background: #111;
+}
+input[type="checkbox"]:checked::after {
+  transform: rotate(-45deg) scale(1);
+}
+input[type="checkbox"]:focus-visible {
+  outline: 2px solid #111;
+  outline-offset: 2px;
+}
+
 .card {
   background: #fff;
   border: 1px solid var(--border);
@@ -74,16 +112,16 @@ input:focus, select:focus { border-color: var(--accent); }
    由 App.vue 的 applyAppearance() 根据 config.ui.theme 写入。
    这里同时覆盖各组件里因历史原因写死的白色背景，避免暗色下出现白块。 */
 html[data-theme="dark"] {
-  --bg: #0f1110;
-  --panel: #171a18;
-  --panel-2: #1e2220;
-  --border: #3d4440;
-  --text: #e9ede9;
-  --muted: #98a29b;
-  --accent: #e9ede9;
-  --accent-2: #b6bfb8;
-  --warn: #e2bb72;
-  --danger: #ef8a82;
+  --bg: #111;
+  --panel: #1b1b1b;
+  --panel-2: #252525;
+  --border: #505050;
+  --text: #f1f1f1;
+  --muted: #a8a8a8;
+  --accent: #f1f1f1;
+  --accent-2: #c9c9c9;
+  --warn: #e0b86c;
+  --danger: #ef8d86;
   color-scheme: dark;
 }
 
@@ -96,8 +134,8 @@ html[data-theme="dark"] input,
 html[data-theme="dark"] select,
 html[data-theme="dark"] textarea { background: var(--panel-2); border-color: var(--border); color: var(--text); }
 html[data-theme="dark"] .card { background: var(--panel); border-color: var(--border); }
-html[data-theme="dark"] ::-webkit-scrollbar-thumb { background: #454d47; }
-html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover { background: #5b645d; }
+html[data-theme="dark"] ::-webkit-scrollbar-thumb { background: #555; }
+html[data-theme="dark"] ::-webkit-scrollbar-thumb:hover { background: #707070; }
 
 /* 组件内写死的浅色表面（scoped 选择器优先级低于这里） */
 html[data-theme="dark"] .toast,
@@ -140,3 +178,176 @@ html[data-theme="dark"] .popover-empty { color: var(--muted); }
 html[data-theme="dark"] .toast.ok { background: #17281c; border-color: #3f6b4b; color: #b6e3c1; }
 html[data-theme="dark"] .toast.warn { background: #2a2418; border-color: #6d5a30; color: #e7cd96; }
 html[data-theme="dark"] .toast.error { background: #2b1a19; border-color: #6d3b37; color: #f0b3ae; }
+
+/* Component-local light-theme rules sometimes use tinted rgba fills. Keep
+   the dark surface neutral so selected and hover states remain legible. */
+html[data-theme="dark"] :is(.item:hover, .row:hover, .row.active, .cell.hot,
+  .nested-box:hover, .tp-row:hover, .tp-row.sel) {
+  background: var(--panel-2) !important;
+  color: var(--text) !important;
+}
+html[data-theme="dark"] :is(.item.active, .item.selected, .result.active) {
+  background: #303030 !important;
+  border-color: var(--text) !important;
+  color: var(--text) !important;
+}
+html[data-theme="dark"] :is(.reason, .tag, .snippet mark, .legend) {
+  background: #2b2b2b !important;
+  color: var(--text) !important;
+  border-color: #5c5c5c !important;
+}
+
+/* Component scoped styles contain a legacy flat-light pass at the end of
+   several files. Keep dark mode authoritative even when those scoped rules
+   are injected after this stylesheet. */
+html[data-theme="dark"] .view,
+html[data-theme="dark"] .view h1,
+html[data-theme="dark"] .view h2,
+html[data-theme="dark"] .view h3,
+html[data-theme="dark"] .view strong { color: var(--text) !important; }
+html[data-theme="dark"] .blk,
+html[data-theme="dark"] .root,
+html[data-theme="dark"] .cur,
+html[data-theme="dark"] .list,
+html[data-theme="dark"] .scan-stat,
+html[data-theme="dark"] .params,
+html[data-theme="dark"] .extension-card,
+html[data-theme="dark"] .settings-sidebar,
+html[data-theme="dark"] .settings-scroll :is(.settings-section, .warning-dialog),
+html[data-theme="dark"] .settings-scroll :is(.cur, .list) {
+  background: var(--panel) !important;
+  border-color: var(--border) !important;
+  color: var(--text) !important;
+}
+html[data-theme="dark"] .root.disabled { background: var(--panel-2) !important; }
+html[data-theme="dark"] .root-detail,
+html[data-theme="dark"] .workspace-list,
+html[data-theme="dark"] .rule-list,
+html[data-theme="dark"] .logs { border-color: var(--border) !important; }
+html[data-theme="dark"] .curpath,
+html[data-theme="dark"] .file,
+html[data-theme="dark"] .workspace-row .mono,
+html[data-theme="dark"] .rule-row,
+html[data-theme="dark"] .log-row,
+html[data-theme="dark"] .extension-card p,
+html[data-theme="dark"] .extension-note,
+html[data-theme="dark"] .field-hint,
+html[data-theme="dark"] .empty-line,
+html[data-theme="dark"] .params-grid label,
+html[data-theme="dark"] .settings-scroll :is(label, .section-head p, .settings-section > div > p) {
+  color: var(--muted) !important;
+}
+html[data-theme="dark"] .root-detail-head span,
+html[data-theme="dark"] .root-detail-grid span,
+html[data-theme="dark"] .scan-stat span,
+html[data-theme="dark"] .index-stats span,
+html[data-theme="dark"] .log-time,
+html[data-theme="dark"] .log-kind,
+html[data-theme="dark"] .extension-path,
+html[data-theme="dark"] .settings-subtitle,
+html[data-theme="dark"] .settings-main-head p { color: var(--muted) !important; }
+html[data-theme="dark"] .type-tag,
+html[data-theme="dark"] .pill,
+html[data-theme="dark"] .item,
+html[data-theme="dark"] .kind,
+html[data-theme="dark"] .badge,
+html[data-theme="dark"] .boolean-switch,
+html[data-theme="dark"] .workspace-row .tiny-button,
+html[data-theme="dark"] .secondary-button,
+html[data-theme="dark"] .remove-extension {
+  background: var(--panel-2) !important;
+  color: var(--text) !important;
+  border-color: var(--border) !important;
+}
+html[data-theme="dark"] .item:hover,
+html[data-theme="dark"] .item.active,
+html[data-theme="dark"] .settings-nav-item:hover { background: var(--panel-2) !important; }
+html[data-theme="dark"] .settings-nav-item.active,
+html[data-theme="dark"] .save-button,
+html[data-theme="dark"] .primary { background: var(--text) !important; color: #121514 !important; border-color: var(--text) !important; }
+html[data-theme="dark"] input,
+html[data-theme="dark"] select,
+html[data-theme="dark"] textarea {
+  background: var(--panel-2) !important;
+  color: var(--text) !important;
+  border-color: var(--border) !important;
+}
+html[data-theme="dark"] input[type="checkbox"],
+html[data-theme="dark"] .settings-scroll input[type="checkbox"] {
+  background: var(--panel-2) !important;
+  border-color: var(--border) !important;
+  color: var(--text) !important;
+}
+html[data-theme="dark"] input[type="checkbox"]:checked,
+html[data-theme="dark"] .settings-scroll input[type="checkbox"]:checked { background: var(--text) !important; }
+html[data-theme="dark"] input[type="checkbox"]:checked::after,
+html[data-theme="dark"] .extension-chip input[type="checkbox"]:checked::after,
+html[data-theme="dark"] .settings-scroll .extension-chip input[type="checkbox"]:checked::after,
+html[data-theme="dark"] .settings-scroll .check-label input[type="checkbox"]:checked::after,
+html[data-theme="dark"] .settings-scroll .switch-row input[type="checkbox"]:checked::after { color: #121514 !important; }
+html[data-theme="dark"] .pbar { background: var(--panel-2) !important; border-color: var(--border) !important; }
+html[data-theme="dark"] .pfill { background: var(--text) !important; }
+html[data-theme="dark"] .warning-dialog { box-shadow: 0 18px 50px rgba(0,0,0,.55); }
+html[data-theme="dark"] .warning-dialog p { color: var(--muted) !important; }
+html[data-theme="dark"] .server-url { background: var(--panel-2) !important; color: var(--text) !important; border-color: var(--border) !important; }
+
+html[data-theme="dark"] :is(.query-shell, .recent-panel, .result, .preview-popover, .context-menu,
+  .chart, .side, .sel, .exclude-modal, .extension-row, .pdf-thumb, .pdf-preview) {
+  background: var(--panel) !important;
+  border-color: var(--border) !important;
+  color: var(--text) !important;
+}
+html[data-theme="dark"] :is(.query-shell, .query-icon, .recent-item, .meta-primary,
+  .brand-name, .search-page h1, .root-toggle, .type-tag, .extension-chip,
+  .exclude-confirm, .exclude-item button, .exclude-modal h3, .modal-close,
+  .parallel-button, .modality-card.supported, .modality-card.supported .modality-state,
+  .inuse, .empty .big, .tree-panel .sh, .tree-panel .num, .tree-panel .pct,
+  .preview-popover .name, .context-menu button, .empty-title) { color: var(--text) !important; }
+html[data-theme="dark"] :is(.query-shell, .query-shell.focused, .recent-panel) { box-shadow: none !important; }
+html[data-theme="dark"] :is(.query-shell input, .exclude-input) { background: transparent !important; color: var(--text) !important; }
+html[data-theme="dark"] :is(.recent-item:hover, .context-menu button:hover, .type-tag:hover,
+  .parallel-button:hover) { background: var(--panel-2) !important; }
+html[data-theme="dark"] :is(.filter-pill:hover, .tool-button:hover, .meta-button:hover) { background: var(--panel-2) !important; color: var(--text) !important; }
+html[data-theme="dark"] :is(.filter-pill.active, .tool-button.active, .run-action,
+  .type-tag.active, .parallel-button.custom.active, .exclude-confirm.ready) {
+  background: var(--text) !important;
+  color: #121514 !important;
+  border-color: var(--text) !important;
+}
+html[data-theme="dark"] :is(.gallery-panel, .bar, .modal-items) { border-color: var(--border) !important; }
+html[data-theme="dark"] :is(.reason, .tag, .snippet mark) { background: var(--panel-2) !important; color: var(--text) !important; border-color: var(--border) !important; }
+html[data-theme="dark"] .score { background: rgba(15,17,16,.9) !important; }
+html[data-theme="dark"] :is(.result:hover, .result.active, .item:hover, .item.active, .sel) { background: var(--panel-2) !important; }
+html[data-theme="dark"] :is(.root-error, .danger) { color: var(--danger) !important; }
+html[data-theme="dark"] .params-warning { background: #2a2418 !important; color: var(--warn) !important; border-color: #6d5a30 !important; }
+html[data-theme="dark"] .modality-card { color: var(--muted) !important; }
+html[data-theme="dark"] .badge.warn { color: var(--warn) !important; }
+html[data-theme="dark"] .boolean-switch span { background: var(--panel-2) !important; color: var(--muted) !important; }
+html[data-theme="dark"] .boolean-switch.active span:first-child,
+html[data-theme="dark"] .boolean-switch:not(.active) span:last-child { background: var(--text) !important; color: #121514 !important; }
+html[data-theme="dark"] .boolean-switch.active span:last-child,
+html[data-theme="dark"] .boolean-switch:not(.active) span:first-child { background: var(--panel-2) !important; color: var(--muted) !important; }
+html[data-theme="dark"] .crumb .c,
+html[data-theme="dark"] .crumb .c.last { color: var(--text) !important; }
+html[data-theme="dark"] .sep { color: var(--muted) !important; }
+html[data-theme="dark"] .modality-copy span,
+html[data-theme="dark"] .modality-state,
+html[data-theme="dark"] .similar-note,
+html[data-theme="dark"] .query-shell input::placeholder { color: var(--muted) !important; }
+
+/* A few view-local styles intentionally keep light fallbacks for the
+   default theme.  Keep their surfaces on the same neutral dark palette so
+   previews and tree cards do not flash as white blocks in dark mode. */
+html[data-theme="dark"] :is(.media, .pdf-card, .pdf-preview, .thumb, .mini,
+  .kind-card, .tree-panel, .tp-search, .tp-foot, .tp-menu) {
+  background: var(--panel) !important;
+  border-color: var(--border) !important;
+  color: var(--text) !important;
+}
+html[data-theme="dark"] :is(.head, .row) { border-color: var(--border) !important; }
+html[data-theme="dark"] .bar { background: var(--panel-2) !important; }
+html[data-theme="dark"] :is(.media img, .video-card, .pdf-card, .pdf-preview,
+  .preview-popover > img, .preview-popover > video) { background: var(--panel) !important; }
+html[data-theme="dark"] :is(.recent-title, .result-meta, .meta, .kind, .snippet,
+  .gallery-state, .empty-title, .t, .file, .curpath) { color: var(--muted) !important; }
+html[data-theme="dark"] .page-indicator { color: #fff !important; }

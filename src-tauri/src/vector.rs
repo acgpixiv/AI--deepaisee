@@ -109,9 +109,6 @@ impl VectorStore {
         // 旧向量全部作废，直接清空重建，否则数据会按错误步长错位。
         if let Some(d) = self.saved_dim() {
             if d != self.dim {
-                let _ = std::fs::remove_file(&vp);
-                let _ = std::fs::remove_file(&ip);
-                let _ = self.write_meta();
                 return Ok(());
             }
         }
@@ -129,9 +126,6 @@ impl VectorStore {
             .collect();
         if self.dim > 0 && data.len() != ids.len() * self.dim {
             // 文件损坏或维度记录缺失：保守起见清空，避免越界
-            let _ = std::fs::remove_file(&vp);
-            let _ = std::fs::remove_file(&ip);
-            let _ = self.write_meta();
             return Ok(());
         }
         let slots = ids.len();
@@ -225,6 +219,28 @@ impl VectorStore {
         if let Some(slot) = index.remove(&file_id) {
             let mut ids = self.ids.write();
             ids[slot] = -1;
+            self.generation.fetch_add(1, AtomicOrdering::Release);
+        }
+    }
+
+    /// Remove all logical keys matching a predicate in one write-lock pass.
+    /// This is used to replace temporal video segments when a file changes.
+    pub fn remove_matching<F>(&self, predicate: F)
+    where
+        F: Fn(i64) -> bool,
+    {
+        let mut index = self.index.write();
+        let mut ids = self.ids.write();
+        let mut changed = false;
+        for id in ids.iter_mut() {
+            if *id == -1 || !predicate(*id) {
+                continue;
+            }
+            index.remove(id);
+            *id = -1;
+            changed = true;
+        }
+        if changed {
             self.generation.fetch_add(1, AtomicOrdering::Release);
         }
     }
@@ -374,5 +390,30 @@ mod tests {
         );
         assert!(store.search(&[1.0], 2, None).is_empty());
         assert!(store.search(&[1.0, 0.0], 0, None).is_empty());
+    }
+
+    #[test]
+    fn dimension_mismatch_does_not_delete_vectors_needed_by_the_selected_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "deepdark-vector-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vectors.bin"), [1.0f32, 0.0].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+        std::fs::write(dir.join("ids.bin"), 7i64.to_le_bytes()).unwrap();
+        std::fs::write(dir.join("meta.json"), r#"{"dim":2,"count":1}"#).unwrap();
+
+        let temporary_hash_view = VectorStore::open(&dir, 256).unwrap();
+        assert_eq!(temporary_hash_view.len(), 0);
+        assert!(dir.join("vectors.bin").is_file());
+        assert!(dir.join("ids.bin").is_file());
+
+        let selected_model_view = VectorStore::open(&dir, 2).unwrap();
+        assert_eq!(selected_model_view.get(7), Some(vec![1.0, 0.0]));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

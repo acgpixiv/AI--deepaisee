@@ -11,9 +11,7 @@ pub mod candle_backend;
 #[cfg(feature = "llama")]
 pub mod llama;
 pub mod ort;
-
 use std::path::Path;
-use std::sync::Arc;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EmbedInfo {
@@ -41,6 +39,9 @@ pub trait Embedder: Send + Sync {
         paths.iter().map(|path| self.embed_image(path)).collect()
     }
     fn embed_image(&self, path: &Path) -> Result<Vec<f32>, String>;
+    fn embed_pdf_image_data(&self, image: &image::DynamicImage) -> Result<Vec<f32>, String> {
+        self.embed_image_data(image)
+    }
     fn embed_image_data(&self, _image: &image::DynamicImage) -> Result<Vec<f32>, String> {
         Err("当前模型不支持内存图像编码".into())
     }
@@ -50,118 +51,42 @@ pub trait Embedder: Send + Sync {
     ) -> Result<Vec<Vec<f32>>, String> {
         images.iter().map(|image| self.embed_image_data(image)).collect()
     }
-    fn embed_audio(&self, path: &Path) -> Result<Vec<f32>, String>;
-    fn embed_video(&self, path: &Path) -> Result<Vec<f32>, String>;
-}
-
-/// Runs independent model instances on disjoint slices of a batch. A single
-/// instance is still used for queries and for media items that arrive one at
-/// a time, which keeps search results deterministic and avoids duplicating
-/// work for small requests.
-pub struct ShardedEmbedder {
-    shards: Vec<Arc<dyn Embedder>>,
-}
-
-impl ShardedEmbedder {
-    fn new(shards: Vec<Arc<dyn Embedder>>) -> Self {
-        Self { shards }
-    }
-
-    fn parallel_batch<T, F>(&self, len: usize, f: F) -> Result<Vec<T>, String>
-    where
-        T: Send,
-        F: Fn(&dyn Embedder, usize, usize) -> Result<Vec<T>, String> + Send + Sync,
-    {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        let shard_count = self.shards.len().min(len).max(1);
-        if shard_count == 1 {
-            return f(self.shards[0].as_ref(), 0, len);
-        }
-        let ranges: Vec<(usize, usize)> = (0..shard_count)
-            .map(|index| (index * len / shard_count, (index + 1) * len / shard_count))
-            .collect();
-
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(ranges.len());
-            for (index, &(start, end)) in ranges.iter().enumerate() {
-                let shard = Arc::clone(&self.shards[index % self.shards.len()]);
-                let task = &f;
-                handles.push(scope.spawn(move || task(shard.as_ref(), start, end)));
-            }
-            let mut output = Vec::with_capacity(len);
-            for ((start, end), handle) in ranges.into_iter().zip(handles) {
-                let part = handle
-                    .join()
-                    .map_err(|_| "并行模型实例线程异常退出".to_string())??;
-                if part.len() != end - start {
-                    return Err(format!(
-                        "模型分片返回数量不匹配：{} / {}",
-                        part.len(),
-                        end - start
-                    ));
-                }
-                output.extend(part);
-            }
-            Ok(output)
-        })
-    }
-}
-
-impl Embedder for ShardedEmbedder {
-    fn info(&self) -> EmbedInfo {
-        self.shards[0].info()
-    }
-
-    fn dim(&self) -> usize {
-        self.shards[0].dim()
-    }
-
-    fn concurrency(&self) -> usize {
-        self.shards.len()
-    }
-
-    fn embed_text(&self, text: &str, query: bool) -> Result<Vec<f32>, String> {
-        self.shards[0].embed_text(text, query)
-    }
-
-    fn embed_text_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
-        self.parallel_batch(texts.len(), |shard, start, end| {
-            shard.embed_text_batch(&texts[start..end])
-        })
-    }
-
-    fn embed_image(&self, path: &Path) -> Result<Vec<f32>, String> {
-        self.shards[0].embed_image(path)
-    }
-
-    fn embed_image_batch(&self, paths: &[&Path]) -> Result<Vec<Vec<f32>>, String> {
-        self.parallel_batch(paths.len(), |shard, start, end| {
-            shard.embed_image_batch(&paths[start..end])
-        })
-    }
-
-    fn embed_image_data(&self, image: &image::DynamicImage) -> Result<Vec<f32>, String> {
-        self.shards[0].embed_image_data(image)
-    }
-
-    fn embed_image_data_batch(
+    fn embed_pdf_image_data_batch(
         &self,
         images: &[&image::DynamicImage],
     ) -> Result<Vec<Vec<f32>>, String> {
-        self.parallel_batch(images.len(), |shard, start, end| {
-            shard.embed_image_data_batch(&images[start..end])
-        })
+        images.iter().map(|image| self.embed_pdf_image_data(image)).collect()
     }
+    fn embed_audio(&self, path: &Path) -> Result<Vec<f32>, String>;
+    fn embed_video(&self, path: &Path) -> Result<Vec<f32>, String>;
+    fn video_window_vectors(&self, path: &Path) -> Result<Vec<Vec<f32>>, String> {
+        self.embed_video(path).map(|vector| vec![vector])
+    }
+    /// Return one vector per bounded video window. Legacy backends expose a
+    /// single file vector through the default implementation; multimodal
+    /// backends can retain temporal locality by overriding this method.
+    fn embed_video_segments(&self, path: &Path) -> Result<Vec<Vec<f32>>, String> {
+        self.video_window_vectors(path)
+    }
+}
+/// IDs used for temporal video vectors in the existing file-keyed store.
+/// SQLite file IDs are positive; negative IDs therefore remain backwards
+/// compatible while allowing several 768-D windows to point at one file.
+const VIDEO_SEGMENT_ID_SCALE: i64 = 1_000_000;
 
-    fn embed_audio(&self, path: &Path) -> Result<Vec<f32>, String> {
-        self.shards[0].embed_audio(path)
-    }
+pub fn video_segment_id(file_id: i64, segment: usize) -> i64 {
+    -(file_id.saturating_mul(VIDEO_SEGMENT_ID_SCALE)
+        .saturating_add(segment as i64 + 1))
+}
 
-    fn embed_video(&self, path: &Path) -> Result<Vec<f32>, String> {
-        self.shards[0].embed_video(path)
+pub fn video_segment_source(id: i64) -> Option<i64> {
+    if id >= 0 {
+        return None;
     }
+    let encoded = id.checked_neg()?;
+    let source = encoded / VIDEO_SEGMENT_ID_SCALE;
+    let segment = encoded % VIDEO_SEGMENT_ID_SCALE;
+    (source > 0 && segment > 0).then_some(source)
 }
 
 /// 按文件类型分发到对应模态。
@@ -199,14 +124,14 @@ pub fn embed_pdf_parts(
     }
     if !images.is_empty() {
         let image_refs: Vec<&image::DynamicImage> = images.iter().collect();
-        match e.embed_image_data_batch(&image_refs) {
+        match e.embed_pdf_image_data_batch(&image_refs) {
             Ok(encoded) => vectors.extend(encoded),
             Err(_) => {
                 // A single malformed/unsupported raster should not discard
                 // the other page images. Retry per image only on the rare
                 // batch failure, keeping the normal path fully batched.
                 for image in images {
-                    if let Ok(vector) = e.embed_image_data(image) {
+                    if let Ok(vector) = e.embed_pdf_image_data(image) {
                         vectors.push(vector);
                     }
                 }
@@ -273,89 +198,104 @@ pub fn embed_pdf_parts_batch_with<F, C>(
 ) -> Result<(), String>
 where
     F: FnMut(usize, Result<Vec<f32>, String>),
-    C: Fn() -> bool,
+    C: Fn() -> bool + Sync,
 {
-    const PDF_EMBED_CHUNK: usize = 8;
-    let mut per_document: Vec<Vec<Vec<f32>>> = vec![Vec::new(); parts.len()];
-    let mut remaining_images: Vec<usize> = parts.iter().map(|(_, images)| images.len()).collect();
-    let mut reported = vec![false; parts.len()];
+    // The backend still applies its own token/attention budget and splits
+    // oversized calls. A 16-item outer chunk gives both llama.cpp and Candle
+    // enough work to keep the GPU fed, while bounding the number of decoded
+    // PDF rasters retained by this routine.
+    const PDF_EMBED_CHUNK: usize = 16;
     let mut text_map = Vec::new();
     let mut texts = Vec::new();
-    for (index, (text, _)) in parts.iter().enumerate() {
+    let mut image_map = Vec::new();
+    let mut images = Vec::new();
+    for (index, (text, document_images)) in parts.iter().enumerate() {
         if let Some(text) = text.as_deref().filter(|value| !value.trim().is_empty()) {
             text_map.push(index);
             texts.push(text.to_owned());
         }
-    }
-    for (map_chunk, text_chunk) in text_map.chunks(PDF_EMBED_CHUNK).zip(texts.chunks(PDF_EMBED_CHUNK)) {
-        if cancelled() {
-            return Err("index cancellation requested".into());
-        }
-        let encoded: Vec<Option<Vec<f32>>> = match e.embed_text_batch(text_chunk) {
-            Ok(rows) if rows.len() == text_chunk.len() => rows.into_iter().map(Some).collect(),
-            _ => {
-                let mut rows = Vec::with_capacity(text_chunk.len());
-                for text in text_chunk {
-                    if cancelled() {
-                        return Err("index cancellation requested".into());
-                    }
-                    rows.push(e.embed_text(text, false).ok());
-                }
-                rows
-            }
-        };
-        for (&index, vector) in map_chunk.iter().zip(encoded) {
-            if let Some(vector) = vector {
-                per_document[index].push(vector);
-            }
-        }
-    }
-    if cancelled() {
-        return Err("index cancellation requested".into());
-    }
-
-    let mut image_map = Vec::new();
-    let mut images = Vec::new();
-    for (index, (_, document_images)) in parts.iter().enumerate() {
         for image in document_images.iter() {
             image_map.push(index);
             images.push(image);
         }
     }
-    for index in 0..parts.len() {
-        if remaining_images[index] == 0 {
-            reported[index] = true;
-            on_document(index, fuse_vectors(std::mem::take(&mut per_document[index]), "PDF 未抽取到可用文字或图片"));
+    let encode_text_lane = || -> Result<Vec<Option<Vec<f32>>>, String> {
+        let mut encoded = Vec::with_capacity(texts.len());
+        for text_chunk in texts.chunks(PDF_EMBED_CHUNK) {
+            if cancelled() {
+                return Err("index cancellation requested".into());
+            }
+            match e.embed_text_batch(text_chunk) {
+                Ok(rows) if rows.len() == text_chunk.len() => {
+                    encoded.extend(rows.into_iter().map(Some));
+                }
+                _ => {
+                    for text in text_chunk {
+                        if cancelled() {
+                            return Err("index cancellation requested".into());
+                        }
+                        encoded.push(e.embed_text(text, false).ok());
+                    }
+                }
+            }
         }
+        Ok(encoded)
+    };
+    let encode_image_lane = || -> Result<Vec<Option<Vec<f32>>>, String> {
+        let mut encoded = Vec::with_capacity(images.len());
+        for image_chunk in images.chunks(PDF_EMBED_CHUNK) {
+            if cancelled() {
+                return Err("index cancellation requested".into());
+            }
+            match e.embed_pdf_image_data_batch(image_chunk) {
+                Ok(rows) if rows.len() == image_chunk.len() => {
+                    encoded.extend(rows.into_iter().map(Some));
+                }
+                _ => {
+                    for image in image_chunk {
+                        if cancelled() {
+                            return Err("index cancellation requested".into());
+                        }
+                        encoded.push(e.embed_pdf_image_data(image).ok());
+                    }
+                }
+            }
+        }
+        Ok(encoded)
+    };
+
+    // GGUF has distinct text and mtmd contexts. Let those lanes overlap;
+    // Candle and legacy adapters keep their established serial scheduling.
+    let dual_context = e.info().backend == "llama.cpp" && !texts.is_empty() && !images.is_empty();
+    let (encoded_texts, encoded_images) = if dual_context {
+        std::thread::scope(|scope| {
+            let text_worker = scope.spawn(encode_text_lane);
+            let image_result = encode_image_lane();
+            let text_result = text_worker
+                .join()
+                .map_err(|_| "PDF text embedding worker panicked".to_string())?;
+            Ok::<_, String>((text_result?, image_result?))
+        })?
+    } else {
+        (encode_text_lane()?, encode_image_lane()?)
+    };
+    if cancelled() {
+        return Err("index cancellation requested".into());
     }
 
-    for (map_chunk, image_chunk) in image_map.chunks(PDF_EMBED_CHUNK).zip(images.chunks(PDF_EMBED_CHUNK)) {
-        if cancelled() {
-            return Err("index cancellation requested".into());
+    let mut per_document: Vec<Vec<Vec<f32>>> = vec![Vec::new(); parts.len()];
+    for (index, vector) in text_map.into_iter().zip(encoded_texts) {
+        if let Some(vector) = vector {
+            per_document[index].push(vector);
         }
-        let encoded: Vec<Option<Vec<f32>>> = match e.embed_image_data_batch(image_chunk) {
-            Ok(rows) if rows.len() == image_chunk.len() => rows.into_iter().map(Some).collect(),
-            _ => {
-                let mut rows = Vec::with_capacity(image_chunk.len());
-                for image in image_chunk {
-                    if cancelled() {
-                        return Err("index cancellation requested".into());
-                    }
-                    rows.push(e.embed_image_data(image).ok());
-                }
-                rows
-            }
-        };
-        for (&index, vector) in map_chunk.iter().zip(encoded) {
-            remaining_images[index] = remaining_images[index].saturating_sub(1);
-            if let Some(vector) = vector {
-                per_document[index].push(vector);
-            }
-            if remaining_images[index] == 0 && !reported[index] {
-                reported[index] = true;
-                on_document(index, fuse_vectors(std::mem::take(&mut per_document[index]), "PDF 未抽取到可用文字或图片"));
-            }
+    }
+    for (index, vector) in image_map.into_iter().zip(encoded_images) {
+        if let Some(vector) = vector {
+            per_document[index].push(vector);
         }
+    }
+    for (index, vectors) in per_document.into_iter().enumerate() {
+        on_document(index, fuse_vectors(vectors, "PDF 未抽取到可用文字或图片"));
     }
     Ok(())
 }
@@ -406,7 +346,16 @@ pub fn resolve_model_path(input: &str) -> Result<std::path::PathBuf, String> {
         let p = entry.path();
         if !p.is_file() { continue; }
         let name = p.file_name().and_then(|x| x.to_str()).unwrap_or_default().to_ascii_lowercase();
-        if name == "model.safetensors" && p.parent().map(|d| d.join("config.json").is_file() && d.join("tokenizer.json").is_file()).unwrap_or(false) {
+        let is_safetensors_weight = name == "model.safetensors"
+            || name == "model.safetensors.index.json"
+            || (name.ends_with(".safetensors") && name.contains("-of-"));
+        let arbitrary_single_weight = p.extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("safetensors"))
+            && p.parent().is_some_and(has_single_safetensors_file);
+        if (is_safetensors_weight || arbitrary_single_weight)
+            && p.parent().is_some_and(safetensors_package_complete)
+        {
             safe_dirs.push(p.parent().unwrap().to_path_buf());
         }
         if p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("gguf")).unwrap_or(false)
@@ -415,12 +364,65 @@ pub fn resolve_model_path(input: &str) -> Result<std::path::PathBuf, String> {
             ggufs.push(p.to_path_buf());
         }
     }
-    #[cfg(feature = "candle")]
+    safe_dirs.sort();
+    safe_dirs.dedup();
     if let Some(dir) = safe_dirs.into_iter().next() {
         return Ok(dir);
     }
     ggufs.sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
     ggufs.into_iter().next().ok_or_else(|| format!("目录中没有找到完整的 safetensors 或 GGUF 嵌入模型：{raw}"))
+}
+
+fn has_single_safetensors_file(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path.extension().and_then(|x| x.to_str())
+                .is_some_and(|x| x.eq_ignore_ascii_case("safetensors"))
+        {
+            count += 1;
+            if count > 1 {
+                return false;
+            }
+        }
+    }
+    count == 1
+}
+
+pub(crate) fn safetensors_package_complete(dir: &Path) -> bool {
+    if !dir.join("config.json").is_file()
+        || !(dir.join("tokenizer.json").is_file() || dir.join("tokenizer.model").is_file())
+    {
+        return false;
+    }
+    let index = dir.join("model.safetensors.index.json");
+    if index.is_file() {
+        let Ok(raw) = std::fs::read_to_string(index) else { return false };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else { return false };
+        let Some(weights) = value.get("weight_map").and_then(serde_json::Value::as_object) else {
+            return false;
+        };
+        return !weights.is_empty()
+            && weights.values().all(|file| {
+                file.as_str().is_some_and(|name| dir.join(name).is_file())
+            });
+    }
+    dir.join("model.safetensors").is_file() || has_single_safetensors_file(dir)
+}
+
+/// The in-tree Candle adapter is intentionally specific to EmbeddingGemma2.
+/// Other safetensors embedding families (for example Qwen3-Embedding and
+/// Jina v5 Omni) need their own graph/runtime or a Python/ONNX adapter; do not
+/// send them through the EmbeddingGemma loader and report a misleading tensor
+/// error.
+pub fn is_embedding_gemma_dir(dir: &Path) -> bool {
+    let Ok(config) = std::fs::read_to_string(dir.join("config.json")) else {
+        return false;
+    };
+    let lower = config.to_ascii_lowercase();
+    lower.contains("embeddinggemma2model") || lower.contains("embedding_gemma2")
 }
 
 /// 按配置构建 embedding 后端。
@@ -442,29 +444,93 @@ pub fn build_embedder(cfg: &crate::config::ModelConfig) -> Result<Box<dyn Embedd
 /// attention cost.
 pub fn effective_batch_size(cfg: &crate::config::ModelConfig, configured: usize) -> usize {
     let requested = configured.clamp(1, 128);
-    match cfg.parallel_mode.trim().to_ascii_lowercase().as_str() {
-        "eco" => requested.min(4),
-        "turbo" | "狂暴" => requested.max(32).min(128),
-        // Automatic mode raises the small historical default, but honours a
-        // deliberate larger value from the settings page.
-        _ => requested.max(16).min(64),
+    let cpu_workers = effective_parallel_threads(cfg);
+    let gpu_ceiling = selected_gpu_batch_ceiling(cfg);
+    requested
+        .max(cpu_workers.saturating_mul(2))
+        .clamp(1, gpu_ceiling)
+}
+
+/// Attention is evaluated in bounded query chunks inside the Candle adapter.
+/// A GPU with ample free VRAM can therefore safely keep more independent
+/// image/text sequences in one batch, while smaller or busy GPUs retain the
+/// conservative budget used by older builds.
+pub fn attention_score_budget(selected_gpu: &str) -> usize {
+    #[cfg(feature = "llama")]
+    {
+        let devices = llama::gpu_devices();
+        let selected = if selected_gpu.trim().is_empty()
+            || selected_gpu.eq_ignore_ascii_case("auto")
+        {
+            devices.iter().max_by_key(|device| device.free_memory)
+        } else {
+            devices.iter().find(|device| device.id == selected_gpu)
+        };
+        if let Some(device) = selected {
+            return attention_score_budget_for_free_vram(device.free_memory);
+        }
+    }
+    1usize << 28
+}
+
+fn attention_score_budget_for_free_vram(free_bytes: u64) -> usize {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if free_bytes >= 10 * GIB {
+        1usize << 32
+    } else if free_bytes >= 6 * GIB {
+        1usize << 31
+    } else if free_bytes >= 3 * GIB {
+        1usize << 30
+    } else {
+        1usize << 28
     }
 }
 
-#[cfg(feature = "llama")]
-fn available_cpu_cores() -> usize {
+fn batch_ceiling_for_free_vram(free_bytes: u64) -> usize {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if free_bytes >= 8 * GIB {
+        64
+    } else if free_bytes >= 4 * GIB {
+        32
+    } else if free_bytes >= 2 * GIB {
+        16
+    } else {
+        8
+    }
+}
+
+fn selected_gpu_batch_ceiling(cfg: &crate::config::ModelConfig) -> usize {
+    #[cfg(feature = "llama")]
+    {
+        let devices = llama::gpu_devices();
+        let selected = if cfg.gpu_device.trim().is_empty()
+            || cfg.gpu_device.eq_ignore_ascii_case("auto")
+        {
+            devices.iter().max_by_key(|device| device.free_memory)
+        } else {
+            devices.iter().find(|device| device.id == cfg.gpu_device)
+        };
+        if let Some(device) = selected {
+            if device.free_memory == 0 {
+                return 16;
+            }
+            return batch_ceiling_for_free_vram(device.free_memory);
+        }
+    }
+    // No reliable accelerator memory report: keep batches moderate. The
+    // model-specific attention/token limits still apply inside each backend.
+    32
+}
+
+fn logical_cpu_threads() -> usize {
     let logical = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1)
         .max(1);
-    #[cfg(windows)]
-    if let Some(idle_fraction) = windows_cpu_idle_fraction() {
-        return ((logical as f64 * idle_fraction).floor() as usize).clamp(1, logical);
-    }
     logical
 }
 
-#[cfg(all(windows, feature = "llama"))]
+#[cfg(windows)]
 fn windows_cpu_idle_fraction() -> Option<f64> {
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -504,238 +570,33 @@ fn windows_cpu_idle_fraction() -> Option<f64> {
 
 #[cfg(feature = "llama")]
 fn effective_model_threads(cfg: &crate::config::ModelConfig) -> i32 {
-    if cfg.n_threads > 0 {
-        return cfg.n_threads;
-    }
-    let cores = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-        .max(1);
-    let mode = cfg.parallel_mode.trim().to_ascii_lowercase();
-    let threads = match mode.as_str() {
-        "eco" | "节能" => (cores / 3).max(1),
-        "turbo" | "狂暴" => cores.div_ceil(5).max(1),
-        _ => (cores / 8).max(1),
-    };
-    threads.min(i32::MAX as usize) as i32
+    effective_parallel_threads(cfg).min(i32::MAX as usize) as i32
 }
-
-#[cfg(feature = "llama")]
-fn model_weight_bytes(cfg: &crate::config::ModelConfig) -> u64 {
-    let Ok(path) = resolve_model_path(&cfg.embed_model) else {
-        return 0;
-    };
-    if path.is_file() {
-        return std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    }
-    walkdir::WalkDir::new(path)
-        .follow_links(false)
-        .into_iter()
-        .flatten()
-        .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| {
-            matches!(
-                entry.path().extension().and_then(|x| x.to_str()).map(|x| x.to_ascii_lowercase()).as_deref(),
-                Some("safetensors") | Some("bin") | Some("gguf")
-            )
-        })
-        .filter_map(|entry| entry.metadata().ok().map(|m| m.len()))
-        .sum()
-}
-
-#[cfg(feature = "llama")]
-const GPU_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
-
-#[cfg(feature = "llama")]
-fn replica_memory_budget(cfg: &crate::config::ModelConfig, info: &EmbedInfo) -> u64 {
-    let weight_bytes = model_weight_bytes(cfg);
-    if weight_bytes == 0 {
-        return 0;
-    }
-    let mode = cfg.parallel_mode.trim().to_ascii_lowercase();
-    let turbo = matches!(mode.as_str(), "turbo" | "狂暴");
-    let (weight_factor, safety_bytes) = if info.backend == "candle" {
-        (32, 2 * GPU_RESERVE_BYTES)
-    } else if turbo {
-        (28, 2 * GPU_RESERVE_BYTES)
-    } else {
-        (32, 2 * GPU_RESERVE_BYTES)
-    };
-    weight_bytes
-        .saturating_mul(weight_factor)
-        .saturating_div(10)
-        .saturating_add(safety_bytes)
-}
-
-/// Choose extra devices for model replicas. Candle safetensors stays on CUDA;
-/// GGUF can also use Vulkan adapters exposed by llama.cpp.
-pub fn replica_device_plan(
-    cfg: &crate::config::ModelConfig,
-    info: &EmbedInfo,
-) -> Vec<String> {
-    let mode = cfg.parallel_mode.trim().to_ascii_lowercase();
-    // The primary instance is loaded before this function. Keep at most four
-    // extra replicas so effective concurrency is always 1 (eco), 1..5 (auto),
-    // or 1..5 (turbo), and the UI can report the real shard count.
-    #[cfg(feature = "llama")]
-    let cpu_cap = available_cpu_cores().div_ceil(2).clamp(1, 5);
-    #[cfg(not(feature = "llama"))]
-    let cpu_cap = 1;
-    let cap: usize = match mode.as_str() {
-        "eco" | "节能" => 1,
-        "turbo" | "狂暴" => 5,
-        _ => cpu_cap,
-    };
-    if cap <= 1 || info.backend == "hash" {
-        return Vec::new();
-    }
-    #[cfg(feature = "llama")]
-    {
-        let weight_bytes = model_weight_bytes(cfg);
-        if weight_bytes == 0 {
-            return Vec::new();
-        }
-        // Keep one GiB unavailable on every adapter. The file size is only
-        // the resident weights; CUDA/Candle also needs allocator arenas,
-        // token buffers and image activations. A deliberately conservative
-        // per-replica budget prevents a larger replica count from turning
-        // into paging/OOM and lower throughput.
-        let required = replica_memory_budget(cfg, info);
-        if required == 0 {
-            return Vec::new();
-        }
-        let mut devices = llama::gpu_devices();
-        if info.backend == "candle" {
-            devices.retain(|device| device.backend.eq_ignore_ascii_case("cuda"));
-        }
-        if devices.is_empty() {
-            return Vec::new();
-        }
-        let primary = if cfg.gpu_device.trim().is_empty() || cfg.gpu_device.eq_ignore_ascii_case("auto") {
-            devices.iter().max_by_key(|device| device.total_memory)
-        } else {
-            devices.iter().find(|device| device.id == cfg.gpu_device)
-        };
-        let Some(primary) = primary else {
-            return Vec::new();
-        };
-        let primary_id = primary.id.clone();
-        let mut ordered: Vec<_> = std::iter::once(primary)
-            .chain(devices.iter().filter(|device| device.id != primary_id))
-            .collect();
-        ordered.sort_by_key(|device| {
-            (device.id != primary_id, u64::MAX - device.total_memory)
-        });
-        let capacities: Vec<usize> = ordered
-            .iter()
-            .map(|device| {
-                let free = if device.integrated {
-                    device.free_memory.min(device.total_memory / 2)
-                } else {
-                    device.free_memory
-                };
-                let occupied = device.total_memory.saturating_sub(free);
-                let budget = device.total_memory.saturating_sub(GPU_RESERVE_BYTES);
-                let room = budget.saturating_sub(occupied);
-                if device.id == primary_id {
-                    1 + (room / required) as usize
-                } else {
-                    (room / required) as usize
-                }
-            })
-            .collect();
-        let mut used = vec![0usize; ordered.len()];
-        if let Some(index) = ordered.iter().position(|device| device.id == primary_id) {
-            used[index] = 1;
-        }
-        let mut plan = Vec::with_capacity(cap.saturating_sub(1));
-        while plan.len() + 1 < cap {
-            let mut added = false;
-            for (index, device) in ordered.iter().enumerate() {
-                if used[index] < capacities[index] {
-                    plan.push(device.id.clone());
-                    used[index] += 1;
-                    added = true;
-                    if plan.len() + 1 >= cap {
-                        break;
-                    }
-                }
-            }
-            if !added {
-                break;
-            }
-        }
-        plan
-    }
-    #[cfg(not(feature = "llama"))]
-    {
-        let _ = (cfg, info, cap);
-        Vec::new()
-    }
-}
-
-/// Expand a successfully loaded model into a guarded multi-device shard.
-/// Extra copies are best-effort; any failed device keeps the working model.
-pub fn maybe_replicate(
-    initial: Arc<dyn Embedder>,
-    cfg: &crate::config::ModelConfig,
-    batch_size: usize,
-) -> Arc<dyn Embedder> {
-    let plan = replica_device_plan(cfg, &initial.info());
-    if plan.is_empty() {
-        return initial;
-    }
-    let mut shards = vec![Arc::clone(&initial)];
-    let mut blocked_devices = std::collections::HashSet::new();
-    for device_id in plan {
-        if blocked_devices.contains(&device_id) {
-            continue;
-        }
-        #[cfg(feature = "llama")]
+/// Single-model host scheduling policy. Automatic mode samples current CPU
+/// headroom on Windows, then caps indexing at 90% of logical processors.
+pub fn effective_parallel_threads(cfg: &crate::config::ModelConfig) -> usize {
+    let cores = logical_cpu_threads();
+    let available = {
+        #[cfg(windows)]
         {
-            let required = replica_memory_budget(cfg, &initial.info());
-            let enough_room = llama::gpu_devices()
-                .into_iter()
-                .find(|device| device.id == device_id)
-                .map(|device| {
-                    let free = if device.integrated {
-                        device.free_memory.min(device.total_memory / 2)
-                    } else {
-                        device.free_memory
-                    };
-                    required > 0 && free.saturating_sub(GPU_RESERVE_BYTES) >= required
-                })
-                .unwrap_or(false);
-            if !enough_room {
-                blocked_devices.insert(device_id);
-                continue;
-            }
+            windows_cpu_idle_fraction()
+                .map(|idle| ((cores as f64 * idle).floor() as usize).clamp(1, cores))
+                .unwrap_or(cores)
         }
-        let mut replica_cfg = cfg.clone();
-        replica_cfg.gpu_device = device_id.clone();
-        match build_embedder_with_batch(&replica_cfg, batch_size) {
-            Ok(extra) => {
-                let extra: Arc<dyn Embedder> = Arc::from(extra);
-                if extra.dim() != initial.dim() || extra.info().backend != initial.info().backend {
-                    blocked_devices.insert(device_id);
-                    continue;
-                }
-                shards.push(extra);
-            }
-            Err(_) => {
-                blocked_devices.insert(device_id);
-            }
+        #[cfg(not(windows))]
+        {
+            cores
         }
-    }
-    if shards.len() > 1 {
-        Arc::new(ShardedEmbedder::new(shards))
-    } else {
-        initial
+    };
+    match cfg.parallel_mode.trim().to_ascii_lowercase().as_str() {
+        "eco" => cores.div_ceil(3).min(available).max(1),
+        "custom" => cfg.parallel_threads.clamp(1, cores),
+        _ => ((cores as f64 * 0.90).floor() as usize).min(available).max(1),
     }
 }
 
 #[cfg(test)]
-mod sharded_tests {
+mod batch_tests {
     use super::*;
 
     struct NumberEmbedder {
@@ -766,31 +627,59 @@ mod sharded_tests {
         fn embed_video(&self, _path: &Path) -> Result<Vec<f32>, String> { Err("unused".into()) }
     }
 
-    #[test]
-    fn sharded_batches_preserve_order_and_queries_use_first_instance() {
-        let shards: Vec<Arc<dyn Embedder>> = vec![
-            Arc::new(NumberEmbedder { offset: 0.0 }),
-            Arc::new(NumberEmbedder { offset: 100.0 }),
-        ];
-        let embedder = ShardedEmbedder::new(shards);
-        assert_eq!(embedder.concurrency(), 2);
-        let input: Vec<String> = (0..5).map(|n| n.to_string()).collect();
-        let vectors = embedder.embed_text_batch(&input).unwrap();
-        let values: Vec<f32> = vectors.into_iter().map(|v| v[0]).collect();
-        assert_eq!(values, vec![0.0, 1.0, 102.0, 103.0, 104.0]);
-        assert_eq!(embedder.embed_text("7", true).unwrap(), vec![7.0]);
+    struct DualLaneEmbedder {
+        active: std::sync::atomic::AtomicUsize,
+        overlapped: std::sync::atomic::AtomicBool,
     }
 
-    #[test]
-    fn sharded_batch_uses_each_available_replica() {
-        let shards: Vec<Arc<dyn Embedder>> = (0..5)
-            .map(|index| Arc::new(NumberEmbedder { offset: index as f32 * 100.0 }) as Arc<dyn Embedder>)
-            .collect();
-        let embedder = ShardedEmbedder::new(shards);
-        let input: Vec<String> = (0..8).map(|n| n.to_string()).collect();
-        let vectors = embedder.embed_text_batch(&input).unwrap();
-        let values: Vec<f32> = vectors.into_iter().map(|v| v[0]).collect();
-        assert_eq!(values, vec![0.0, 101.0, 102.0, 203.0, 304.0, 305.0, 406.0, 407.0]);
+    impl DualLaneEmbedder {
+        fn work(&self) {
+            use std::sync::atomic::Ordering;
+            if self.active.fetch_add(1, Ordering::SeqCst) > 0 {
+                self.overlapped.store(true, Ordering::SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Embedder for DualLaneEmbedder {
+        fn info(&self) -> EmbedInfo {
+            EmbedInfo {
+                backend: "llama.cpp".into(),
+                model: "test".into(),
+                dim: 1,
+                device: "test".into(),
+                modalities: vec!["text".into(), "image".into()],
+                ready: true,
+                detail: String::new(),
+            }
+        }
+
+        fn dim(&self) -> usize { 1 }
+
+        fn embed_text(&self, _text: &str, _query: bool) -> Result<Vec<f32>, String> {
+            self.work();
+            Ok(vec![1.0])
+        }
+
+        fn embed_text_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            self.work();
+            Ok(vec![vec![1.0]; texts.len()])
+        }
+
+        fn embed_image(&self, _path: &Path) -> Result<Vec<f32>, String> { Err("unused".into()) }
+
+        fn embed_pdf_image_data_batch(
+            &self,
+            images: &[&image::DynamicImage],
+        ) -> Result<Vec<Vec<f32>>, String> {
+            self.work();
+            Ok(vec![vec![3.0]; images.len()])
+        }
+
+        fn embed_audio(&self, _path: &Path) -> Result<Vec<f32>, String> { Err("unused".into()) }
+        fn embed_video(&self, _path: &Path) -> Result<Vec<f32>, String> { Err("unused".into()) }
     }
 
     #[test]
@@ -806,14 +695,95 @@ mod sharded_tests {
         assert!(vectors[0].is_err());
         assert_eq!(vectors[1].as_ref().unwrap(), &vec![1.0]);
     }
+
+    #[test]
+    fn llama_pdf_text_and_image_lanes_overlap_and_fuse() {
+        use std::sync::atomic::Ordering;
+
+        let embedder = DualLaneEmbedder {
+            active: std::sync::atomic::AtomicUsize::new(0),
+            overlapped: std::sync::atomic::AtomicBool::new(false),
+        };
+        let image = image::DynamicImage::new_rgb8(2, 2);
+        let parts = [(Some("page text".to_owned()), std::slice::from_ref(&image))];
+
+        let vectors = embed_pdf_parts_batch(&embedder, &parts);
+        assert_eq!(vectors[0].as_ref().unwrap(), &vec![1.0]);
+        assert!(embedder.overlapped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn gpu_batch_ceiling_reserves_capacity_as_free_vram_drops() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(batch_ceiling_for_free_vram(12 * GIB), 64);
+        assert_eq!(batch_ceiling_for_free_vram(6 * GIB), 32);
+        assert_eq!(batch_ceiling_for_free_vram(3 * GIB), 16);
+        assert_eq!(batch_ceiling_for_free_vram(GIB), 8);
+    }
+
+    #[test]
+    fn attention_batch_budget_tracks_free_gpu_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(attention_score_budget_for_free_vram(12 * GIB), 1usize << 32);
+        assert_eq!(attention_score_budget_for_free_vram(8 * GIB), 1usize << 31);
+        assert_eq!(attention_score_budget_for_free_vram(4 * GIB), 1usize << 30);
+        assert_eq!(attention_score_budget_for_free_vram(GIB), 1usize << 28);
+    }
+
+    #[test]
+    fn model_directory_resolution_prefers_complete_safetensors_package() {
+        let dir = std::env::temp_dir().join(format!(
+            "deepaisee-sharded-model-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        std::fs::write(dir.join("tokenizer.model"), b"tokenizer").unwrap();
+        std::fs::write(dir.join("model-00001-of-00001.safetensors"), b"weights").unwrap();
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"model-00001-of-00001.safetensors"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(resolve_model_path(dir.to_str().unwrap()).unwrap(), dir);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn model_directory_resolution_accepts_a_custom_single_safetensors_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "deepaisee-custom-model-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(dir.join("embeddinggemma-2.safetensors"), b"weights").unwrap();
+
+        assert_eq!(resolve_model_path(dir.to_str().unwrap()).unwrap(), dir);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 pub fn build_embedder_with_batch(
     cfg: &crate::config::ModelConfig,
     batch_size: usize,
 ) -> Result<Box<dyn Embedder>, String> {
+    build_embedder_with_index(cfg, &crate::config::IndexConfig::default(), batch_size)
+}
+
+/// Build an embedder with the complete indexing configuration. The legacy
+/// helper above remains for CLI and compatibility callers that do not carry
+/// an `AppConfig`.
+pub fn build_embedder_with_index(
+    cfg: &crate::config::ModelConfig,
+    index: &crate::config::IndexConfig,
+    batch_size: usize,
+) -> Result<Box<dyn Embedder>, String> {
     #[cfg(not(feature = "candle"))]
-    let _ = batch_size;
+    let _ = (batch_size, index);
     let path = cfg.embed_model.trim();
     if path.is_empty() {
         return Ok(Box::new(hash::HashEmbedder::new()));
@@ -828,12 +798,29 @@ pub fn build_embedder_with_batch(
         None
     };
     if let Some(_dir) = safe_dir.filter(|p| p.exists()) {
+        if !is_embedding_gemma_dir(_dir) {
+            return Err(format!(
+                "当前原生 Candle 适配器只支持 EmbeddingGemma2 safetensors：{}；Qwen3-Embedding/Jina v5 Omni 请导入对应 GGUF，或安装 Python/ONNX 扩展",
+                _dir.display()
+            ));
+        }
         #[cfg(feature = "candle")]
         {
             return candle_backend::CandleEmbedder::load(
                 _dir,
                 &cfg.gpu_device,
                 effective_batch_size(cfg, batch_size),
+                cfg.context_size as usize,
+                index.image_token_budget,
+                index.video_token_budget,
+                index.vision_encoder,
+                index.audio_encoder,
+                index.video_index_audio,
+                index.audio_seconds,
+                index.video_frame_interval,
+                index.video_max_frames,
+                index.image_max_side,
+                index.pdf_image_token_budget,
             ).map(|e| Box::new(e) as Box<dyn Embedder>);
         }
         #[cfg(not(feature = "candle"))]

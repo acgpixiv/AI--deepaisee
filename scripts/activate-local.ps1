@@ -22,8 +22,17 @@ $npmCache = Join-Path $tools "npm-cache"
 $env:DEEPAISEE_REPO = $repo
 $env:CARGO_HOME = $cargoHome
 $env:RUSTUP_HOME = $rustupHome
-# Keep an externally chosen target dir (CI / limited-disk hosts redirect it).
-if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = Join-Path $repo "src-tauri\target" }
+# Keep an externally chosen target dir (CI / limited-disk hosts may redirect it),
+# but normalize relative values. Cargo is often invoked from `src-tauri`; a
+# relative `src-tauri/target` would otherwise become `src-tauri/src-tauri/target`
+# and produce very long CMake paths on Windows.
+if ($env:CARGO_TARGET_DIR) {
+  if (-not [System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
+    $env:CARGO_TARGET_DIR = [System.IO.Path]::GetFullPath((Join-Path $repo $env:CARGO_TARGET_DIR))
+  }
+} else {
+  $env:CARGO_TARGET_DIR = Join-Path $repo "src-tauri\target"
+}
 $env:npm_config_cache = $npmCache
 $env:npm_config_prefix = Join-Path $tools "npm-global"
 

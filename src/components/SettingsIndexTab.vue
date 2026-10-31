@@ -58,7 +58,7 @@ const excludeDirs = computed({
       </div>
     </section>
 
-    <section class="settings-section">
+    <section v-if="props.cfg.ui?.professional_mode" class="settings-section">
       <div class="section-head">
         <div>
           <h2>{{ t("索引参数") }}</h2>
@@ -66,29 +66,51 @@ const excludeDirs = computed({
         </div>
         <button class="save-button" @click="props.saveFileConfig"><Save :size="14" />{{ t("保存") }}</button>
       </div>
-      <div class="field-hint">{{ t("视频抽帧间隔不低于 4 秒；去重阈值越小越严格（相同画面会被丢弃）。") }}</div>
+      <div class="field-hint">{{ t("EmbeddingGemma2 共用 8192 token 上下文；图片和视频预算可在 70-1120 之间调整，视频默认按 1 FPS 采样。Qwen3-Embedding/Jina 等 GGUF 使用通用文本参数；这些多模态参数仅对 EmbeddingGemma2 safetensors 生效。") }}</div>
       <div class="form-grid three">
         <label>{{ t("最大文件（MB）") }}<input type="number" v-model.number="props.cfg.scan.max_size_mb" /></label>
         <label>{{ t("最小文件（KB）") }}<input type="number" v-model.number="props.cfg.scan.min_size_kb" /></label>
         <label>{{ t("正文最大字符数") }}<input type="number" v-model.number="props.cfg.index.max_text_chars" /></label>
-        <label>{{ t("图片最长边") }}<input type="number" v-model.number="props.cfg.index.image_max_side" /></label>
-        <label>{{ t("视频抽帧数") }}<input type="number" v-model.number="props.cfg.index.video_frames" /></label>
-        <label>{{ t("视频抽帧间隔（秒）") }}<input type="number" min="4" step="1" v-model.number="props.cfg.index.video_frame_interval" /></label>
-        <label>{{ t("单视频最大帧数") }}<input type="number" min="1" v-model.number="props.cfg.index.video_max_frames" /></label>
-        <label>{{ t("抽帧去重阈值") }}<input type="number" min="0" max="64" v-model.number="props.cfg.index.video_dedup_distance" /></label>
-        <label>{{ t("音频秒数") }}<input type="number" step="0.5" v-model.number="props.cfg.index.audio_seconds" /></label>
         <label>{{ t("索引批量大小") }}<input type="number" v-model.number="props.cfg.index.batch_size" /></label>
         <label>{{ t("搜索结果数") }}<input type="number" v-model.number="props.cfg.search.page_size" /></label>
         <label>{{ t("语义权重") }}<input type="number" min="0" max="1" step="0.05" v-model.number="props.cfg.search.semantic_weight" /></label>
         <label>{{ t("语义最低分") }}<input type="number" min="0" max="1" step="0.05" v-model.number="props.cfg.search.semantic_floor" /></label>
         <label>{{ t("输入防抖（毫秒）") }}<input type="number" min="0" step="50" v-model.number="props.cfg.search.debounce_ms" /></label>
       </div>
+      <div class="param-groups">
+        <section class="param-group">
+          <h3>{{ t("图片参数") }}</h3>
+          <div class="form-grid three">
+            <label>{{ t("图片最长边") }}<input type="number" min="64" max="4096" v-model.number="props.cfg.index.image_max_side" /></label>
+            <label>{{ t("图片 Token 预算") }}<input type="number" min="70" max="1120" step="10" v-model.number="props.cfg.index.image_token_budget" /></label>
+            <label>{{ t("PDF 内嵌图片 Token 预算") }}<input type="number" min="70" max="1120" step="10" v-model.number="props.cfg.index.pdf_image_token_budget" /></label>
+            <label class="check-label"><input type="checkbox" v-model="props.cfg.index.vision_encoder" />{{ t("启用 EmbeddingGemma 图片/视频编码器") }}</label>
+          </div>
+        </section>
+        <section class="param-group">
+          <h3>{{ t("视频参数") }}</h3>
+          <div class="form-grid three">
+            <label>{{ t("视频帧 Token 预算") }}<input type="number" min="70" max="1120" step="10" v-model.number="props.cfg.index.video_token_budget" /></label>
+            <label>{{ t("视频抽帧数") }}<input type="number" min="1" v-model.number="props.cfg.index.video_frames" /></label>
+            <label>{{ t("视频抽帧间隔（秒）") }}<input type="number" min="0.1" step="0.1" v-model.number="props.cfg.index.video_frame_interval" /></label>
+            <label>{{ t("单视频最大帧数") }}<input type="number" min="1" max="256" v-model.number="props.cfg.index.video_max_frames" /></label>
+            <label>{{ t("抽帧去重阈值") }}<input type="number" min="0" max="64" v-model.number="props.cfg.index.video_dedup_distance" /></label>
+            <label class="check-label"><input type="checkbox" v-model="props.cfg.index.video_index_audio" />{{ t("索引视频音轨") }}</label>
+          </div>
+        </section>
+        <section class="param-group">
+          <h3>{{ t("音频参数") }}</h3>
+          <div class="form-grid three">
+            <label>{{ t("音频秒数") }}<input type="number" min="0.25" max="30" step="0.5" v-model.number="props.cfg.index.audio_seconds" /></label>
+            <label class="check-label"><input type="checkbox" v-model="props.cfg.index.audio_encoder" />{{ t("启用 EmbeddingGemma 音频编码器") }}</label>
+          </div>
+        </section>
+      </div>
       <div class="switch-row">
         <label><input type="checkbox" v-model="props.cfg.index.auto_fulltext" />{{ t("自动抽取正文") }}</label>
         <label><input type="checkbox" v-model="props.cfg.index.auto_embed" />{{ t("自动生成向量") }}</label>
         <label><input type="checkbox" v-model="props.cfg.search.use_pinyin" />{{ t("启用拼音检索") }}</label>
         <label><input type="checkbox" v-model="props.cfg.search.use_fuzzy" />{{ t("启用模糊匹配") }}</label>
-        <label><input type="checkbox" v-model="props.cfg.index.video_index_audio" />{{ t("索引视频音轨（说话声/环境声）") }}</label>
         <label><input type="checkbox" v-model="props.cfg.scan.follow_links" />{{ t("扫描时跟随符号链接") }}</label>
       </div>
       <label class="wide-label exclude-label">
@@ -148,5 +170,27 @@ const excludeDirs = computed({
 </template>
 
 <style scoped>
+.param-groups {
+  display: grid;
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.param-group {
+  border-top: 1px solid var(--line, #d0d0d0);
+  padding-top: 10px;
+}
+
+.param-group h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.check-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 </style>
 

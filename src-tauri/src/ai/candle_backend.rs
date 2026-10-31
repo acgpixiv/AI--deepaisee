@@ -50,22 +50,53 @@ pub struct CandleEmbedder {
     model: Mutex<EmbeddingGemma2>,
     model_dir: PathBuf,
     device: String,
+    vision_enabled: bool,
+    audio_enabled: bool,
+    video_index_audio: bool,
+    audio_seconds: f32,
+    image_max_side: u32,
+    pdf_image_token_budget: usize,
 }
 
 impl CandleEmbedder {
-    pub fn load(dir: &Path, selected_device: &str, batch_size: usize) -> Result<Self, String> {
-        if !dir.join("config.json").is_file()
-            || !dir.join("model.safetensors").is_file()
-            || !dir.join("tokenizer.json").is_file()
-        {
-            return Err(format!("EmbeddingGemma2 目录缺少 config.json、model.safetensors 或 tokenizer.json：{}", dir.display()));
+    pub fn load(
+        dir: &Path,
+        selected_device: &str,
+        batch_size: usize,
+        max_seq_len: usize,
+        image_token_budget: usize,
+        video_token_budget: usize,
+        vision_enabled: bool,
+        audio_enabled: bool,
+        video_index_audio: bool,
+        audio_seconds: f32,
+        _video_frame_interval: f32,
+        _video_max_frames: u32,
+        image_max_side: u32,
+        pdf_image_token_budget: usize,
+    ) -> Result<Self, String> {
+        let package_complete = crate::ai::safetensors_package_complete(dir);
+        // The in-tree tokenizer runtime consumes the fast `tokenizer.json`
+        // graph. A SentencePiece `tokenizer.model` can still be retained as
+        // package metadata, but it is not sufficient for this native adapter.
+        let has_tokenizer = dir.join("tokenizer.json").is_file();
+        if !package_complete || !has_tokenizer {
+            return Err(format!("EmbeddingGemma2 目录缺少 config、tokenizer 或 safetensors 权重文件：{}", dir.display()));
         }
         let mut options = Options::default();
-        options.modalities = Modalities::ALL;
+        options.modalities = Modalities { vision: vision_enabled, audio: audio_enabled };
+        options.max_seq_len = max_seq_len.clamp(512, 8192);
+        options.image_token_budget = image_token_budget.clamp(70, 1120);
+        options.video_token_budget = video_token_budget.clamp(70, 1120);
         // The model internally splits batches by sequence length and attention
         // cost, so a larger ceiling lets short documents keep the GPU busy
         // without forcing long documents into one oversized allocation.
         options.batch_size = batch_size.clamp(1, 128);
+        // The Candle attention kernels chunk query rows internally. Use the
+        // selected GPU's free memory to decide how many independent vision
+        // sequences may share one forward pass; busy cards stay conservative.
+        options = options
+            .with_attention_score_budget(crate::ai::attention_score_budget(selected_device));
         #[cfg(feature = "candle-cuda")]
         {
             let ordinal = {
@@ -105,6 +136,12 @@ impl CandleEmbedder {
             model: Mutex::new(model),
             model_dir: dir.to_path_buf(),
             device,
+            vision_enabled,
+            audio_enabled,
+            video_index_audio,
+            audio_seconds: audio_seconds.clamp(0.25, 30.0),
+            image_max_side: image_max_side.clamp(64, 4096),
+            pdf_image_token_budget: pdf_image_token_budget.clamp(70, 1120),
         })
     }
 
@@ -113,6 +150,66 @@ impl CandleEmbedder {
         let tensor = model.encode(&[input], prompt).map_err(|e| format!("Candle 编码失败：{e}"))?;
         let rows = tensor.to_vec2::<f32>().map_err(|e| format!("读取 Candle 向量失败：{e}"))?;
         rows.into_iter().next().ok_or_else(|| "Candle 没有返回向量".into())
+    }
+    /// Encode a raster extracted from a PDF with the cheaper 280-token budget.
+    /// Standalone photos use the model's high-resolution image budget.
+    pub fn encode_pdf_image_data(&self, image: &image::DynamicImage) -> Result<Vec<f32>, String> {
+        self.one(Input::image_with_budget(image.clone(), self.pdf_image_token_budget), None)
+    }
+
+    pub fn encode_pdf_image_data_batch(
+        &self,
+        images: &[&image::DynamicImage],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let inputs: Vec<Input> = images
+            .iter()
+            .map(|image| Input::image_with_budget((*image).clone(), self.pdf_image_token_budget))
+            .collect();
+        let model = self.model.lock().map_err(|error| error.to_string())?;
+        model
+            .encode(&inputs, None)
+            .map_err(|error| format!("Candle PDF image batch encoding failed: {error}"))?
+            .to_vec2::<f32>()
+            .map_err(|error| format!("Candle PDF image vectors failed: {error}"))
+    }
+
+    // Keep usable sub-batches when a backend rejects a large vision batch.
+    // This avoids turning an entire directory into scalar inference after one
+    // transient allocation or model-specific batch limit is hit.
+    fn encode_image_batch_adaptive(
+        &self,
+        images: &[&image::DynamicImage],
+        pdf_budget: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let inputs: Vec<Input> = images
+            .iter()
+            .map(|image| match pdf_budget {
+                Some(budget) => Input::image_with_budget((*image).clone(), budget),
+                None => Input::image((*image).clone()),
+            })
+            .collect();
+        let encoded = {
+            let model = self.model.lock().map_err(|error| error.to_string())?;
+            model.encode(&inputs, None)
+        };
+        match encoded {
+            Ok(tensor) => tensor
+                .to_vec2::<f32>()
+                .map_err(|error| format!("Candle image vectors failed: {error}")),
+            Err(_) if images.len() > 1 => {
+                let middle = images.len() / 2;
+                let mut first = self.encode_image_batch_adaptive(&images[..middle], pdf_budget)?;
+                first.extend(self.encode_image_batch_adaptive(&images[middle..], pdf_budget)?);
+                Ok(first)
+            }
+            Err(error) => Err(format!("Candle image batch encoding failed: {error}")),
+        }
     }
 }
 
@@ -123,7 +220,12 @@ impl Embedder for CandleEmbedder {
             model: self.model_dir.display().to_string(),
             dim: 768,
             device: self.device.clone(),
-            modalities: vec!["text".into(), "image".into(), "audio".into(), "video".into()],
+            modalities: {
+                let mut values = vec!["text".into()];
+                if self.vision_enabled { values.extend(["image".into(), "video".into()]); }
+                if self.audio_enabled { values.push("audio".into()); }
+                values
+            },
             ready: true,
             detail: "EmbeddingGemma2 Candle 原生多模态后端 · 文本/图片/音频/视频共用 768 维空间".into(),
         }
@@ -255,33 +357,108 @@ impl Embedder for CandleEmbedder {
         self.one(Input::image(image.clone()), None)
     }
 
+    fn embed_pdf_image_data(&self, image: &image::DynamicImage) -> Result<Vec<f32>, String> {
+        CandleEmbedder::encode_pdf_image_data(self, image)
+    }
+
+    fn embed_pdf_image_data_batch(
+        &self,
+        images: &[&image::DynamicImage],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        self.encode_image_batch_adaptive(images, Some(self.pdf_image_token_budget))
+    }
+
     fn embed_image_data_batch(
         &self,
         images: &[&image::DynamicImage],
     ) -> Result<Vec<Vec<f32>>, String> {
-        if images.is_empty() {
-            return Ok(Vec::new());
-        }
-        let inputs: Vec<Input> = images.iter().map(|image| Input::image((*image).clone())).collect();
-        let model = self.model.lock().map_err(|error| error.to_string())?;
-        model
-            .encode(&inputs, None)
-            .map_err(|error| format!("Candle 批量内存图片编码失败：{error}"))?
-            .to_vec2::<f32>()
-            .map_err(|error| format!("读取 Candle 批量图片向量失败：{error}"))
+        self.encode_image_batch_adaptive(images, None)
     }
 
     fn embed_audio(&self, path: &Path) -> Result<Vec<f32>, String> {
-        let samples = crate::media::load_audio(path, 30.0).ok_or("音频解码失败（需要 ffmpeg）")?;
+        let samples = crate::media::load_audio(path, f64::from(self.audio_seconds))
+            .ok_or("音频解码失败（需要 ffmpeg）")?;
         self.one(Input::audio(samples), None)
     }
 
+    fn video_window_vectors(&self, path: &Path) -> Result<Vec<Vec<f32>>, String> {
+        // Process one 30-second window at a time. Each window mixes 1 FPS
+        // frames and its matching 16 kHz audio clip in EmbeddingGemma2's
+        // shared context. The caller can retain each window vector for
+        // temporal search or average them for legacy file-level access.
+        let duration = crate::media::video_duration(path).unwrap_or(0.0).max(0.1);
+        let mut vectors = Vec::new();
+        let mut start = 0.0f64;
+        while start < duration {
+            let window = (duration - start).min(30.0);
+            let frames = crate::media::sample_video_frames_window(path, start, window, self.image_max_side);
+            let images: Vec<image::DynamicImage> = frames
+                .iter()
+                .filter_map(|frame| {
+                    let image = image::open(frame).ok();
+                    let _ = std::fs::remove_file(frame);
+                    image
+                })
+                .collect();
+            if let Some(parent) = frames.first().and_then(|frame| frame.parent()) {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+            let audio = if self.audio_enabled && self.video_index_audio {
+                crate::media::load_audio_segment(path, start, window)
+            } else {
+                None
+            };
+            if !images.is_empty() || audio.as_ref().is_some_and(|samples| !samples.is_empty()) {
+                let mut input = Input::new(Vec::new());
+                if !images.is_empty() {
+                    input = input.with_video(images);
+                }
+                if let Some(samples) = audio {
+                    input = input.with_audio(samples);
+                }
+                vectors.push(self.one(input, None)?);
+            }
+            start += 30.0;
+        }
+        if vectors.is_empty() {
+            return Err("视频未能解码出画面或音轨（需要 ffmpeg）".into());
+        }
+        Ok(vectors)
+    }
+
     fn embed_video(&self, path: &Path) -> Result<Vec<f32>, String> {
+        let vectors = self.video_window_vectors(path)?;
+        let mut merged = vec![0.0f32; vectors[0].len()];
+        let mut count = 0usize;
+        for vector in vectors {
+            if vector.len() != merged.len() { continue; }
+            for (dst, value) in merged.iter_mut().zip(vector) { *dst += value; }
+            count += 1;
+        }
+        if count == 0 {
+            return Err("video windows returned inconsistent vector dimensions".into());
+        }
+        for value in &mut merged { *value /= count as f32; }
+        crate::ai::l2_normalize(&mut merged);
+        Ok(merged)
+    }
+
+    fn embed_video_segments(&self, path: &Path) -> Result<Vec<Vec<f32>>, String> {
+        self.video_window_vectors(path)
+    }
+
+    /*
+    fn embed_video_legacy(&self, path: &Path) -> Result<Vec<f32>, String> {
         // 与 index.rs 用同一套智能抽帧：场景切换/I 帧优先 + dHash 去重，
         // 避免「固定均匀切 32 帧」在长静止镜头上浪费算力、在快剪视频上漏画面。
         let frames = crate::media::sample_video_frames_smart(
             path,
-            crate::media::FramePlan { interval: 4.0, max_frames: 32, max_side: 1024, dedup_distance: 6 },
+            crate::media::FramePlan {
+                interval: self.video_frame_interval,
+                max_frames: self.video_max_frames,
+                max_side: self.image_max_side,
+                dedup_distance: 6,
+            },
         );
         if frames.is_empty() {
             return Err("视频抽帧失败（需要 ffmpeg）".into());
@@ -298,4 +475,5 @@ impl Embedder for CandleEmbedder {
         }
         self.one(Input::video(images), None)
     }
+    */
 }

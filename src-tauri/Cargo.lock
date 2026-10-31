@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "DeepDark_Oracle"
-version = "0.0.22"
+version = "0.0.23"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1221,6 +1221,7 @@ dependencies = [
  "candle-nn",
  "hf-hub",
  "image",
+ "rayon",
  "rustfft",
  "serde",
  "serde_json",

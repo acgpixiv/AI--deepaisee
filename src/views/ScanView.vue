@@ -17,13 +17,22 @@ const idx = ref<IndexStats | null>(null);
 const polling = ref<number | null>(null);
 const operationActive = ref(false);
 const cancelledIndexPct = ref<number | null>(null);
+const selectedExtensions = ref<string[]>([]);
+const knownExtensions = ref<string[]>([]);
+const rootExtensions = ref<Record<string, string[]>>({});
+const rootEnabledExtensions = ref<Record<string, string[]>>({});
+const extensionGroupOpen = ref("");
+const excludeDraft = ref("");
+const excludedPaths = ref<string[]>([]);
+const modalExcludedPaths = ref<string[]>([]);
+const exclusionsOpen = ref(false);
+let defaultsAppliedForRun = false;
 let lastRootRefresh = 0;
 
 const TYPES = [
   { k: "images", label: "图片" },
   { k: "videos", label: "视频" },
   { k: "audios", label: "音频" },
-  { k: "pdf", label: "PDF" },
   { k: "documents", label: "文档" },
   { k: "archives", label: "压缩包" },
   { k: "others", label: "其它" },
@@ -45,6 +54,7 @@ async function loadCfg() {
     roots.value = [...(cfg.value.scan.roots || [])];
     const disabled = new Set<string>(cfg.value.scan.disabled_roots || []);
     rootEnabled.value = Object.fromEntries(roots.value.map((r) => [r, !disabled.has(r)]));
+    selectedRoot.value = roots.value.find((root) => rootEnabled.value[root] !== false) || null;
     const s = cfg.value.scan;
     typeState.value = {
       images: s.images !== false,
@@ -55,18 +65,83 @@ async function loadCfg() {
       archives: s.archives !== false,
       others: !!s.others,
     };
+    selectedExtensions.value = [...(s.enabled_exts || [])];
+    knownExtensions.value = [...(s.known_exts || [])];
+    rootExtensions.value = { ...(s.root_extensions || {}) };
+    rootEnabledExtensions.value = { ...(s.root_enabled_exts || {}) };
+    if (selectedRoot.value && rootEnabledExtensions.value[rootKey(selectedRoot.value)]) {
+      selectedExtensions.value = [...rootEnabledExtensions.value[rootKey(selectedRoot.value)]];
+    }
+    excludedPaths.value = [...(s.exclude_paths || [])];
   } catch (e) {
     toast(`${t("读取配置失败：")}${e}`, "error");
   }
 }
 
 const activeRoots = computed(() => roots.value.filter((r) => rootEnabled.value[r] !== false));
+const hasSelectedRoot = computed(() => !!selectedRoot.value && roots.value.includes(selectedRoot.value));
 const rootKey = (root: string) => {
   let normalized = root.replaceAll("/", "\\").replace(/\\+/g, "\\");
   if (!/^[a-z]:\\$/i.test(normalized)) normalized = normalized.replace(/\\+$/, "");
   return normalized.toLowerCase();
 };
 const selectedRootStats = computed(() => selectedRoot.value ? rootStats.value[rootKey(selectedRoot.value)] : undefined);
+const liveSelectedRoot = computed(() => selectedRoot.value
+  ? progress.value?.roots?.find((row) => rootKey(row.root) === rootKey(selectedRoot.value!))
+  : undefined);
+const rootExtensionRows = computed(() => {
+  if (liveSelectedRoot.value?.extensions?.length) return liveSelectedRoot.value.extensions;
+  const saved = selectedRoot.value ? rootExtensions.value[rootKey(selectedRoot.value)] : undefined;
+  if (saved?.length) return saved.map((ext) => ({ ext, kind: kindForExt(ext), count: 0 }));
+  return progress.value?.extensions || [];
+});
+
+function kindForExt(ext: string): string {
+  const value = ext.toLowerCase();
+  if (["jpg", "jpeg", "png", "gif", "bmp", "webp", "tif", "tiff", "ico", "heic", "avif", "svg"].includes(value)) return "image";
+  if (["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "ts", "3gp"].includes(value)) return "video";
+  if (["mp3", "wav", "flac", "aac", "ogg", "m4a", "wma", "opus", "aiff", "ape"].includes(value)) return "audio";
+  if (["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst", "iso", "cab", "tgz"].includes(value)) return "archive";
+  if (["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "epub", "mobi", "rtf"].includes(value)) return "document";
+  if (["txt", "md", "markdown", "log", "csv", "tsv", "json", "jsonl", "xml", "yaml", "yml", "toml", "ini", "cfg", "conf", "html", "htm", "css", "js", "jsx", "ts", "tsx", "vue", "py", "rs", "go", "java", "c", "h", "cpp", "hpp", "cs", "php", "rb", "sh", "bat", "ps1", "sql", "lua", "kt", "swift", "m", "r", "jl", "tex", "rst", "srt", "ass"].includes(value)) return "text";
+  return "other";
+}
+
+function groupForExt(ext: string): string {
+  const kind = kindForExt(ext);
+  if (kind === "image") return "images";
+  if (kind === "video") return "videos";
+  if (kind === "audio") return "audios";
+  if (kind === "archive") return "archives";
+  if (kind === "document" || kind === "text") return "documents";
+  return "others";
+}
+
+const groupedExtensions = computed(() => Object.fromEntries(TYPES.map((group) => [
+  group.k,
+  rootExtensionRows.value.filter((row) => groupForExt(row.ext) === group.k).sort((a, b) => a.ext.localeCompare(b.ext)),
+])) as Record<string, { ext: string; kind: string; count: number }[]>);
+
+function categorySelected(key: string): boolean {
+  const found = groupedExtensions.value[key] || [];
+  if (!found.length) return !!typeState.value[key];
+  return found.some((row) => selectedExtensions.value.includes(row.ext));
+}
+
+function toggleExtension(ext: string) {
+  const selected = new Set(selectedExtensions.value);
+  if (selected.has(ext)) selected.delete(ext);
+  else selected.add(ext);
+  selectedExtensions.value = [...selected];
+  const groups = new Set(selectedExtensions.value.map(groupForExt));
+  typeState.value = {
+    ...typeState.value,
+    images: groups.has("images"), videos: groups.has("videos"), audios: groups.has("audios"),
+    pdf: groups.has("documents"), documents: groups.has("documents"),
+    archives: groups.has("archives"), others: groups.has("others"),
+  };
+  void api.saveConfig({ scan: scanSettingsPatch() }).catch((error) => toast(`${t("保存文件类型失败：")}${error}`, "error"));
+}
 
 async function refreshRootStats() {
   try {
@@ -79,13 +154,53 @@ async function refreshRootStats() {
 
 async function toggleRoot(root: string) {
   rootEnabled.value[root] = rootEnabled.value[root] === false;
-  selectedRoot.value = root;
+  if (rootEnabled.value[root]) {
+    setSelectedRootState(root);
+  } else if (selectedRoot.value === root) {
+    selectedRoot.value = roots.value.find((item) => rootEnabled.value[item] !== false) || null;
+    if (selectedRoot.value) setSelectedRootState(selectedRoot.value);
+  }
   try {
     await saveRoots();
   } catch (e) {
     rootEnabled.value[root] = !rootEnabled.value[root];
     toast(`${t("保存目录状态失败：")}${e}`, "error");
   }
+}
+
+function setSelectedRootState(root: string) {
+  selectedRoot.value = root;
+  const key = rootKey(root);
+  const hasRootSelection = Object.prototype.hasOwnProperty.call(rootEnabledExtensions.value, key);
+  if (hasRootSelection) {
+    selectedExtensions.value = [...rootEnabledExtensions.value[key]];
+  } else {
+    // A root without its own extension selection has not been discovered yet.
+    // Do not inherit the previous root's allow-list (for example doc/pdf/txt),
+    // otherwise a new image-only root is filtered before its formats can be
+    // discovered and selected. If discovery data already exists, select all
+    // formats found for this root; otherwise let the scanner do a full first
+    // pass and persist the per-root list afterwards.
+    selectedExtensions.value = [...(rootExtensions.value[key] || [])];
+    const discovered = selectedExtensions.value.length > 0;
+    const groups = new Set(selectedExtensions.value.map(groupForExt));
+    typeState.value = {
+      images: discovered ? groups.has("images") : true,
+      videos: discovered ? groups.has("videos") : true,
+      audios: discovered ? groups.has("audios") : true,
+      pdf: discovered ? groups.has("documents") : true,
+      documents: discovered ? groups.has("documents") : true,
+      archives: discovered ? groups.has("archives") : true,
+      others: discovered ? groups.has("others") : true,
+    };
+    return;
+  }
+  const groups = new Set(selectedExtensions.value.map(groupForExt));
+  typeState.value = {
+    images: groups.has("images"), videos: groups.has("videos"), audios: groups.has("audios"),
+    pdf: groups.has("documents"), documents: groups.has("documents"),
+    archives: groups.has("archives"), others: groups.has("others"),
+  };
 }
 
 function rootProgress(stats?: RootIndexStats) {
@@ -99,11 +214,6 @@ const persistedIndexPct = computed(() => {
   const pending = rows.reduce((sum, row) => sum + row.embed_pending, 0);
   return Math.max(0, Math.min(100, Math.round(((total - pending) / total) * 100)));
 });
-
-function formatRootScanTime(value: number) {
-  if (!value) return t("尚未扫描");
-  return new Date(value * 1000).toLocaleString();
-}
 
 async function pickDir() {
   try {
@@ -121,39 +231,60 @@ async function pickDir() {
   }
 }
 
-function removeRoot(r: string) {
+async function removeRoot(r: string) {
+  if (!window.confirm(t("移除扫描目录将同步删除该目录的正文和向量数据，确定继续吗？"))) return;
   roots.value = roots.value.filter((x) => x !== r);
   delete rootEnabled.value[r];
-  if (selectedRoot.value === r) selectedRoot.value = null;
+  delete rootExtensions.value[rootKey(r)];
+  delete rootEnabledExtensions.value[rootKey(r)];
+  if (selectedRoot.value === r) {
+    selectedRoot.value = roots.value.find((root) => rootEnabled.value[root] !== false) || null;
+    if (selectedRoot.value) setSelectedRootState(selectedRoot.value);
+  }
+  try {
+    await saveRoots();
+  } catch (error) {
+    toast(`${t("保存目录状态失败：")}${error}`, "error");
+  }
+}
+
+function scanSettingsPatch() {
+  if (selectedRoot.value) rootEnabledExtensions.value[rootKey(selectedRoot.value)] = [...selectedExtensions.value];
+  return {
+    roots: roots.value,
+    disabled_roots: roots.value.filter((r) => rootEnabled.value[r] === false),
+    images: typeState.value.images,
+    videos: typeState.value.videos,
+    audios: typeState.value.audios,
+    pdf: typeState.value.pdf,
+    documents: typeState.value.documents,
+    archives: typeState.value.archives,
+    others: typeState.value.others,
+    enabled_exts: selectedExtensions.value,
+    known_exts: knownExtensions.value,
+    filter_extensions: cfg.value?.scan?.filter_extensions ?? false,
+    root_extensions: rootExtensions.value,
+    root_enabled_exts: rootEnabledExtensions.value,
+    exclude_paths: excludedPaths.value,
+  };
 }
 
 async function saveRoots() {
   await api.saveConfig({
-    scan: {
-      roots: roots.value,
-      disabled_roots: roots.value.filter((r) => rootEnabled.value[r] === false),
-    },
+    scan: scanSettingsPatch(),
   });
   await refreshRootStats();
 }
 
-async function startScan() {
-  if (!activeRoots.value.length) return toast(t("至少启用一个扫描目录"), "warn");
-  await api.saveConfig({
-    scan: {
-      roots: roots.value,
-      disabled_roots: roots.value.filter((r) => rootEnabled.value[r] === false),
-      images: typeState.value.images,
-      videos: typeState.value.videos,
-      audios: typeState.value.audios,
-      pdf: typeState.value.pdf,
-      documents: typeState.value.documents,
-      archives: typeState.value.archives,
-      others: typeState.value.others,
-    },
-  });
+async function startScan(targetRoot?: string) {
+  if (operationBusy.value) return;
+  const selected = targetRoot ? [targetRoot] : activeRoots.value;
+  if (!selected.length) return toast(t("至少启用一个扫描目录"), "warn");
+  await api.saveConfig({ scan: scanSettingsPatch() });
   try {
-    await api.scanStart(activeRoots.value, "auto");
+    defaultsAppliedForRun = false;
+    progress.value = null;
+    await api.scanStart(selected, undefined, true);
     store.scanBusy = true;
     operationActive.value = true;
     startPolling();
@@ -161,6 +292,94 @@ async function startScan() {
   } catch (e) {
     toast(`${t("扫描失败：")}${e}`, "error");
   }
+}
+
+async function selectRootAndScan(root: string) {
+  setSelectedRootState(root);
+  if (rootEnabled.value[root] !== false) await startScan(root);
+}
+
+async function syncDiscoveredExtensions() {
+  if (!progress.value?.done || progress.value.running || defaultsAppliedForRun) return;
+  defaultsAppliedForRun = true;
+  if (progress.value.cancelled) return;
+  const oldKnownByRoot = new Map<string, Set<string>>();
+  const oldSelectedByRoot = new Map<string, Set<string>>();
+  for (const row of progress.value.roots || []) {
+    const key = rootKey(row.root);
+    oldKnownByRoot.set(key, new Set(rootExtensions.value[key] || []));
+    oldSelectedByRoot.set(key, new Set(rootEnabledExtensions.value[key] || []));
+    const found = row.extensions.map((item) => item.ext).filter(Boolean).sort();
+    const oldKnown = oldKnownByRoot.get(key)!;
+    const oldSelected = oldSelectedByRoot.get(key)!;
+    rootExtensions.value[key] = found;
+    rootEnabledExtensions.value[key] = found.filter((ext) => !oldKnown.has(ext) || oldSelected.has(ext));
+  }
+  const allKnownExtensions = new Set(Object.values(rootExtensions.value).flat());
+  const nextSelected = selectedRoot.value
+    ? [...(rootEnabledExtensions.value[rootKey(selectedRoot.value)] || [])]
+    : [...new Set(Object.values(rootEnabledExtensions.value).flat())];
+  const groups = new Set(nextSelected.map(groupForExt));
+  typeState.value = {
+    images: groups.has("images"), videos: groups.has("videos"), audios: groups.has("audios"),
+    pdf: groups.has("documents"), documents: groups.has("documents"),
+    archives: groups.has("archives"), others: groups.has("others"),
+  };
+  knownExtensions.value = [...allKnownExtensions].sort();
+  selectedExtensions.value = nextSelected;
+  if (cfg.value) {
+    cfg.value.scan.known_exts = knownExtensions.value;
+    cfg.value.scan.enabled_exts = selectedExtensions.value;
+    cfg.value.scan.filter_extensions = true;
+    cfg.value.scan.root_extensions = rootExtensions.value;
+    cfg.value.scan.root_enabled_exts = rootEnabledExtensions.value;
+  }
+  await api.saveConfig({
+    scan: {
+      ...scanSettingsPatch(),
+      enabled_exts: nextSelected,
+      known_exts: knownExtensions.value,
+      filter_extensions: true,
+      root_extensions: rootExtensions.value,
+      root_enabled_exts: rootEnabledExtensions.value,
+    },
+  });
+}
+
+async function addExcludedPath() {
+  const path = excludeDraft.value.trim();
+  if (!path) return;
+  if (!excludedPaths.value.some((item) => rootKey(item) === rootKey(path))) excludedPaths.value.push(path);
+  excludeDraft.value = "";
+  await saveRoots();
+}
+
+function openExclusions() {
+  modalExcludedPaths.value = [...excludedPaths.value];
+  exclusionsOpen.value = true;
+}
+
+function closeExclusions() {
+  exclusionsOpen.value = false;
+}
+
+function removeModalExcludedPath(path: string) {
+  modalExcludedPaths.value = modalExcludedPaths.value.filter((item) => rootKey(item) !== rootKey(path));
+}
+
+async function confirmExclusions() {
+  excludedPaths.value = [...modalExcludedPaths.value];
+  try {
+    await saveRoots();
+    exclusionsOpen.value = false;
+  } catch (error) {
+    toast(`${t("保存排除项失败：")}${error}`, "error");
+  }
+}
+
+async function removeExcludedPath(path: string) {
+  excludedPaths.value = excludedPaths.value.filter((item) => rootKey(item) !== rootKey(path));
+  await saveRoots();
 }
 
 async function cancelScan() {
@@ -184,6 +403,7 @@ function startPolling() {
     try {
       progress.value = await api.scanProgress();
       idx.value = await api.indexStats();
+      await syncDiscoveredExtensions();
       if (Date.now() - lastRootRefresh > 2500) {
         lastRootRefresh = Date.now();
         await refreshRootStats();
@@ -215,20 +435,9 @@ function stopPolling() {
 async function buildIndex(what: "auto" | "text" | "embed") {
   try {
     if (!activeRoots.value.length) return toast(t("至少启用一个扫描目录"), "warn");
-    await api.saveConfig({
-      scan: {
-        roots: roots.value,
-        disabled_roots: roots.value.filter((r) => rootEnabled.value[r] === false),
-        images: typeState.value.images,
-        videos: typeState.value.videos,
-        audios: typeState.value.audios,
-        pdf: typeState.value.pdf,
-        documents: typeState.value.documents,
-        archives: typeState.value.archives,
-        others: typeState.value.others,
-      },
-    });
+    await api.saveConfig({ scan: scanSettingsPatch() });
     cancelledIndexPct.value = null;
+    defaultsAppliedForRun = false;
     await api.scanStart(activeRoots.value, what);
     operationActive.value = true;
     startPolling();
@@ -240,11 +449,17 @@ async function buildIndex(what: "auto" | "text" | "embed") {
 
 const operationBusy = computed(() => operationActive.value || store.scanBusy || !!idx.value?.running || !!idx.value?.queued);
 
-const pct = computed(() => {
-  const p = progress.value;
-  if (!p) return 0;
-  return p.done ? 100 : p.running ? 35 : 0;
-});
+const selectedScanStats = computed(() => liveSelectedRoot.value || selectedRootStats.value);
+const scanTotalFiles = computed(() => selectedScanStats.value?.discovered_files ?? selectedScanStats.value?.files ?? 0);
+const scanAddedOrUpdated = computed(() => (selectedScanStats.value?.added ?? 0) + (selectedScanStats.value?.updated ?? 0));
+const scanErrors = computed(() => selectedScanStats.value?.errors ?? 0);
+const scanBytes = computed(() => selectedScanStats.value?.discovered_bytes ?? selectedScanStats.value?.bytes ?? 0);
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
 
 const indexPct = computed(() => {
   if (cancelledIndexPct.value !== null) return cancelledIndexPct.value;
@@ -256,14 +471,18 @@ const indexPct = computed(() => {
   return persistedIndexPct.value;
 });
 
-const displayedIndexTotal = computed(() => selectedRoot.value
-  ? selectedRootStats.value?.files ?? 0
-  : idx.value?.total ?? 0);
-const displayedIndexDone = computed(() => selectedRoot.value
-  ? selectedRootStats.value
-    ? Math.max(0, Math.round(displayedIndexTotal.value * rootProgress(selectedRootStats.value) / 100))
-    : 0
-  : idx.value?.completed ?? 0);
+const indexElapsedLabel = computed(() => {
+  const seconds = Math.max(0, Math.floor(idx.value?.elapsed_seconds ?? 0));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+});
+
+const currentItemsLabel = computed(() => {
+  const names = (idx.value?.current_items || []).filter((name) => name.trim());
+  if (names.length) return names.join(",");
+  return idx.value?.current?.trim() || "";
+});
 
 onMounted(async () => {
   await loadCfg();
@@ -284,7 +503,7 @@ onBeforeUnmount(stopPolling);
             :key="r"
             class="root"
             :class="{ selected: selectedRoot === r, disabled: rootEnabled[r] === false }"
-            @click="selectedRoot = r"
+            @click="selectRootAndScan(r)"
           >
             <button
               class="root-toggle"
@@ -303,83 +522,59 @@ onBeforeUnmount(stopPolling);
           <button class="primary" @click="pickDir">{{ t("+ 添加目录") }}</button>
           <button class="ghost" @click="saveRoots">{{ t("保存") }}</button>
         </div>
-        <div v-if="selectedRoot" class="root-detail">
-          <div class="root-detail-head"><b>{{ selectedRoot }}</b><span>{{ rootEnabled[selectedRoot] === false ? t("已跳过") : t("已启用") }}</span></div>
-          <div class="root-detail-grid">
-            <span>{{ t("文件类型") }}</span><b>{{ selectedRootStats?.kinds_label || t("暂无文件") }}</b>
-            <span>{{ t("建立索引") }}</span><b>{{ rootProgress(selectedRootStats) }}%</b>
-            <span>{{ t("总文件数") }}</span><b>{{ (selectedRootStats?.files ?? 0).toLocaleString() }}</b>
-            <span>{{ t("目录大小") }}</span><b>{{ selectedRootStats?.bytes_label || '0 B' }}</b>
-            <span>{{ t("上次扫描") }}</span><b>{{ formatRootScanTime(selectedRootStats?.last_scan ?? 0) }}</b>
-            <span>{{ t("新增文件") }}</span><b>{{ (selectedRootStats?.added ?? 0).toLocaleString() }}</b>
-            <span>{{ t("更新文件") }}</span><b>{{ (selectedRootStats?.updated ?? 0).toLocaleString() }}</b>
-            <span>{{ t("跳过 / 错误") }}</span><b>{{ (selectedRootStats?.skipped ?? 0).toLocaleString() }} / {{ (selectedRootStats?.errors ?? 0).toLocaleString() }}</b>
-            <span>{{ t("正文完成 / 待处理") }}</span><b>{{ (selectedRootStats?.text_ok ?? 0).toLocaleString() }} / {{ (selectedRootStats?.text_pending ?? 0).toLocaleString() }}</b>
-            <span>{{ t("向量完成 / 待处理") }}</span><b>{{ (selectedRootStats?.embed_ok ?? 0).toLocaleString() }} / {{ (selectedRootStats?.embed_pending ?? 0).toLocaleString() }}</b>
-            <span>{{ t("已消失文件") }}</span><b>{{ (selectedRootStats?.missing ?? 0).toLocaleString() }}</b>
-          </div>
-          <p v-if="selectedRootStats?.last_error" class="root-error">{{ selectedRootStats.last_error }}</p>
-        </div>
       </section>
 
-      <section class="card blk types-card">
+      <section v-if="hasSelectedRoot" class="card blk types-card">
         <h3>{{ t("文件类型") }}</h3>
-        <div class="types">
-          <button
-            v-for="item in TYPES"
-            :key="item.k"
-            type="button"
-            class="type-tag"
-            :class="{ active: typeState[item.k] }"
-            :aria-pressed="typeState[item.k]"
-            @click="typeState[item.k] = !typeState[item.k]"
-          >{{ t(item.label) }}</button>
+        <div class="type-groups">
+          <div class="type-buttons">
+            <button
+              v-for="item in TYPES"
+              :key="item.k"
+              type="button"
+              class="type-tag"
+              :class="{ active: categorySelected(item.k), expanded: extensionGroupOpen === item.k }"
+              :aria-expanded="extensionGroupOpen === item.k"
+              @click="extensionGroupOpen = extensionGroupOpen === item.k ? '' : item.k"
+            >{{ t(item.label) }}</button>
+          </div>
+          <div v-if="extensionGroupOpen" class="extension-row">
+            <label v-for="extension in groupedExtensions[extensionGroupOpen] || []" :key="extension.ext" class="extension-chip" :class="{ selected: selectedExtensions.includes(extension.ext) }">
+              <input type="checkbox" :checked="selectedExtensions.includes(extension.ext)" @change="toggleExtension(extension.ext)" />
+              <span>{{ extension.ext ? `.${extension.ext}` : t("无扩展名") }}</span>
+            </label>
+            <span v-if="!(groupedExtensions[extensionGroupOpen] || []).length" class="empty-extension">{{ t("尚未扫描到此类型") }}</span>
+          </div>
         </div>
-        <p class="muted tiny">
-          {{ t("默认跳过系统目录、回收站、node_modules、.git 等；网盘目录可手动加排除。") }}
-        </p>
-        <div class="row">
-          <button class="primary" :disabled="operationBusy" @click="startScan">
-            {{ operationBusy ? t("处理中…") : t("扫描并建立索引") }}
-          </button>
-          <button class="ghost" :disabled="!operationBusy" @click="cancelScan">{{ t("取消") }}</button>
+        <div class="exclude-row">
+          <input v-model="excludeDraft" class="exclude-input" :placeholder="t('输入要跳过的路径或文件')" @keydown.enter.prevent="addExcludedPath" />
+          <button class="exclude-confirm" :class="{ ready: excludeDraft.trim() }" @click="addExcludedPath">{{ t("确定") }}</button>
+          <button class="ghost" @click="openExclusions">{{ t("列表") }} ({{ excludedPaths.length }})</button>
         </div>
       </section>
     </div>
 
-    <section class="card blk grow">
-      <h3>{{ t("进度") }}</h3>
-      <div class="prog">
-        <div class="pbar"><div class="pfill" :class="{ scanning: progress?.running }" :style="{ width: pct + '%' }"></div></div>
-        <span class="muted mono">{{ progress?.done ? "100%" : progress?.running ? t("扫描中") : "0%" }}</span>
+    <section v-if="hasSelectedRoot" class="card blk grow">
+      <h3>{{ t("索引进度") }}</h3>
+      <div class="scan-cards">
+        <div class="scan-stat"><b>{{ scanTotalFiles.toLocaleString() }}</b><span>{{ t("文件") }}</span></div>
+        <div class="scan-stat"><b>{{ scanAddedOrUpdated.toLocaleString() }}</b><span>{{ t("新增 / 更新") }}</span></div>
+        <div class="scan-stat" :class="{ warn: scanErrors > 0 }"><b>{{ scanErrors.toLocaleString() }}</b><span>{{ t("扫描错误") }}</span></div>
+        <div class="scan-stat"><b>{{ formatBytes(scanBytes) }}</b><span>{{ t("总体积") }}</span></div>
       </div>
-      <div class="stats" v-if="progress">
-        <div><b>{{ progress.files.toLocaleString() }}</b><span>{{ t("文件") }}</span></div>
-        <div><b>{{ progress.dirs.toLocaleString() }}</b><span>{{ t("目录") }}</span></div>
-        <div><b>{{ progress.added.toLocaleString() }}</b><span>{{ t("新增") }}</span></div>
-        <div><b>{{ progress.updated.toLocaleString() }}</b><span>{{ t("更新") }}</span></div>
-        <div><b>{{ progress.skipped.toLocaleString() }}</b><span>{{ t("跳过") }}</span></div>
-        <div><b>{{ progress.errors.toLocaleString() }}</b><span>{{ t("错误") }}</span></div>
-        <div :class="{ warn: progress.missing > 0 }">
-          <b>{{ (progress.missing || 0).toLocaleString() }}</b><span>{{ t("已消失") }}</span>
-        </div>
-        <div><b>{{ (progress.bytes / 1048576).toFixed(1) }}</b><span>MB</span></div>
-        <div><b>{{ progress.seconds.toFixed(1) }}</b><span>{{ t("秒") }}</span></div>
-      </div>
-      <div class="cur mono" v-if="progress?.current">正在扫描：{{ progress.current }}</div>
 
-      <h3 class="mt">{{ t("索引") }}</h3>
       <div class="prog">
         <div class="pbar"><div class="pfill index-fill" :style="{ width: indexPct + '%' }"></div></div>
         <span class="muted mono">{{ indexPct }}%</span>
       </div>
-      <div class="stats" v-if="idx">
+      <div class="index-stats" v-if="idx">
         <div><b>{{ idx.text_done }}</b><span>{{ t("正文已抽取") }}</span></div>
         <div><b>{{ idx.emb_done }}</b><span>{{ t("向量已完成") }}</span></div>
-        <div><b>{{ idx.thumb_done }}</b><span>{{ t("缩略图") }}</span></div>
-        <div><b>{{ idx.queued }}</b><span>{{ t("队列") }}</span></div>
-        <div><b>{{ displayedIndexDone }} / {{ displayedIndexTotal }}</b><span>{{ selectedRoot ? t("所选目录已处理 / 总数") : t("本批次进度") }}</span></div>
-        <div><b>{{ idx.emb_fail }}</b><span>{{ t("失败") }}</span></div>
+        <div><b>{{ idx.text_fail + idx.emb_fail }}</b><span>{{ t("失败") }}</span></div>
+        <div><b>{{ indexElapsedLabel }}</b><span>{{ t("已用时间") }}</span></div>
+      </div>
+      <div v-if="operationBusy && currentItemsLabel" class="index-current muted mono" :title="currentItemsLabel">
+        {{ t("正在处理：") }}{{ currentItemsLabel }}
       </div>
       <div class="row">
         <button class="primary" :disabled="operationBusy" @click="buildIndex('auto')">{{ t("建立索引") }}</button>
@@ -387,11 +582,24 @@ onBeforeUnmount(stopPolling);
         <button class="ghost" :disabled="operationBusy" @click="buildIndex('text')">{{ t("仅补正文") }}</button>
         <button class="ghost" :disabled="operationBusy" @click="buildIndex('embed')">{{ t("仅补向量") }}</button>
       </div>
-      <p class="muted tiny index-help">{{ t("正文用于全文检索，向量用于语义检索。日常使用“扫描并建立索引”即可；只有修改了抽取规则或更换模型时，才需要单独补其中一项。") }}</p>
-      <p class="muted tiny processing-files" v-if="idx?.running && idx.current_items?.length">
-        正在处理：{{ idx.current_items.join("、") }}
-      </p>
     </section>
+
+    <div v-if="exclusionsOpen" class="modal-backdrop" role="presentation" @click.self="closeExclusions">
+      <section class="exclude-modal" role="dialog" aria-modal="true" :aria-label="t('排除项列表')">
+        <button class="modal-close" type="button" :title="t('关闭')" @click="closeExclusions">×</button>
+        <h3>{{ t("排除项列表") }}</h3>
+        <div class="modal-items">
+          <div v-for="path in modalExcludedPaths" :key="path" class="exclude-item">
+            <span class="mono" :title="path">{{ path }}</span>
+            <button type="button" :title="t('删除')" @click="removeModalExcludedPath(path)">×</button>
+          </div>
+          <div v-if="!modalExcludedPaths.length" class="empty-extension">{{ t("没有排除项") }}</div>
+        </div>
+        <div class="modal-actions">
+          <button class="primary" type="button" @click="confirmExclusions">{{ t("确定") }}</button>
+        </div>
+      </section>
+    </div>
   </div>
 </template>
 
@@ -410,6 +618,7 @@ h3.mt { margin-top: 18px; }
   padding: 6px 10px; font-size: 12px;
 }
 .root.selected { outline: 2px solid #111; outline-offset: -2px; }
+.root { cursor: pointer; }
 .root.disabled { color: #777; background: #f2f2f2; }
 .root-toggle { width: 22px; height: 22px; flex: none; display: grid; place-items: center; padding: 0; border: 0; background: transparent; color: #111; font-size: 0; line-height: 0; cursor: pointer; }
 .root.disabled .root-toggle { color: #888; }
@@ -419,9 +628,30 @@ h3.mt { margin-top: 18px; }
 .row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
 .types-card { grid-column: 1 / -1; }
 .types-card .row { display: none; }
-.types { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 8px; }
+.type-groups { display: flex; flex-direction: column; gap: 6px; }
+.type-buttons { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; }
 .type-tag { min-width: 0; padding: 7px 5px; border: 1px solid #111; border-radius: 0; background: #e8e8e8; color: #666; font-size: 13px; cursor: pointer; white-space: nowrap; }
 .type-tag.active { background: #111; color: #fff; }
+.type-tag.expanded { outline: 1px solid #111; outline-offset: -3px; }
+.extension-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 8px 2px; border-top: 1px solid #111; background: #fff; }
+.extension-chip { display: inline-flex; flex-direction: row; align-items: center; gap: 4px; color: #111; background: transparent; font-size: 12px; cursor: pointer; white-space: nowrap; }
+.extension-chip input { appearance: none; display: inline-grid; flex: none; width: 12px; height: 12px; margin: 0; border: 1px solid #111; border-radius: 0; background: #fff; cursor: pointer; }
+.extension-chip input:checked { background: #111; }
+.extension-chip input:checked::after { content: "✓"; display: block; width: auto; height: auto; border: 0; transform: none; color: #fff; text-align: center; font-size: 11px; line-height: 1; font-weight: 700; }
+.empty-extension { color: #666; font-size: 11px; }
+.exclude-row { position: relative; display: flex; gap: 6px; margin-top: 10px; }
+.exclude-input { flex: 1; min-width: 0; padding: 7px 9px; border: 1px solid #111; border-radius: 0; background: #fff; }
+.exclude-confirm { padding: 7px 14px; border: 1px solid #111; border-radius: 2px; color: #111; background: #fff; cursor: pointer; transition: color .18s, background .18s; }
+.exclude-confirm.ready { color: #fff; background: #111; }
+.exclude-item { display: flex; align-items: center; gap: 7px; min-height: 32px; padding: 3px 6px; border-bottom: 1px solid #ddd; }
+.exclude-item .mono { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.exclude-item button { width: 24px; height: 24px; padding: 0; border: 1px solid #111; color: #111; background: #fff; cursor: pointer; }
+.modal-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 18px; background: rgba(0, 0, 0, .28); backdrop-filter: blur(5px); }
+.exclude-modal { position: relative; width: min(620px, 100%); max-height: min(620px, 90vh); display: flex; flex-direction: column; padding: 20px; border: 1px solid #111; border-radius: 8px; background: #fff; box-shadow: 0 18px 50px rgba(0, 0, 0, .25); }
+.exclude-modal h3 { margin: 0 0 12px; color: #111; }
+.modal-close { position: absolute; top: 9px; right: 10px; width: auto; height: auto; padding: 0 2px; border: 0; border-radius: 0; color: #111; background: transparent; font-size: 22px; line-height: 1; cursor: pointer; }
+.modal-items { min-height: 80px; overflow: auto; border-top: 1px solid #ddd; }
+.modal-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
 .type-tag:focus-visible, .root-toggle:focus-visible { outline: 2px solid #111; outline-offset: 2px; }
 .root-detail { margin-top: 12px; border-top: 1px solid #111; padding-top: 10px; }
 .root-detail-head { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; }
@@ -430,17 +660,20 @@ h3.mt { margin-top: 18px; }
 .root-detail-grid span { color: #666; }
 .root-detail-grid b { overflow-wrap: anywhere; font-weight: 600; }
 .root-error { margin: 9px 0 0; color: #8c1d18; font-size: 11px; overflow-wrap: anywhere; }
-.prog { display: flex; align-items: center; gap: 10px; }
+.prog { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
 .pbar { flex: 1; height: 8px; background: #1b2333; border-radius: 5px; overflow: hidden; }
 .pfill { height: 100%; background: linear-gradient(90deg, #4f8cff, #22c55e); transition: width .3s; }
-.stats { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 14px; }
-.stats div { display: flex; flex-direction: column; gap: 2px; }
-.stats b { font-size: 18px; font-weight: 600; }
-.stats span { font-size: 11px; color: var(--muted); }
-.stats .warn b { color: var(--warn); }
-.cur { margin-top: 10px; font-size: 11px; color: var(--muted); overflow: hidden; overflow-wrap: anywhere; line-height: 1.45; max-height: 3.1em; }
+.scan-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.scan-stat { display: flex; min-width: 0; flex-direction: column; gap: 3px; padding: 9px 10px; border: 1px solid #111; background: #fff; }
+.scan-stat b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 17px; font-weight: 600; }
+.scan-stat span { color: #555; font-size: 11px; }
+.scan-stat.warn b { color: #8c1d18; }
+.index-stats { display: flex; gap: 28px; margin-top: 10px; }
+.index-stats div { display: flex; min-width: 70px; flex-direction: column; gap: 3px; }
+.index-stats b { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.index-stats span { color: #555; font-size: 11px; }
+.index-current { margin-top: 10px; color: #666; font-size: 11px; line-height: 1.45; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tiny { font-size: 11px; }
-.processing-files { margin: 8px 0 0; line-height: 1.45; overflow-wrap: anywhere; }
 /* Flat white/black scan surface. */
 .view { color: #111; }
 .blk { border: 1px solid #111; border-radius: 2px; background: #fff; }
@@ -452,7 +685,8 @@ h3 { color: #111; }
 .index-fill { background: #555; }
 .pfill.scanning { animation: scan-progress 1.35s ease-in-out infinite alternate; }
 @keyframes scan-progress { from { transform: translateX(0); } to { transform: translateX(185%); } }
-.stats b { color: #111; }
-.stats span, .cur { color: #555; }
-.stats .warn b { color: #8c6410; }
+@media (max-width: 720px) {
+  .type-buttons { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .scan-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 </style>

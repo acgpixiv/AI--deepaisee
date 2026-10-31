@@ -9,7 +9,13 @@ use std::collections::{HashMap, HashSet};
 
 /// Keep an explicit safety ceiling for a single UI request while removing the
 /// old 200-result behavior. Larger result sets should be paged with `offset`.
-const MAX_RESULT_LIMIT: usize = 10_000;
+// The database candidate scan currently supplies at most 50,000 rows. Keep
+// the request ceiling aligned with that scan so the old 1,000-result UI cap
+// cannot silently truncate otherwise valid matches.
+const MAX_RESULT_LIMIT: usize = 50_000;
+/// Final user-visible relevance floor shared by indexed, similar, and
+/// workspace results. Internal model floors remain separate calibration steps.
+pub const MIN_RESULT_SCORE: f32 = 0.40;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -48,6 +54,13 @@ pub struct SearchQuery {
     pub audio_query: Option<Vec<f32>>,
     /// 是否把「工作区目录」里尚未入库的文件也算进来（实时抽取正文）。
     pub workspace: Option<bool>,
+    /// Search scope selected on the home page: `all` (all indexed rows plus
+    /// configured live workspace), `indexed` (database only), or `path`
+    /// (the selected path, including live files that are not indexed yet).
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub scope_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,9 +78,14 @@ pub struct Hit {
     pub mtime_label: String,
     pub category: Option<String>,
     pub thumb: bool,
+    /// Persistent thumbnail cache key. The UI must use this only when the
+    /// indexed row confirms that the cache belongs to the current file.
+    pub thumb_key: Option<String>,
     pub score: f32,
     pub reason: String,
     pub snippet: Option<String>,
+    /// One-based page/slide number for page-level document matches.
+    pub page: Option<i64>,
     /// 视觉标签（图片/视频）：蓝天、草地、雪景、夕阳…
     pub tags: Option<String>,
 }
@@ -87,14 +105,12 @@ impl Hit {
             mtime: r.mtime,
             mtime_label: format_ts(r.mtime),
             category: r.category.clone(),
-            thumb: r.thumb_key.is_some()
-                || r.kind == "image"
-                || r.kind == "video"
-                || (r.kind == "document"
-                    && matches!(r.ext.to_ascii_lowercase().as_str(), "pdf" | "docx")),
+            thumb: r.thumb_key.is_some(),
+            thumb_key: r.thumb_key.clone(),
             score,
             reason: reason.to_string(),
             snippet: None,
+            page: None,
             tags: r.tags.clone(),
         }
     }
@@ -114,7 +130,10 @@ pub struct SearchEngine<'a> {
 }
 
 fn limit_for_cross(q: &SearchQuery) -> usize {
-    q.limit.unwrap_or(800).clamp(400, MAX_RESULT_LIMIT)
+    q.offset
+        .unwrap_or(0)
+        .saturating_add(q.limit.unwrap_or(800))
+        .clamp(400, MAX_RESULT_LIMIT)
 }
 
 /// Restrict a query to configured, enabled index roots while preserving a
@@ -221,6 +240,21 @@ fn fuzzy_score(ql: &str, query_chars: usize, name: &str) -> f32 {
     }
 }
 
+fn semantic_score(similarity: f32, configured_floor: f32, query_chars: usize) -> Option<f32> {
+    // Very short queries (especially single Chinese characters) have weak
+    // embedding intent and otherwise return broad clusters of unrelated
+    // images. Keep the configured floor for normal queries, with a stricter
+    // minimum for ambiguous short input.
+    let short_query_floor = if query_chars <= 2 { 0.62 } else { 0.0 };
+    let floor = configured_floor.clamp(0.0, 0.99).max(short_query_floor);
+    if similarity < floor {
+        return None;
+    }
+    // Show cosine similarity as-is. The old scaling gave every accepted match
+    // an artificial 0.40 baseline and made unrelated vectors look like 0.52.
+    Some(similarity.clamp(0.0, 1.0))
+}
+
 impl<'a> SearchEngine<'a> {
     pub fn search(&self, q: &SearchQuery) -> Vec<Hit> {
         let text = q.text.trim().to_string();
@@ -229,11 +263,13 @@ impl<'a> SearchEngine<'a> {
         let query_chars = text.chars().count();
         let limit = q.limit.unwrap_or(self.cfg.page_size).clamp(1, MAX_RESULT_LIMIT);
         let offset = q.offset.unwrap_or(0);
+        let candidate_limit = offset.saturating_add(limit).min(MAX_RESULT_LIMIT);
         let low_text = query_chars < 2;
         // 相似检索：只有向量、没有文本
         let pure_vector = q.query_vector.is_some() && low_text;
         let rows = self.candidate_rows(q, if low_text { 20_000 } else { 50_000 });
         let mut scored: HashMap<i64, (FileRow, f32, String)> = HashMap::new();
+        let mut matched_pages: HashMap<i64, i64> = HashMap::new();
 
         if !low_text {
             let use_pinyin = q.use_pinyin.unwrap_or(self.cfg.use_pinyin);
@@ -305,7 +341,7 @@ impl<'a> SearchEngine<'a> {
         let mut fts_ids: HashSet<i64> = HashSet::new();
         if use_fts && !low_text {
             if let Some(expr) = build_fts_expr(&text) {
-                if let Ok(hits) = self.db.search_fts(&expr, limit.max(500).min(MAX_RESULT_LIMIT)) {
+                if let Ok(hits) = self.db.search_fts(&expr, candidate_limit.max(500).min(MAX_RESULT_LIMIT)) {
                     // bm25() 返回的是负数，越负越相关（ORDER BY 升序 = 最相关在前）。
                     // 所以取反后再归一化，否则最相关的那条 rel 会是 0、其余为负，
                     // 全部被阈值滤掉 —— 表现为「正文里明明有这个词却搜不到」。
@@ -343,6 +379,14 @@ impl<'a> SearchEngine<'a> {
                             }
                         }
                     }
+                    // Keep the best page number for the result payload. The
+                    // aggregate docs table still supplies the main score, so
+                    // page matches do not double-count the same text.
+                    if let Ok(page_hits) = self.db.search_pages_fts(&expr, candidate_limit.max(500).min(MAX_RESULT_LIMIT)) {
+                        for (fid, page, _score) in page_hits {
+                            matched_pages.entry(fid).or_insert(page);
+                        }
+                    }
                 }
             }
         }
@@ -370,23 +414,44 @@ impl<'a> SearchEngine<'a> {
                     }
                     _ => vec![self.vectors],
                 };
-                let floor = self.cfg.semantic_floor;
+                // Keep the user-visible floor at 0.40. Older configs used
+                // 0.45 as an internal noise floor, which silently discarded
+                // valid cross-language matches from multilingual embedders.
                 for store in stores {
-                    for (fid, sc) in store.search(&qvec, limit.max(800).min(MAX_RESULT_LIMIT), allowed_ref) {
-                        let rel = ((sc - floor) / (1.0 - floor)).clamp(0.0, 1.0);
-                        if rel <= 0.0 {
-                            continue;
+                    // Video windows use negative synthetic IDs. Resolve them
+                    // before applying root/type filters or reading files.id.
+                    for (fid, sc) in store.search(&qvec, candidate_limit.max(800).min(MAX_RESULT_LIMIT), None) {
+                        let source_id = crate::ai::video_segment_source(fid).unwrap_or(fid);
+                        if let Some(allowed) = allowed_ref {
+                            if !allowed.contains(&source_id) {
+                                continue;
+                            }
                         }
-                        let add = self.cfg.semantic_weight * 1.6 * rel;
-                        if let Some((_, score, reason)) = scored.get_mut(&fid) {
-                            *score += add;
+                        // Keep semantic-only results in cosine units so the
+                        // displayed confidence is not inflated by a baseline.
+                        let Some(add) = semantic_score(
+                            sc,
+                            self.cfg.semantic_floor,
+                            query_chars,
+                        ) else {
+                            continue;
+                        };
+                        if let Some((_, score, reason)) = scored.get_mut(&source_id) {
+                            let floor = if query_chars <= 2 {
+                                self.cfg.semantic_floor.max(0.62)
+                            } else {
+                                self.cfg.semantic_floor
+                            };
+                            *score = (*score
+                                + (add - floor).max(0.0) * self.cfg.semantic_weight.clamp(0.0, 1.0))
+                                .min(1.0);
                             // 原因只做「升级」不做降级：名称/全文这种确定性命中
                             // 比语义更有解释力，不能被后执行的语义分支覆盖成「语义相似」。
                             if reason == "全部" {
                                 *reason = "语义相似".to_string();
                             }
-                        } else if let Ok(Some(r)) = self.db.get_by_id(fid) {
-                            scored.insert(fid, (r, add, "语义相似".to_string()));
+                        } else if let Ok(Some(r)) = self.db.get_by_id(source_id) {
+                            scored.insert(source_id, (r, add, "语义相似".to_string()));
                         }
                     }
                 }
@@ -406,15 +471,24 @@ impl<'a> SearchEngine<'a> {
         // 过滤阈值 + 排序
         let mut list: Vec<(FileRow, f32, String)> = scored
             .into_values()
-            .filter(|(_, s, _)| pure_vector || *s >= 0.16)
+            .filter(|(_, s, _)| *s >= MIN_RESULT_SCORE)
             .collect();
         let sort = q.sort.clone().unwrap_or_else(|| "relevance".to_string());
         match sort.as_str() {
-            "name" => list.sort_by(|a, b| a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase())),
-            "size" => list.sort_by(|a, b| a.0.size.cmp(&b.0.size)),
-            "mtime" => list.sort_by(|a, b| a.0.mtime.cmp(&b.0.mtime)),
-            "kind" => list.sort_by(|a, b| a.0.kind.cmp(&b.0.kind)),
-            _ => list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)),
+            "name" => list.sort_by(|a, b| {
+                a.0.name
+                    .to_lowercase()
+                    .cmp(&b.0.name.to_lowercase())
+                    .then_with(|| a.0.id.cmp(&b.0.id))
+            }),
+            "size" => list.sort_by(|a, b| a.0.size.cmp(&b.0.size).then_with(|| a.0.id.cmp(&b.0.id))),
+            "mtime" => list.sort_by(|a, b| a.0.mtime.cmp(&b.0.mtime).then_with(|| a.0.id.cmp(&b.0.id))),
+            "kind" => list.sort_by(|a, b| a.0.kind.cmp(&b.0.kind).then_with(|| a.0.id.cmp(&b.0.id))),
+            _ => list.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.id.cmp(&b.0.id))
+            }),
         }
         if q.desc && sort != "relevance" {
             list.reverse();
@@ -424,6 +498,7 @@ impl<'a> SearchEngine<'a> {
             .take(limit)
             .map(|(r, s, reason)| {
                 let mut hit = Hit::from_row(&r, s, &reason);
+                hit.page = matched_pages.get(&r.id).copied();
                 // 正文命中要能看见上下文，否则用户不知道「为什么这条算命中」。
                 if fts_ids.contains(&r.id) {
                     if let Ok(Some(raw)) = self.db.get_doc_raw(r.id) {
@@ -835,6 +910,11 @@ pub fn similar_scoped(
             if r.path.is_empty() {
                 continue;
             }
+            // Similarity scores are cosine values in the selected vector
+            // space. Hide weak matches consistently with normal search.
+            if sc < MIN_RESULT_SCORE {
+                continue;
+            }
             if let Some(ref k) = want_kind {
                 if &r.kind != k {
                     continue;
@@ -852,7 +932,7 @@ pub fn similar_scoped(
 
 #[cfg(test)]
 mod root_scope_tests {
-    use super::{apply_enabled_root_scope, SearchQuery};
+    use super::{apply_enabled_root_scope, semantic_score, SearchQuery};
 
     fn query_roots(requested: &[&str], configured: &[&str], disabled: &[&str]) -> Vec<String> {
         let mut query = SearchQuery::default();
@@ -885,5 +965,14 @@ mod root_scope_tests {
             query_roots(&["D:\\"], &["D:\\Media"], &[]),
             vec!["D:\\Media"]
         );
+    }
+
+    #[test]
+    fn semantic_scores_report_cosine_and_filter_ambiguous_short_queries() {
+        assert_eq!(semantic_score(0.39, 0.45, 3), None);
+        assert_eq!(semantic_score(0.53, 0.45, 3), Some(0.53));
+        assert_eq!(semantic_score(0.53, 0.45, 1), None);
+        assert_eq!(semantic_score(0.61, 0.45, 1), None);
+        assert_eq!(semantic_score(0.70, 0.45, 1), Some(0.70));
     }
 }

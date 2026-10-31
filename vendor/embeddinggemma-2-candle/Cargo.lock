@@ -749,6 +749,7 @@ dependencies = [
  "hf-hub",
  "hound",
  "image",
+ "rayon",
  "rustfft",
  "serde",
  "serde_json",

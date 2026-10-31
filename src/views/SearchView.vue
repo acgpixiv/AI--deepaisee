@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { ArrowDownUp, Check, ChevronRight, Download, Search, X } from "lucide-vue-next";
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import { ArrowDownUp, Check, ChevronDown, ChevronRight, Download, FolderOpen, Search, X } from "lucide-vue-next";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { api, type Hit, type SearchQuery } from "../api";
 import { langState, t } from "../i18n";
 import { toast } from "../store";
@@ -9,6 +10,8 @@ import ResultGallery from "../components/ResultGallery.vue";
 const props = defineProps<{ thumbDir: string }>();
 
 const text = ref("");
+// Hybrid is the default: lexical matches stay instant, while semantic search
+// is loaded lazily on the first query that needs it.
 const semantic = ref(true);
 const fulltext = ref(true);
 const pinyin = ref(true);
@@ -16,21 +19,52 @@ const fuzzy = ref(true);
 const visual = ref(true);
 const workspaceMode = ref(true);
 const debounceMs = ref(260);
-const pageSize = ref(1000);
+const RESULT_PAGE_SIZE = 500;
+const pageSize = ref(RESULT_PAGE_SIZE);
 const kind = ref("all");
 const sort = ref("relevance");
 const desc = ref(true);
-const hits = ref<Hit[]>([]);
-const recentHits = ref<Hit[]>([]);
+const hits = shallowRef<Hit[]>([]);
+const allHits: Hit[] = [];
+const hitBuckets = new Map<string, Hit[]>();
+const loadedResultsRevision = ref(0);
 const loading = ref(false);
 const searched = ref(false);
 const selected = ref<Hit | null>(null);
-const elapsed = ref(0);
 const similarMode = ref(false);
 const similarSource = ref<Hit | null>(null);
 const selectedIds = ref<Set<number>>(new Set());
+const selectAllActive = ref(false);
+const selectAllKind = ref("all");
+const loadingMore = ref(false);
+const renderLimit = ref(RESULT_PAGE_SIZE);
 const typedPrompt = ref("");
-const recentOpen = ref(false);
+const scopeOpen = ref(false);
+const scopeValue = ref("all");
+const scopeConfig = ref<Record<string, any>>({});
+const driveRoots = ref<string[]>([]);
+type ScopeOption = { value: string; label: string; path?: string; mode: "all" | "indexed" | "path" };
+const driveOptions = computed<ScopeOption[]>(() => {
+  const drives = new Map<string, string>();
+  for (const root of driveRoots.value) {
+    const match = root.match(/^([a-z]:)(?:[\\/]|$)/i);
+    if (match) drives.set(match[1].toLowerCase(), `${match[1].toUpperCase()}\\`);
+  }
+  return [...drives.values()].sort().map((path) => ({ value: `drive:${path}`, label: path, path, mode: "path" }));
+});
+const recentScopeOptions = computed<ScopeOption[]>(() => ((scopeConfig.value.recent_paths as string[] | undefined) ?? []).map((path) => ({ value: `recent:${path}`, label: path, path, mode: "path" })));
+const pinnedScopeOptions = computed<ScopeOption[]>(() => ((scopeConfig.value.pinned_paths as string[] | undefined) ?? []).map((path) => ({ value: `pinned:${path}`, label: path, path, mode: "path" })));
+const scopeOptions = computed<ScopeOption[]>(() => [
+  { value: "all", label: t("全盘"), mode: "all" },
+  { value: "indexed", label: t("仅索引"), mode: "indexed" },
+  ...driveOptions.value,
+  ...recentScopeOptions.value,
+  ...pinnedScopeOptions.value.filter((item) => !recentScopeOptions.value.some((recent) => recent.path?.toLowerCase() === item.path?.toLowerCase())),
+  ...(scopeConfig.value.initial_path && ![...recentScopeOptions.value, ...pinnedScopeOptions.value, ...driveOptions.value].some((item) => item.path?.toLowerCase() === String(scopeConfig.value.initial_path).toLowerCase())
+    ? [{ value: "initial:" + scopeConfig.value.initial_path, label: String(scopeConfig.value.initial_path), path: String(scopeConfig.value.initial_path), mode: "path" as const }]
+    : []),
+]);
+const activeScope = computed(() => scopeOptions.value.find((item) => item.value === scopeValue.value) ?? scopeOptions.value[0]);
 
 // 界面文案在模板里用 t() 翻译，这里保留中文原文作为词条 key。
 const KINDS = [
@@ -39,8 +73,11 @@ const KINDS = [
   { v: "video", label: "视频" },
   { v: "audio", label: "音频" },
   { v: "document", label: "文档" },
-  { v: "text", label: "文本" },
   { v: "archive", label: "压缩包" },
+];
+const FILTER_KINDS = [
+  ...KINDS,
+  { v: "other", label: "其他" },
 ];
 const SORTS = [
   { v: "relevance", label: "相关度" },
@@ -52,6 +89,9 @@ const SORTS = [
 
 let searchTimer: number | undefined;
 let typeTimer: number | undefined;
+let searchGeneration = 0;
+let loadingMoreGeneration = 0;
+let disposed = false;
 let promptIndex = 0;
 let deleting = false;
 // 打字机文案跟随界面语言：词条走 i18n，切换语言时重置动画。
@@ -81,9 +121,12 @@ function typePrompt() {
 }
 
 function buildQuery(): SearchQuery {
+  const scope = activeScope.value;
   return {
     text: text.value,
-    kinds: kind.value === "all" ? [] : [kind.value],
+    // Type pills filter the fetched pages locally; changing a type does not
+    // issue another model/database query.
+    kinds: [],
     exts: [],
     roots: [],
     categories: [],
@@ -95,42 +138,158 @@ function buildQuery(): SearchQuery {
     use_fuzzy: fuzzy.value,
     use_semantic: semantic.value,
     cross_modal: visual.value,
-    workspace: workspaceMode.value,
+    workspace: workspaceMode.value && scope?.mode !== "indexed",
+    scope: scope?.mode ?? "all",
+    scope_path: scope?.mode === "path" ? scope.path ?? null : null,
   };
 }
 
-async function run() {
-  if (similarMode.value) return runSimilar();
-  searched.value = true;
-  loading.value = true;
-  const started = performance.now();
+async function persistScope(next: string, path?: string) {
   try {
-    let res: Hit[];
-    if (!text.value.trim() && kind.value === "all" && sort.value === "relevance") {
-      res = recentHits.value.length ? recentHits.value : await api.recent(200);
-    } else {
-      const q = buildQuery();
-      res = semantic.value && text.value.trim() ? await api.searchSemantic(q) : await api.search(q);
+    const state = await api.workspaceSetActive(path ? "path" : next, path);
+    scopeConfig.value = { ...scopeConfig.value, ...state };
+    scopeValue.value = path ? "recent:" + path : next;
+    scopeOpen.value = false;
+  } catch (error) {
+    toast(`${t("保存搜索范围失败：")}${error}`, "error");
+  }
+  if (searched.value && text.value.trim()) schedule();
+}
+
+async function addRecentScope(path: string) {
+  const normalized = path.replace(/[\\/]+$/, "") || path;
+  const recent = (scopeConfig.value.recent_paths as string[] | undefined) ?? [];
+  scopeConfig.value.recent_paths = [normalized, ...recent.filter((item) => item.toLowerCase() !== normalized.toLowerCase())].slice(0, 3);
+  try { await api.saveConfig({ workspace: { recent_paths: scopeConfig.value.recent_paths } }); } catch {}
+  await persistScope(`recent:${normalized}`, normalized);
+}
+
+async function chooseSearchPath() {
+  try {
+    const picked = await openDialog({ directory: true, multiple: false, title: t("选择搜索范围") });
+    if (typeof picked === "string" && picked) await addRecentScope(picked);
+  } catch (error) { toast(`${t("选择目录失败：")}${error}`, "error"); }
+}
+
+async function chooseScope(option: ScopeOption) {
+  await persistScope(option.value, option.path);
+}
+
+function matchesKind(hit: Hit, selectedKind: string): boolean {
+  if (selectedKind === "all") return true;
+  if (selectedKind === "document") return hit.kind === "document" || hit.kind === "text";
+  if (selectedKind === "other") return hit.kind === "other" || hit.kind === "app";
+  return hit.kind === selectedKind;
+}
+
+function resetResults() {
+  allHits.length = 0;
+  hitBuckets.clear();
+  for (const item of FILTER_KINDS) hitBuckets.set(item.v, []);
+  hits.value = [];
+  loadedResultsRevision.value++;
+}
+
+function syncVisibleHits() {
+  hits.value = (hitBuckets.get(kind.value) ?? []).slice(0, renderLimit.value);
+}
+
+function appendResults(results: Hit[]) {
+  if (!results.length) return;
+  const nextSelected = selectAllActive.value ? new Set(selectedIds.value) : null;
+  for (const hit of results) {
+    allHits.push(hit);
+    for (const item of FILTER_KINDS) {
+      if (matchesKind(hit, item.v)) hitBuckets.get(item.v)?.push(hit);
     }
-    hits.value = res;
-    elapsed.value = performance.now() - started;
-    if (selected.value) selected.value = res.find((hit) => hit.id === selected.value?.id) || null;
+    if (nextSelected && matchesKind(hit, selectAllKind.value)) nextSelected.add(hit.id);
+  }
+  if (nextSelected && nextSelected.size !== selectedIds.value.size) selectedIds.value = nextSelected;
+  loadedResultsRevision.value++;
+  const activeBucket = hitBuckets.get(kind.value) ?? [];
+  if (activeBucket.length > hits.value.length && hits.value.length < renderLimit.value) syncVisibleHits();
+}
+
+const displayHits = computed(() => hits.value);
+const visibleSelectedCount = computed(() => displayHits.value.reduce((count, hit) => count + (selectedIds.value.has(hit.id) ? 1 : 0), 0));
+const renderedHits = computed(() => displayHits.value.slice(0, renderLimit.value));
+const hasMore = ref(false);
+
+async function run(loadMore = false) {
+  if (similarMode.value) return runSimilar();
+  const generation = ++searchGeneration;
+  loadingMoreGeneration = generation;
+  loadingMore.value = false;
+  hasMore.value = false;
+  renderLimit.value = RESULT_PAGE_SIZE;
+  if (!loadMore) {
+    selectedIds.value = new Set();
+    selectAllActive.value = false;
+    resetResults();
+  }
+  searched.value = true;
+  if (!loadMore) loading.value = true;
+  try {
+    if (!text.value.trim()) {
+      resetResults();
+      hasMore.value = false;
+      return;
+    }
+    const q = buildQuery();
+    q.limit = pageSize.value;
+    q.offset = loadMore ? allHits.length : 0;
+    const res = semantic.value ? await api.searchSemantic(q) : await api.search(q);
+    if (generation !== searchGeneration || disposed) return;
+    appendResults(res);
+    hasMore.value = res.length === pageSize.value;
+    if (!loadMore && hasMore.value) void loadRemaining(generation);
   } catch (e) {
-    hits.value = [];
+    if (!loadMore) resetResults();
+    if (generation !== searchGeneration || disposed) return;
     toast(`${t("搜索失败：")}${e}`, "error");
   } finally {
-    loading.value = false;
+    if (!loadMore && generation === searchGeneration) loading.value = false;
+  }
+}
+
+async function loadRemaining(generation: number) {
+  if (loadingMore.value && loadingMoreGeneration === generation) return;
+  loadingMoreGeneration = generation;
+  loadingMore.value = true;
+  try {
+    while (hasMore.value && generation === searchGeneration && !disposed) {
+      const q = buildQuery();
+      q.limit = pageSize.value;
+      q.offset = allHits.length;
+      const res = semantic.value ? await api.searchSemantic(q) : await api.search(q);
+      if (generation !== searchGeneration || disposed) return;
+      if (!res.length) {
+        hasMore.value = false;
+        break;
+      }
+      appendResults(res);
+      hasMore.value = res.length === pageSize.value;
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+    }
+  } catch (e) {
+    if (generation === searchGeneration && !disposed) toast(`Loading more results failed: ${e}`, "error");
+  } finally {
+    if (loadingMoreGeneration === generation) loadingMore.value = false;
   }
 }
 
 async function runSimilar() {
   if (!similarSource.value) return;
+  const generation = ++searchGeneration;
+  loadingMoreGeneration = generation;
+  loadingMore.value = false;
+  renderLimit.value = RESULT_PAGE_SIZE;
+  resetResults();
   searched.value = true;
   loading.value = true;
-  const started = performance.now();
   try {
-    hits.value = await api.similar(similarSource.value.id, kind.value === "all" ? undefined : kind.value, 1000);
-    elapsed.value = performance.now() - started;
+    appendResults(await api.similar(similarSource.value.id, undefined, RESULT_PAGE_SIZE));
+    hasMore.value = false;
   } catch (e) {
     toast(`${t("相似检索失败：")}${e}`, "error");
   } finally {
@@ -140,16 +299,30 @@ async function runSimilar() {
 
 function schedule() {
   window.clearTimeout(searchTimer);
+  searchGeneration++;
+  loadingMoreGeneration = searchGeneration;
+  loadingMore.value = false;
+  hasMore.value = false;
+  loading.value = false;
   if (!text.value.trim() && !similarMode.value) {
     searched.value = false;
-    hits.value = [];
+    resetResults();
     selected.value = null;
     selectedIds.value = new Set();
     return;
   }
   searched.value = true;
-  recentOpen.value = false;
   searchTimer = window.setTimeout(run, debounceMs.value);
+}
+
+function runNow() {
+  window.clearTimeout(searchTimer);
+  void run();
+}
+
+function revealMoreResults() {
+  renderLimit.value += RESULT_PAGE_SIZE;
+  syncVisibleHits();
 }
 
 function enterSimilar(hit: Hit) {
@@ -163,13 +336,8 @@ function exitSimilar() {
   similarSource.value = null;
 }
 
-function openRecent(hit: Hit) {
-  recentOpen.value = false;
-  void open(hit);
-}
-
 async function open(hit: Hit) {
-  try { await api.openPath(hit.path); } catch (e) { toast(`${t("打开失败：")}${e}`, "error"); }
+  try { await api.openIndexedPath(hit.id, hit.path); } catch (e) { toast(`${t("打开失败：")}${e}`, "error"); }
 }
 
 async function reveal(hit: Hit) {
@@ -196,13 +364,20 @@ function toggleSelected(id: number) {
 }
 
 function toggleAll() {
-  selectedIds.value = selectedIds.value.size === hits.value.length
-    ? new Set()
-    : new Set(hits.value.map((hit) => hit.id));
+  const visibleIds = new Set((hitBuckets.get(kind.value) ?? []).map((hit) => hit.id));
+  const allVisibleSelected = displayHits.value.length > 0 && visibleSelectedCount.value === displayHits.value.length;
+  const next = new Set(selectedIds.value);
+  for (const id of visibleIds) {
+    if (allVisibleSelected) next.delete(id); else next.add(id);
+  }
+  selectAllActive.value = !allVisibleSelected;
+  selectAllKind.value = kind.value;
+  selectedIds.value = next;
 }
 
 async function doExport() {
-  const paths = hits.value.filter((hit) => selectedIds.value.has(hit.id)).map((hit) => hit.path);
+  while (loadingMore.value) await new Promise<void>((resolve) => window.setTimeout(resolve, 25));
+  const paths = allHits.filter((hit) => matchesKind(hit, kind.value) && selectedIds.value.has(hit.id)).map((hit) => hit.path);
   if (!paths.length) return toast(t("请先勾选文件"), "warn");
   try {
     const out = `${await api.dataDir()}\\export-${Date.now()}.csv`;
@@ -213,13 +388,31 @@ async function doExport() {
   }
 }
 
-watch([text, semantic, fulltext, pinyin, fuzzy, visual, workspaceMode, kind, sort, desc], schedule);
+watch([text, semantic, fulltext, pinyin, fuzzy, visual, workspaceMode, sort, desc], schedule);
+watch(kind, () => { renderLimit.value = RESULT_PAGE_SIZE; syncVisibleHits(); });
 watch(similarMode, (value) => { if (value) runSimilar(); else if (searched.value) run(); });
 
 onMounted(async () => {
   typePrompt();
   try {
-    const [config, recent] = await Promise.all([api.getConfig(), api.recent(80)]);
+    const [config, drives, workspace] = await Promise.all([api.getConfig(), api.availableDrives(), api.workspaceState()]);
+    scopeConfig.value = { ...(config.workspace ?? {}), ...workspace };
+    driveRoots.value = drives;
+    const launchDefault = scopeConfig.value.startup_scope ?? "remember";
+    const savedScope = scopeConfig.value.last_scope === "path"
+      ? String(scopeConfig.value.last_path ?? "")
+      : String(scopeConfig.value.last_scope ?? "indexed");
+    const remembered = savedScope === "all" || savedScope === "indexed"
+      ? savedScope
+      : savedScope ? `recent:${savedScope}` : "indexed";
+    if (launchDefault === "remember") scopeValue.value = remembered;
+    else if (launchDefault === "fixed" && scopeConfig.value.startup_path) scopeValue.value = `pinned:${scopeConfig.value.startup_path}`;
+    else scopeValue.value = launchDefault;
+    if (!scopeOptions.value.some((item) => item.value === scopeValue.value)) scopeValue.value = "indexed";
+    const initialScope = String(workspace.initial_scope ?? "indexed");
+    scopeValue.value = initialScope === "path"
+      ? scopeOptions.value.find((item) => item.path?.toLowerCase() === String(workspace.initial_path).toLowerCase())?.value ?? "indexed"
+      : initialScope;
     semantic.value = config.search.use_semantic !== false;
     fulltext.value = config.search.use_fulltext !== false;
     pinyin.value = config.search.use_pinyin !== false;
@@ -230,15 +423,13 @@ onMounted(async () => {
     if (mode === "fulltext") { semantic.value = false; fulltext.value = true; }
     else if (mode === "semantic") { semantic.value = true; fulltext.value = false; }
     else if (mode === "hybrid") { semantic.value = true; fulltext.value = true; }
-    workspaceMode.value = Boolean(config.workspace?.enabled) && ((config.workspace?.dirs as string[] | undefined)?.length ?? 0) > 0;
-    // Migrate the old 200-result default so an existing config cannot keep
-    // the previous practical ceiling. The backend still caps a single page
-    // at 10,000 and supports offset pagination for larger collections.
-    pageSize.value = Math.min(10000, Math.max(1000, Number(config.search.page_size ?? 1000)));
+    workspaceMode.value = Boolean(config.workspace?.enabled);
+    // Migrate the old 1,000-result default. The backend scans up to 50,000
+    // candidates, so normal searches no longer stop at the old ceiling.
+    pageSize.value = RESULT_PAGE_SIZE;
     debounceMs.value = Math.min(2000, Math.max(0, Number(config.search.debounce_ms ?? 200)));
-    recentHits.value = recent;
   } catch {
-    try { recentHits.value = await api.recent(80); } catch {}
+    scopeValue.value = "indexed";
   }
 });
 
@@ -256,22 +447,25 @@ watch(
 );
 
 onBeforeUnmount(() => {
+  disposed = true;
+  searchGeneration++;
   window.clearTimeout(searchTimer);
   window.clearTimeout(typeTimer);
 });
 
 const resultLabel = computed(() => {
+  void loadedResultsRevision.value;
   if (similarMode.value) {
     return `${t("相似于")} ${similarSource.value?.name || t("当前文件")}`;
   }
-  return `${hits.value.length.toLocaleString()} ${t("个结果")}`;
+  return `${(hitBuckets.get(kind.value)?.length ?? 0).toLocaleString()} ${t("个结果")}`;
 });
 
 defineExpose({ run, enterSimilar });
 </script>
 
 <template>
-  <div class="search-page" :class="{ searched }" @keydown.esc="recentOpen = false">
+  <div class="search-page" :class="{ searched }">
     <div v-if="!searched" class="triangle-field" aria-hidden="true">
       <span class="triangle triangle-a"></span>
       <span class="triangle triangle-b"></span>
@@ -285,6 +479,19 @@ defineExpose({ run, enterSimilar });
         <h1>{{ typedPrompt }}<span class="caret" aria-hidden="true"></span></h1>
       </div>
       <div class="query-wrap">
+        <div class="scope-wrap">
+          <button class="scope-select" type="button" :aria-expanded="scopeOpen" @click="scopeOpen = !scopeOpen">
+            <span class="scope-caption">{{ t("工作区") }}</span>
+            <span class="scope-path" :title="activeScope?.label">{{ activeScope?.label }}</span>
+            <ChevronDown :size="16" aria-hidden="true" />
+          </button>
+          <div v-if="scopeOpen" class="scope-menu" @click.stop>
+            <button v-for="option in scopeOptions" :key="option.value" type="button" class="scope-option" :class="{ selected: scopeValue === option.value }" @click="chooseScope(option)">
+              <span>{{ option.label }}</span><Check v-if="scopeValue === option.value" :size="15" />
+            </button>
+            <button type="button" class="scope-add" @click="chooseSearchPath"><FolderOpen :size="15" />{{ t("选择路径…") }}</button>
+          </div>
+        </div>
         <div class="query-shell" :class="{ focused: searched }">
           <Search :size="20" class="query-icon" aria-hidden="true" />
           <input
@@ -292,20 +499,13 @@ defineExpose({ run, enterSimilar });
             autofocus
             :disabled="similarMode"
             :placeholder="similarMode ? t('相似检索中：按内容距离排序') : t('搜索文件名、正文、拼音或一句话描述…')"
-            @focus="recentOpen = true"
-            @keyup.enter="run"
+            @keyup.enter="runNow"
           />
           <button v-if="text" class="query-action clear-action" :title="t('清空')" :aria-label="t('清空')" @click="text = ''">
             <X :size="17" />
           </button>
-          <button class="query-action run-action" :title="t('搜索')" :aria-label="t('搜索')" @click="run">
+          <button class="query-action run-action" :title="t('搜索')" :aria-label="t('搜索')" @click="runNow">
             <ChevronRight :size="20" />
-          </button>
-        </div>
-        <div v-if="!searched && recentOpen && recentHits.length" class="recent-panel">
-          <div class="recent-title">{{ t("最近文件") }}</div>
-          <button v-for="hit in recentHits.slice(0, 6)" :key="hit.id" class="recent-item" @mousedown.prevent="openRecent(hit)">
-            <span class="recent-name">{{ hit.name }}</span><span>{{ hit.size_label }}</span>
           </button>
         </div>
       </div>
@@ -315,7 +515,7 @@ defineExpose({ run, enterSimilar });
       <div class="toolbar">
         <div class="filter-group">
           <button
-            v-for="item in KINDS"
+            v-for="item in FILTER_KINDS"
             :key="item.v"
             class="filter-pill"
             :class="{ active: kind === item.v }"
@@ -340,11 +540,10 @@ defineExpose({ run, enterSimilar });
 
       <div class="result-meta">
         <span class="meta-primary">{{ resultLabel }}</span>
-        <span class="muted">{{ elapsed.toFixed(0) }} ms</span>
         <span v-if="selectedIds.size" class="muted">{{ t("已选") }} {{ selectedIds.size }}</span>
         <span class="toolbar-spacer"></span>
-        <button class="meta-button" @click="toggleAll">
-          <Check :size="14" /> {{ selectedIds.size === hits.length && hits.length ? t("取消全选") : t("全选") }}
+          <button class="meta-button" @click="toggleAll">
+          <Check :size="14" /> {{ visibleSelectedCount === displayHits.length && displayHits.length ? t("取消全选") : t("全选") }}
         </button>
         <button class="meta-button" @click="doExport">
           <Download :size="14" /> {{ t("导出") }}
@@ -355,17 +554,18 @@ defineExpose({ run, enterSimilar });
         <section class="gallery-panel">
           <div v-if="similarMode" class="similar-note">{{ t("相似于") }}：{{ similarSource?.name }}</div>
           <ResultGallery
-            :hits="hits"
+            :hits="renderedHits"
             :selected-id="selected?.id ?? null"
             :selected-ids="selectedIds"
             :thumb-dir="props.thumbDir"
-            :loading="loading"
+            :loading="loading && hits.length === 0"
             :query="text"
             @select="selected = $event"
             @open="open"
             @toggle="toggleSelected"
             @reveal="reveal"
             @rename="rename"
+            @reach-end="revealMoreResults"
           />
         </section>
       </div>
@@ -401,19 +601,24 @@ defineExpose({ run, enterSimilar });
 h1 { min-height: 1.4em; margin: 0; color: #111; font-size: 42px; font-weight: 450; letter-spacing: 0; }
 .caret { display: inline-block; width: 2px; height: .9em; margin-left: 4px; vertical-align: -.08em; background: var(--accent); animation: blink 1s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
-.query-wrap { position: relative; width: min(680px, 100%); }
+.query-wrap { position: relative; width: min(680px, 100%); display: flex; flex-direction: column; gap: 8px; }
 .searched .query-wrap { width: 100%; }
+.scope-wrap { position: relative; z-index: 4; width: 100%; }
+.scope-select { width: 100%; height: 32px; display: flex; align-items: center; gap: 12px; padding: 0 18px; border: 1px solid rgba(17,17,17,.14); border-radius: 18px 18px 0 0; background: linear-gradient(180deg, rgba(17,17,17,.075), rgba(255,255,255,.72)); color: #111; text-align: left; }
+.scope-caption { flex: none; color: #555; font-size: 11px; }
+.scope-path { flex: 1; min-width: 0; overflow: hidden; color: #111; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.scope-select :deep(svg) { flex: none; }
+.scope-menu { position: absolute; top: 100%; left: 0; right: 0; z-index: 20; max-height: 320px; overflow: auto; padding: 5px; border: 1px solid #111; border-radius: 0 0 4px 4px; background: #fff; box-shadow: 0 12px 28px rgba(0,0,0,.16); }
+.scope-option, .scope-add { width: 100%; min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 10px; border: 0; background: transparent; color: #111; text-align: left; }
+.scope-option span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scope-option:hover, .scope-option.selected, .scope-add:hover { background: #f1f1f1; }
+.scope-add { justify-content: flex-start; margin-top: 4px; border-top: 1px solid #ddd; }
 .query-shell { width: 100%; height: 62px; display: flex; align-items: center; gap: 12px; padding: 0 12px 0 22px; border: 1px solid #111; border-radius: 32px; background: #fff; box-shadow: 0 12px 30px rgba(0,0,0,.08); transition: height .24s cubic-bezier(.2,.7,.3,1), border-radius .24s cubic-bezier(.2,.7,.3,1), padding .24s ease, border-color .15s, box-shadow .15s; }
 .query-shell.focused { width: 100%; height: 50px; border-radius: 25px; background: #fff; box-shadow: none; }
 .query-shell:focus-within { border-color: #111; box-shadow: 0 0 0 3px rgba(17, 17, 17, .08); }
 .query-icon { flex: none; color: #111; }
 .query-shell input { flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 15px; }
 .query-shell input::placeholder { color: #777; }
-.recent-panel { position: absolute; z-index: 10; top: calc(100% + 8px); left: 0; width: 100%; padding: 8px; border: 1px solid #111; border-radius: 3px; background: #fff; box-shadow: 0 10px 28px rgba(0,0,0,.12); }
-.recent-title { padding: 5px 9px 8px; color: #666; font-size: 10px; }
-.recent-item { width: 100%; display: flex; justify-content: space-between; gap: 12px; padding: 8px 9px; border: 0; border-radius: 2px; background: transparent; color: #111; text-align: left; font-size: 11px; }
-.recent-item:hover { background: #f0f0f0; }.recent-item > span:last-child { flex: none; color: #666; }
-.recent-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .query-action { width: 36px; height: 36px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; }
 .query-action:hover { background: #f0f0f0; }
 .clear-action { color: #666; }

@@ -24,9 +24,9 @@ const gpuDevices = ref<GpuDevice[]>([]);
 const gpuLoadError = ref("");
 
 const PARALLEL_MODES = [
-  { key: "eco", label: "节能", hint: "降低后台资源占用", className: "eco" },
-  { key: "auto", label: "自动", hint: "按设备状态动态调节", className: "auto" },
-  { key: "turbo", label: "狂暴", hint: "尽可能提高后台吞吐", className: "turbo" },
+  { key: "eco", label: "节能", className: "eco" },
+  { key: "auto", label: "自动", className: "auto" },
+  { key: "custom", label: "自定义", className: "custom" },
 ];
 
 const FILTERS = [
@@ -35,12 +35,59 @@ const FILTERS = [
   { v: "chat", label: "对话" },
   { v: "projector", label: "投影" },
 ];
+const visibleParallelModes = computed(() => PARALLEL_MODES.filter(
+  (mode) => mode.key !== "custom" || !!props.cfg?.ui?.professional_mode,
+));
+const currentParallelMode = computed(() => {
+  const mode = props.cfg?.model?.parallel_mode;
+  return mode === "eco" || mode === "custom" ? mode : "auto";
+});
+
+// A GGUF mmproj is a companion file, not an embedding model. When it is
+// selected, use the sibling embedding entry for capability display.
+const selectedEmbedding = computed(() => {
+  const candidate = selected.value || list.value.find((model) => model.active && model.kind === "embed");
+  if (!candidate) return null;
+  const modelDir = candidate.model_dir.toLowerCase();
+  if (candidate.kind !== "projector") return candidate;
+  const sameDir = list.value.find((model) => model.kind === "embed" && model.model_dir.toLowerCase() === modelDir);
+  if (sameDir) return sameDir;
+
+  // Imported packages often place the GGUF projector and the full
+  // safetensors directory under separate folders. Associate the projector
+  // with the best declared multimodal embedding model by filename stem so
+  // the cards explain what must be activated instead of saying "unconfigured".
+  const stem = candidate.file
+    .toLowerCase()
+    .replace(/\.(gguf|safetensors)$/i, "")
+    .replace(/^mmproj[-_]?/, "");
+  const multimodal = list.value
+    .filter((model) => model.kind === "embed" && model.modalities.some((item) => ["image", "audio", "video"].includes(item)))
+    .map((model) => {
+      const modelStem = model.file.toLowerCase().replace(/\.(gguf|safetensors)$/i, "");
+      const nameMatch = modelStem === stem || modelStem.includes(stem) || stem.includes(modelStem);
+      return { model, rank: (nameMatch ? 100 : 0) + (model.format === "safetensors" ? 10 : 0) };
+    })
+    .sort((a, b) => b.rank - a.rank || b.model.size - a.model.size);
+  return multimodal[0]?.model || null;
+});
+const hasProjectorCompanion = computed(() => {
+  if (selected.value?.kind === "projector") return true;
+  const dir = selectedEmbedding.value?.model_dir.toLowerCase();
+  return !!dir && list.value.some((model) => model.kind === "projector" && model.model_dir.toLowerCase() === dir);
+});
 
 async function load() {
   loading.value = true;
   try {
     const [l, m, d] = await Promise.all([api.modelList(), api.modelInfo(), api.modelDir()]);
     list.value = l;
+    // Keep the selected card's active flag in sync after activation/deactivation.
+    // Otherwise the old object can keep reporting text as available after the
+    // user has switched back to the hash fallback.
+    if (selected.value) {
+      selected.value = l.find((model) => model.path === selected.value?.path) || null;
+    }
     info.value = m;
     store.model = m;
     dir.value = d;
@@ -68,7 +115,7 @@ const totalSize = computed(() => list.value.reduce((s, m) => s + m.size, 0));
 // The backend is selected from the model contents by Rust. The UI only
 // exposes whether a complete, supported model package is available.
 function canActivate(model: ModelEntry): boolean {
-  return model.kind !== "projector" && model.direct_loadable;
+  return model.kind !== "projector" && model.files_complete && model.direct_loadable;
 }
 
 const gpuOptions = computed(() => {
@@ -81,32 +128,32 @@ const gpuOptions = computed(() => {
   });
 });
 
-const activeModelFormat = computed(() => list.value.find((model) => model.active)?.format || "");
-const integratedGpuNote = computed(() => {
-  const hasVulkanIntegrated = gpuOptions.value.some(
-    (device) => device.integrated && device.backend.toLowerCase() === "vulkan",
-  );
-  if (!hasVulkanIntegrated) return "";
-  if (activeModelFormat.value === "safetensors") {
-    return t("当前 safetensors 模型仅使用 NVIDIA GPU；切换到配套 GGUF 后可尝试核显与独显协同。");
-  }
-  if (activeModelFormat.value === "gguf") {
-    return t("当前 GGUF 模型可尝试由核显与独显共同处理索引批次；核显会共享系统内存。");
-  }
-  return t("核显与独显协同取决于当前模型格式和设备可用资源。");
-});
-
 function activationLabel(model: ModelEntry): string {
   if (busy.value === model.path) return t("加载中…");
   if (model.active) return t("当前使用");
   if (model.kind === "projector") return t("配套文件");
-  return canActivate(model) ? t("设为当前模型") : t("缺少完整文件");
+  if (canActivate(model)) return t("设为当前模型");
+  if (!model.files_complete) return t("缺少完整文件");
+  return model.candidate_backends.includes("candle")
+    ? t("需要 Candle CUDA 后端")
+    : model.candidate_backends.includes("python")
+      ? t("需要 Python 推理后端")
+      : t("当前构建不支持此模型架构");
 }
 
 /** 把某个 GGUF 设为当前嵌入模型 */
 async function activate(m: ModelEntry) {
   if (m.kind === "projector") return toast(t("这是模型配套投影文件，不能单独作为嵌入模型加载"), "warn");
-  if (!canActivate(m)) return toast(t("此模型缺少可识别的完整配套文件，暂时不能加载"), "warn");
+  if (!canActivate(m)) {
+    const reason = !m.files_complete
+      ? t("此模型缺少可识别的完整配套文件，暂时不能加载")
+      : m.candidate_backends.includes("candle")
+        ? t("需要 Candle CUDA 后端")
+        : m.candidate_backends.includes("python")
+          ? t("需要 Python 推理后端")
+          : t("当前构建不支持此模型架构");
+    return toast(reason, "warn");
+  }
   busy.value = m.path;
   try {
     const out = await api.modelLoad("auto", m.path);
@@ -151,12 +198,18 @@ async function importFile() {
     busy.value = "import";
     const result: ModelImportResult = await api.modelImportFolder(picked);
     importedDir.value = result.destination;
-    const loadState = result.direct_loadable || result.candidate_backends?.length
+    const loadState = result.direct_loadable
       ? t("已识别，可尝试加载")
-      : t("已识别，但缺少可用的完整模型文件");
+      : !result.files_complete
+        ? t("已识别，但缺少可用的完整模型文件")
+        : result.candidate_backends?.includes("candle")
+          ? t("已识别，开发构建需要 Candle CUDA 后端")
+          : result.candidate_backends?.includes("python")
+            ? t("已识别，但需要 Python 推理后端")
+            : t("已识别，但当前构建不支持此模型架构");
     const components = result.components.length ? `（${result.components.join(" + ")}）` : "";
     const architecture = result.architecture ? `${t("架构：")}${result.architecture}${components}` : `${t("分类：")}${result.primary_kind}`;
-    toast(`${t("已导入")} ${result.copied_files} ${t("个配套文件")}（${humanSize(result.total_bytes)}），${architecture}；${loadState}`, result.direct_loadable || result.candidate_backends?.length ? "ok" : "warn");
+    toast(`${t("已导入")} ${result.copied_files} ${t("个配套文件")}（${humanSize(result.total_bytes)}），${architecture}；${loadState}`, result.direct_loadable ? "ok" : "warn");
     for (const warning of result.warnings) toast(warning, "warn");
     await load();
   } catch (e) {
@@ -223,7 +276,7 @@ async function setParallelMode(mode: string) {
   if (!saved) return;
   const modelPath = props.cfg.model.embed_model.trim();
   if (!modelPath || !info.value?.ready) {
-    toast(t("并行策略已保存；加载嵌入模型后生效"), "ok");
+    toast(t("批处理线程设置已保存；加载嵌入模型后生效"), "ok");
     return;
   }
   busy.value = "parallel-mode";
@@ -232,21 +285,48 @@ async function setParallelMode(mode: string) {
     info.value = out;
     store.model = out;
     await load();
-    toast(out.ready ? `${t("并行策略已应用：")}${out.detail}` : out.detail, out.ready ? "ok" : "warn");
+    toast(out.ready ? `${t("批处理线程已应用：")}${out.detail}` : out.detail, out.ready ? "ok" : "warn");
   } catch (error) {
-    toast(`${t("策略已保存，但模型重载失败：")}${error}`, "error");
+    toast(`${t("设置已保存，但模型重载失败：")}${error}`, "error");
   } finally {
     busy.value = "";
   }
 }
 
+async function setParallelThreads() {
+  if (!props.cfg) return;
+  props.cfg.model.parallel_threads = Math.max(1, Math.min(128, Number(props.cfg.model.parallel_threads) || 1));
+  await setParallelMode("custom");
+}
+
 const modalityCards = computed(() => {
-  const selectedModalities = selected.value?.modalities || [];
+  const selectedModalities = selectedEmbedding.value?.modalities || [];
   const declared = (key: string) => selectedModalities.length > 0
     ? selectedModalities.includes(key)
     : info.value?.modalities?.includes(key) || false;
-  const selectedReady = selected.value?.direct_loadable && selected.value?.active;
-  const activeSupports = (key: string) => !!info.value?.ready && info.value.modalities.includes(key);
+  const selectedReady = selectedEmbedding.value?.direct_loadable
+    && selectedEmbedding.value?.active
+    && info.value?.backend !== "hash";
+  // Hash is only a deterministic search fallback, not a configured AI model.
+  const activeSupports = (key: string) => !!info.value?.ready
+    && info.value.backend !== "hash"
+    && info.value.modalities.includes(key);
+  const pairedProjector = (key: string) => hasProjectorCompanion.value && ["image", "audio", "video"].includes(key);
+  // A loaded GGUF uses the same runtime capability report as Candle. The
+  // package-level declaration is only used before activation; once active,
+  // `info.modalities` is authoritative and prevents an unrelated mmproj from
+  // being shown as usable.
+  const isUsable = (key: string) => activeSupports(key) || (selectedReady && declared(key));
+  const statusFor = (key: string) => isUsable(key)
+    ? "可用"
+    : pairedProjector(key)
+      ? "已检测"
+      : (declared(key) ? "已检测" : "未配置");
+  const detailFor = (key: string) => pairedProjector(key) && !isUsable(key)
+    ? "已检测同目录 mmproj；加载模型后可用"
+    : declared(key) && !isUsable(key)
+      ? "模型已声明此能力，加载后可用"
+      : activeSupports(key) ? "共用 768 维向量空间" : "未配置可用编码器";
   return [
     {
       key: "text",
@@ -254,33 +334,33 @@ const modalityCards = computed(() => {
       icon: FileText,
       ok: activeSupports("text") || selectedReady,
       status: activeSupports("text") || selectedReady ? "可用" : (selected.value?.format === "safetensors" && declared("text") ? "声明" : "未配置"),
-      detail: declared("text") && !selectedReady && selected.value?.format === "safetensors"
-        ? "模型声明 · 需配套组件"
+      detail: declared("text") && !selectedReady
+        ? "模型声明 · 需加载"
         : info.value?.ready ? `${info.value.dim} ${t("维")}` : "未加载",
     },
     {
       key: "image",
       label: "图片",
       icon: ImageIcon,
-      ok: activeSupports("image") || (selected.value?.format === "safetensors" && declared("image") && !!selectedReady),
-      status: activeSupports("image") || (selected.value?.format === "safetensors" && declared("image") && !!selectedReady) ? "可用" : (selected.value?.format === "safetensors" && declared("image") ? "声明" : "未配置"),
-      detail: declared("image") && !selectedReady && selected.value?.format === "safetensors" ? "模型声明 · 需加载" : activeSupports("image") ? "共享空间" : "未配置",
+      ok: isUsable("image"),
+      status: statusFor("image"),
+      detail: detailFor("image"),
     },
     {
       key: "audio",
       label: "音频",
       icon: AudioLines,
-      ok: activeSupports("audio") || (selected.value?.format === "safetensors" && declared("audio") && !!selectedReady),
-      status: activeSupports("audio") || (selected.value?.format === "safetensors" && declared("audio") && !!selectedReady) ? "可用" : (selected.value?.format === "safetensors" && declared("audio") ? "声明" : "未配置"),
-      detail: declared("audio") && !selectedReady && selected.value?.format === "safetensors" ? "模型声明 · 需加载" : activeSupports("audio") ? "共享空间" : "未配置",
+      ok: isUsable("audio"),
+      status: statusFor("audio"),
+      detail: detailFor("audio"),
     },
     {
       key: "video",
       label: "视频",
       icon: Film,
-      ok: activeSupports("video") || (selected.value?.format === "safetensors" && declared("video") && !!selectedReady),
-      status: activeSupports("video") || (selected.value?.format === "safetensors" && declared("video") && !!selectedReady) ? "可用" : (selected.value?.format === "safetensors" && declared("video") ? "声明" : "未配置"),
-      detail: declared("video") && !selectedReady && selected.value?.format === "safetensors" ? "模型声明 · 需加载" : activeSupports("video") ? "共享空间" : "未配置",
+      ok: isUsable("video"),
+      status: statusFor("video"),
+      detail: detailFor("video"),
     },
   ];
 });
@@ -293,39 +373,40 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
     <!-- 第一行：GPU 选择 -->
     <div class="gpu-row card">
       <div>
-        <div class="sec">{{ t("GPU 推理设备") }}</div>
-        <div class="muted tiny">{{ t("所选设备作为主推理设备；并行模式会按后端兼容性使用其他可用设备。没有可用加速后端时自动退回 CPU。") }}</div>
-        <div v-if="integratedGpuNote" class="muted tiny gpu-note">{{ integratedGpuNote }}</div>
+        <div class="sec">{{ t("选择GPU硬件") }}</div>
+        <div class="muted tiny">{{ t("所选硬件将优先调用，并行策略可能还会调用其他GPU硬件") }}</div>
       </div>
       <div class="gpu-controls">
-        <select v-if="props.cfg" v-model="props.cfg.model.gpu_device" :aria-label="t('GPU 推理设备')">
+        <select v-if="props.cfg" v-model="props.cfg.model.gpu_device" :aria-label="t('选择GPU硬件')">
           <option value="auto">{{ t("自动选择（按显存）") }}</option>
-          <option value="cpu">{{ t("CPU（无可用加速设备时）") }}</option>
           <option v-for="device in gpuOptions" :key="device.id" :value="device.id">
             {{ device.name }} · {{ formatMemory(device.total_memory) }}{{ device.integrated ? t(" · 核显") : "" }}
           </option>
         </select>
         <span v-if="gpuLoadError" class="tiny warn-text">{{ t("GPU 列表加载失败：") }}{{ gpuLoadError }}</span>
-        <span v-else-if="!gpuOptions.length" class="tiny muted">{{ t("未检测到可用加速设备，将使用 CPU 推理") }}</span>
+        <span v-else-if="!gpuOptions.length" class="tiny muted">{{ t("未检测到可用GPU硬件") }}</span>
         <button v-if="props.saveModelConfig" class="ghost icon-action" :title="t('保存 GPU 设置')" @click="saveParams"><Save :size="15" /></button>
       </div>
     </div>
 
     <div class="parallel-row card">
       <div>
-        <div class="sec">{{ t("模型并行策略") }}</div>
-        <div class="muted tiny">{{ t("按当前设备状态动态调节后台工作负载；模型实例会按后端能力安全复用") }}</div>
+        <div class="sec">{{ t("单模型批处理") }}</div>
       </div>
-      <div class="parallel-buttons" role="group" :aria-label="t('模型并行策略')">
+      <div class="parallel-buttons" role="group" :aria-label="t('单模型批处理')">
         <button
-          v-for="mode in PARALLEL_MODES"
+          v-for="mode in visibleParallelModes"
           :key="mode.key"
           class="parallel-button"
-          :class="[mode.className, { active: (props.cfg?.model?.parallel_mode || 'auto') === mode.key }]"
-          :title="`${t(mode.label)}：${t(mode.hint)}`"
+          :class="[mode.className, { active: currentParallelMode === mode.key }]"
+          :title="t(mode.label)"
           @click="setParallelMode(mode.key)"
         >{{ t(mode.label) }}</button>
       </div>
+      <label v-if="props.cfg?.model?.parallel_mode === 'custom' && props.cfg?.ui?.professional_mode" class="parallel-count">
+        {{ t("并行线程数") }}
+        <input v-model.number="props.cfg.model.parallel_threads" type="number" min="1" max="128" step="1" @change="setParallelThreads" />
+      </label>
     </div>
 
     <!-- 第二行：四种模态状态 -->
@@ -377,7 +458,6 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
             <span class="nm" :title="m.name">{{ m.name }}</span>
             <span class="kind" :class="m.kind">{{ m.kind_label }}</span>
             <span class="kind format">{{ m.format.toUpperCase() }}</span>
-            <span v-if="m.active" class="inuse">{{ t("使用中") }}</span>
           </div>
           <div class="file mono" :title="m.path">{{ m.file }} · {{ m.size_label }}</div>
           <div class="meta muted tiny">{{ m.mtime_label }} · {{ m.path }}</div>
@@ -402,7 +482,7 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
     </div>
 
     <!-- 点击模型后展开推理参数 -->
-    <section v-if="selected && props.cfg" class="params card">
+    <section v-if="selected && props.cfg?.ui?.professional_mode" class="params card">
       <div class="params-head">
         <div><strong>{{ selected.name }}</strong><span class="kind format">{{ selected.format.toUpperCase() }}</span></div>
         <SlidersHorizontal :size="16" aria-hidden="true" />
@@ -450,7 +530,9 @@ onMounted(() => { void Promise.all([load(), loadGpus()]); });
 .parallel-button:last-child { border-right: 1px solid #111; }
 .parallel-button.eco.active { color: #fff; background: #238636; }
 .parallel-button.auto.active { color: #fff; background: #1d6fd1; }
-.parallel-button.turbo.active { color: #fff; background: #d9572b; }
+.parallel-button.custom.active { color: #fff; background: #111; }
+.parallel-count { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.parallel-count input { width: 86px; }
 .warn-text { color: var(--warn); }
 .modality-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; flex: none; }
 .modality-card { display: flex; align-items: center; gap: 9px; min-width: 0; padding: 11px 12px; color: #555; }

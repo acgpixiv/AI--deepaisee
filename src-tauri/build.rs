@@ -40,6 +40,11 @@ fn main() {
             .define("LLAMA_BUILD_EXAMPLES", "OFF")
             .define("LLAMA_BUILD_SERVER", "OFF")
             .define("LLAMA_BUILD_TOOLS", "OFF")
+            // GGUF multimodal support is provided by the mtmd projector
+            // library. Keep this explicit in the Rust build as well as in
+            // native/CMakeLists.txt so stale/default CMake cache values cannot
+            // silently produce a text-only llama.cpp binary.
+            .define("LLAMA_BUILD_MTMD", "ON")
             .define("LLAMA_CURL", "OFF")
             .define("BUILD_SHARED_LIBS", "OFF")
             .define("DEEPAISEE_CUDA", if cuda_enabled { "ON" } else { "OFF" })
@@ -146,6 +151,7 @@ fn main() {
             "ggml-cuda",
             "ggml-vulkan",
             "llama",
+            "mtmd",
             "llama_shim",
         ] {
             let src = dst.join("lib").join(format!("{name}.a"));
@@ -182,11 +188,20 @@ fn main() {
                 let _ = std::fs::copy(&from, compat.join(format!("lib{name}.a")));
             }
         }
+        for name in ["libmtmd.a", "mtmd.lib"] {
+            let candidate = dst.join("build").join("lib").join(name);
+            if candidate.exists() {
+                let target_name = if name.ends_with(".a") { "libmtmd.a" } else { "mtmd.lib" };
+                let _ = std::fs::copy(candidate, compat.join(target_name));
+            }
+        }
         for sub in [
             "native-libs",
             "lib",
             "build",
+            "build/lib",
             "build/llama.cpp/src",
+            "build/llama.cpp/tools/mtmd",
             "build/llama.cpp/ggml/src",
             "build/llama.cpp/ggml/src/ggml-cuda",
             "build/llama.cpp/ggml/src/ggml-vulkan",
@@ -196,6 +211,7 @@ fn main() {
             println!("cargo:rustc-link-search=native={}", p.display());
         }
         println!("cargo:rustc-link-lib=static=llama_shim");
+        println!("cargo:rustc-link-lib=static=mtmd");
         println!("cargo:rustc-link-lib=static=llama");
         // Link the static backend libraries in dependency order.
         println!("cargo:rustc-link-lib=static=ggml");
@@ -231,6 +247,8 @@ fn main() {
         }
         println!("cargo:rerun-if-changed=native/llama_shim.cpp");
         println!("cargo:rerun-if-changed=native/CMakeLists.txt");
+        println!("cargo:rerun-if-changed=../vendor/llama.cpp/tools/mtmd/mtmd.h");
+        println!("cargo:rerun-if-changed=../vendor/llama.cpp/src/models/gemma-embedding2.cpp");
     }
 
     // Windows + GNU 工具链下，windres 无法打开含非 ASCII 字符路径的 .ico

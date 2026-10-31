@@ -16,6 +16,7 @@ fn default_pooling_kernel_size() -> usize {
 fn default_image_max_soft_tokens() -> usize {
     280
 }
+const MAX_UPSCALE_FACTOR: f64 = 2.0;
 
 /// Mirrors the `image_processor` and `video_processor` entries of `processor_config.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -73,7 +74,12 @@ impl ImageProcessor {
         }
         let max_patches = self.max_patches();
         let target_px = max_patches * self.patch_size * self.patch_size;
-        let factor = (target_px as f64 / (height * width) as f64).sqrt();
+        // Keep the model's modest upscaling for ordinary inputs, but do not
+        // inflate tiny sources to the full configured budget. Attention cost
+        // grows quadratically with patch count, so this cap avoids turning an
+        // icon into thousands of patches without limiting high-resolution files.
+        let factor = ((target_px as f64 / (height * width) as f64).sqrt())
+            .min(MAX_UPSCALE_FACTOR);
         let side_mult = self.pooling_kernel_size * self.patch_size;
         let round_down =
             |side: usize| (factor * side as f64 / side_mult as f64).floor() as usize * side_mult;
@@ -84,7 +90,8 @@ impl ImageProcessor {
             max_patches / (self.pooling_kernel_size * self.pooling_kernel_size) * side_mult;
         match (target_height, target_width) {
             (0, 0) => {
-                candle::bail!("a {width}x{height} image cannot be resized to the patch budget")
+                target_height = side_mult;
+                target_width = side_mult;
             }
             (0, _) => {
                 target_height = side_mult;
@@ -185,6 +192,7 @@ mod tests {
         assert_eq!(processor.target_size(768, 768).unwrap(), (768, 768));
         assert_eq!(processor.target_size(1000, 300).unwrap(), (1440, 432));
         assert_eq!(processor.target_size(10, 4000).unwrap(), (48, 13440));
+        assert_eq!(processor.target_size(32, 32).unwrap(), (48, 48));
         let video = ImageProcessor {
             max_soft_tokens: 140,
             ..processor

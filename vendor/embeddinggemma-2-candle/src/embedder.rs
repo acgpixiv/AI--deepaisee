@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use image::DynamicImage;
+use rayon::prelude::*;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -17,8 +18,8 @@ use crate::model::{mean_pool, normalize, EmbeddingGemma2Model, Modalities, SoftT
 /// Repository of the released checkpoint on the Hugging Face hub.
 pub const DEFAULT_REPO: &str = "google/embeddinggemma-2";
 
-/// Attention scores (batch x heads x seq_len^2) a batch may take, which bounds the memory of
-/// the attention to a few GB. Batches of long inputs are split to stay under it.
+/// Estimated attention work used to group sequences. The attention
+/// implementation separately chunks query rows to bound its score tensor.
 const MAX_ATTENTION_SCORES: usize = 1 << 28;
 
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +63,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Part {
     Text(String),
     Image(DynamicImage),
+    /// An image with an input-specific soft-token budget. This is used by the
+    /// indexer to keep standalone images at a high resolution while keeping
+    /// embedded PDF raster images at the checkpoint's cheaper budget.
+    ImageBudget(DynamicImage, usize),
     /// The frames of a video, already decoded and sampled; the reference samples one frame
     /// per second. Videos of more than `max_frames` frames are subsampled uniformly.
     Video(Vec<DynamicImage>),
@@ -90,6 +95,10 @@ impl Input {
         Self::default().with_image(image)
     }
 
+    pub fn image_with_budget(image: DynamicImage, max_soft_tokens: usize) -> Self {
+        Self::default().with_image_budget(image, max_soft_tokens)
+    }
+
     pub fn video(frames: Vec<DynamicImage>) -> Self {
         Self::default().with_video(frames)
     }
@@ -105,6 +114,11 @@ impl Input {
 
     pub fn with_image(mut self, image: DynamicImage) -> Self {
         self.parts.push(Part::Image(image));
+        self
+    }
+
+    pub fn with_image_budget(mut self, image: DynamicImage, max_soft_tokens: usize) -> Self {
+        self.parts.push(Part::ImageBudget(image, max_soft_tokens));
         self
     }
 
@@ -150,12 +164,21 @@ pub struct Options {
     pub dtype: DType,
     /// Towers to load. Loading only the ones in use saves memory.
     pub modalities: Modalities,
-    /// Most inputs to run through the model at once. Batches of long inputs are smaller, to
-    /// bound the memory of the attention.
+    /// Most inputs to run through the model at once.
     pub batch_size: usize,
+    /// Upper bound used to group similarly sized sequences. Attention itself
+    /// is computed in bounded query chunks, so this is a scheduling budget
+    /// rather than the size of a single allocated attention matrix.
+    pub attention_score_budget: usize,
     /// Longest input, in tokens. Longer texts are truncated; the reference implementation
     /// does not truncate, this is a guard for the quadratic cost of the attention.
     pub max_seq_len: usize,
+    /// Maximum soft tokens generated for one image. The model supports
+    /// budgets from 70 to 1120; 280 is the checkpoint default.
+    pub image_token_budget: usize,
+    /// Maximum soft tokens generated for one video frame. 140 is the
+    /// checkpoint default and uses the same vision tower as images.
+    pub video_token_budget: usize,
     /// Revision of the hub repository.
     pub revision: Option<String>,
 }
@@ -167,7 +190,10 @@ impl Default for Options {
             dtype: DType::F32,
             modalities: Modalities::ALL,
             batch_size: 8,
+            attention_score_budget: MAX_ATTENTION_SCORES,
             max_seq_len: 8192,
+            image_token_budget: 280,
+            video_token_budget: 140,
             revision: None,
         }
     }
@@ -204,6 +230,13 @@ impl Options {
     pub fn with_cuda_device(mut self, ordinal: usize) -> Result<Self> {
         self.device = Device::new_cuda(ordinal)?;
         Ok(self)
+    }
+
+    /// Lets GPU-aware callers increase the amount of independent work grouped
+    /// together when the selected accelerator has spare memory.
+    pub fn with_attention_score_budget(mut self, budget: usize) -> Self {
+        self.attention_score_budget = budget.clamp(1 << 28, 1 << 32);
+        self
     }
 }
 
@@ -272,6 +305,7 @@ pub struct EmbeddingGemma2 {
     eos_token_id: u32,
     pad_token_id: u32,
     batch_size: usize,
+    attention_score_budget: usize,
     max_seq_len: usize,
     text_heads: usize,
     vision_heads: usize,
@@ -311,10 +345,64 @@ fn read_json_or_default<T: serde::de::DeserializeOwned + Default>(
     }
 }
 
+/// Resolve the weight files for a local Transformers checkpoint.  Hugging Face
+/// uses either one `model.safetensors` file or an index whose `weight_map`
+/// names the shard files.  Candle accepts all shard paths in one VarBuilder,
+/// so loading a sharded package does not require merging or copying weights.
+fn local_weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let single = dir.join("model.safetensors");
+    if single.is_file() {
+        return Ok(vec![single]);
+    }
+    let index = dir.join("model.safetensors.index.json");
+    if !index.is_file() {
+        // A few model publishers use a descriptive filename instead of the
+        // Transformers convention `model.safetensors`. Accept one or more
+        // direct Safetensors files in that directory as long as the caller
+        // already supplied the matching config and tokenizer.
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map_err(|source| Error::Io { path: dir.to_path_buf(), source })?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.is_file()
+                    && path.extension().and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
+            })
+            .collect();
+        files.sort();
+        return match files.len() {
+            0 => Ok(vec![single]),
+            1 => Ok(files),
+            _ => Err(Error::InvalidInput(
+                "multiple safetensors files require model.safetensors.index.json",
+            )),
+        };
+    }
+    let value: serde_json::Value = read_json(&index)?;
+    let Some(weight_map) = value.get("weight_map").and_then(serde_json::Value::as_object) else {
+        return Err(Error::InvalidInput("model.safetensors.index.json has no weight_map"));
+    };
+    let mut names: Vec<String> = weight_map
+        .values()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        return Err(Error::InvalidInput("model.safetensors.index.json has no shard files"));
+    }
+    let paths: Vec<PathBuf> = names.into_iter().map(|name| dir.join(name)).collect();
+    if paths.iter().any(|path| !path.is_file()) {
+        return Err(Error::InvalidInput("a safetensors shard listed by the index is missing"));
+    }
+    Ok(paths)
+}
+
 /// Paths of the files of a checkpoint.
 struct Files {
     config: PathBuf,
-    weights: PathBuf,
+    weights: Vec<PathBuf>,
     tokenizer: PathBuf,
     sentence_transformers_config: Option<PathBuf>,
     processor_config: Option<PathBuf>,
@@ -335,7 +423,7 @@ impl EmbeddingGemma2 {
         };
         let files = Files {
             config: repo.get("config.json")?,
-            weights: repo.get("model.safetensors")?,
+            weights: vec![repo.get("model.safetensors")?],
             tokenizer: repo.get("tokenizer.json")?,
             sentence_transformers_config: repo.get("config_sentence_transformers.json").ok(),
             processor_config: repo.get("processor_config.json").ok(),
@@ -346,9 +434,10 @@ impl EmbeddingGemma2 {
     /// Loads the model from a local directory laid out like the hub repository.
     pub fn from_dir(dir: impl AsRef<Path>, options: Options) -> Result<Self> {
         let dir = dir.as_ref();
+        let weights = local_weight_files(dir)?;
         let files = Files {
             config: dir.join("config.json"),
-            weights: dir.join("model.safetensors"),
+            weights,
             tokenizer: dir.join("tokenizer.json"),
             sentence_transformers_config: Some(dir.join("config_sentence_transformers.json")),
             processor_config: Some(dir.join("processor_config.json")),
@@ -376,12 +465,22 @@ impl EmbeddingGemma2 {
         let st_config: SentenceTransformersConfig =
             read_json_or_default(files.sentence_transformers_config.as_deref())?;
         let processor: ProcessorConfig = read_json_or_default(files.processor_config.as_deref())?;
+        let ProcessorConfig {
+            mut image_processor,
+            video_processor,
+            feature_extractor,
+        } = processor;
+        image_processor.max_soft_tokens = options.image_token_budget.clamp(70, 1120);
+        let max_frames = video_processor.max_frames;
+        let mut video_processor = video_processor.frames;
+        video_processor.max_soft_tokens = options.video_token_budget.clamp(70, 1120);
         let tokenizer = Tokenizer::from_file(&files.tokenizer)?;
 
         // Safety: the weights are memory mapped, the file must not be modified while the
         // model is alive.
+        let weight_refs: Vec<&Path> = files.weights.iter().map(PathBuf::as_path).collect();
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[&files.weights], options.dtype, &options.device)?
+            VarBuilder::from_mmaped_safetensors(&weight_refs, options.dtype, &options.device)?
         };
         let model = EmbeddingGemma2Model::with_modalities(&config, options.modalities, vb)?;
 
@@ -398,15 +497,16 @@ impl EmbeddingGemma2 {
         Ok(Self {
             model,
             tokenizer,
-            image_processor: processor.image_processor,
-            video_processor: processor.video_processor.frames,
-            max_frames: processor.video_processor.max_frames,
-            audio_extractor: processor.feature_extractor,
+            image_processor,
+            video_processor,
+            max_frames,
+            audio_extractor: feature_extractor,
             prompts: st_config.prompts,
             special_tokens,
             eos_token_id: config.text_config.eos_token_id,
             pad_token_id: config.text_config.pad_token_id,
             batch_size: options.batch_size,
+            attention_score_budget: options.attention_score_budget.clamp(1 << 28, 1 << 32),
             max_seq_len: options.max_seq_len,
             text_heads: config.text_config.num_attention_heads,
             vision_heads: config
@@ -481,7 +581,7 @@ impl EmbeddingGemma2 {
             return Err(Error::InvalidInput("no inputs to encode"));
         }
         let prepared = inputs
-            .iter()
+            .par_iter()
             .map(|input| self.prepare(input, prompt))
             .collect::<Result<Vec<_>>>()?;
 
@@ -491,7 +591,12 @@ impl EmbeddingGemma2 {
         let mut embeddings: Vec<Option<Tensor>> = vec![None; prepared.len()];
         let lengths: Vec<usize> = order.iter().map(|&idx| prepared[idx].ids.len()).collect();
         let mut start = 0;
-        for size in batch_sizes(&lengths, self.text_heads, self.batch_size) {
+        for size in batch_sizes(
+            &lengths,
+            self.text_heads,
+            self.batch_size,
+            self.attention_score_budget,
+        ) {
             let batch = &order[start..start + size];
             start += size;
             let items: Vec<&Prepared> = batch.iter().map(|&idx| &prepared[idx]).collect();
@@ -528,6 +633,20 @@ impl EmbeddingGemma2 {
                         return Err(Error::MissingTower("vision"));
                     }
                     let patches = self.image_processor.preprocess(image)?;
+                    text.push_str(&tokens.boi);
+                    text.push_str(&tokens.image.repeat(patches.num_soft_tokens));
+                    text.push_str(&tokens.eoi);
+                    prepared.images.push(patches);
+                }
+                Part::ImageBudget(image, max_soft_tokens) => {
+                    if !self.model.has_vision() {
+                        return Err(Error::MissingTower("vision"));
+                    }
+                    let processor = ImageProcessor {
+                        max_soft_tokens: (*max_soft_tokens).clamp(70, 1120),
+                        ..self.image_processor
+                    };
+                    let patches = processor.preprocess(image)?;
                     text.push_str(&tokens.boi);
                     text.push_str(&tokens.image.repeat(patches.num_soft_tokens));
                     text.push_str(&tokens.eoi);
@@ -630,7 +749,12 @@ impl EmbeddingGemma2 {
         let lengths: Vec<usize> = images.iter().map(|image| image.num_patches()).collect();
         let mut soft_tokens = Vec::with_capacity(images.len());
         let mut start = 0;
-        for size in batch_sizes(&lengths, self.vision_heads, self.batch_size) {
+        for size in batch_sizes(
+            &lengths,
+            self.vision_heads,
+            self.batch_size,
+            self.attention_score_budget,
+        ) {
             let chunk = &images[start..start + size];
             start += size;
             let (pixel_values, positions) = processor.collate(chunk, self.model.device())?;
@@ -661,16 +785,19 @@ impl EmbeddingGemma2 {
     }
 }
 
-/// Splits sequences of the given lengths, in order, into consecutive batches of at most
-/// `batch_size`, cut short where padding the batch to its longest sequence would take more
-/// than [`MAX_ATTENTION_SCORES`]. A sequence over that budget is run on its own.
-fn batch_sizes(lengths: &[usize], num_heads: usize, batch_size: usize) -> Vec<usize> {
+/// Splits sequences into groups bounded by item count and estimated attention work.
+fn batch_sizes(
+    lengths: &[usize],
+    num_heads: usize,
+    batch_size: usize,
+    attention_score_budget: usize,
+) -> Vec<usize> {
     let mut sizes = Vec::new();
     let (mut size, mut longest) = (0, 0);
     for &len in lengths {
         let padded = longest.max(len);
         let scores = (size + 1) * num_heads * padded * padded;
-        if size > 0 && (size == batch_size || scores > MAX_ATTENTION_SCORES) {
+        if size > 0 && (size == batch_size || scores > attention_score_budget) {
             sizes.push(size);
             (size, longest) = (1, len);
         } else {
@@ -696,21 +823,35 @@ fn sample_uniformly(len: usize, max: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_sizes, sample_uniformly};
+    use super::{batch_sizes, local_weight_files, sample_uniformly, MAX_ATTENTION_SCORES};
+    use std::path::PathBuf;
 
     #[test]
     fn batches_shrink_for_long_sequences() {
         // Short sequences fill the batches.
-        assert_eq!(batch_sizes(&[100; 20], 4, 8), vec![8, 8, 4]);
+        assert_eq!(batch_sizes(&[100; 20], 4, 8, MAX_ATTENTION_SCORES), vec![8, 8, 4]);
         // Four heads over 8192 tokens are 2^28 scores: such a sequence runs alone.
         assert_eq!(
-            batch_sizes(&[8192, 8192, 4096, 4096, 16], 4, 8),
+            batch_sizes(&[8192, 8192, 4096, 4096, 16], 4, 8, MAX_ATTENTION_SCORES),
             vec![1, 1, 3]
         );
-        assert_eq!(batch_sizes(&[20_000, 10], 4, 8), vec![1, 1]);
-        // Twelve heads over the 2520 patches of a full resolution image: three at a time.
-        assert_eq!(batch_sizes(&[2520; 7], 12, 8), vec![3, 3, 1]);
-        assert!(batch_sizes(&[], 4, 8).is_empty());
+        assert_eq!(batch_sizes(&[20_000, 10], 4, 8, MAX_ATTENTION_SCORES), vec![1, 1]);
+        // Twelve heads over the 2520 patches of a PDF image: three at a time.
+        assert_eq!(batch_sizes(&[2520; 7], 12, 8, MAX_ATTENTION_SCORES), vec![3, 3, 1]);
+        assert!(batch_sizes(&[], 4, 8, MAX_ATTENTION_SCORES).is_empty());
+    }
+
+    #[test]
+    fn high_vram_budget_batches_full_resolution_images_together() {
+        let high_resolution_patches = [10_080; 4];
+        assert_eq!(
+            batch_sizes(&high_resolution_patches, 16, 16, 1 << 32),
+            vec![2, 2]
+        );
+        assert_eq!(
+            batch_sizes(&high_resolution_patches, 16, 16, 1 << 28),
+            vec![1, 1, 1, 1]
+        );
     }
 
     #[test]
@@ -719,5 +860,44 @@ mod tests {
         assert_eq!(sample_uniformly(10, 4), vec![0, 3, 6, 9]);
         assert_eq!(sample_uniformly(100, 32).len(), 32);
         assert_eq!(sample_uniformly(100, 32).last(), Some(&99));
+    }
+
+    #[test]
+    fn local_weight_files_resolves_all_indexed_shards_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "embeddinggemma-shards-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("model-00001-of-00002.safetensors");
+        let second = dir.join("model-00002-of-00002.safetensors");
+        std::fs::write(&first, b"one").unwrap();
+        std::fs::write(&second, b"two").unwrap();
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors","c":"model-00001-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let weights = local_weight_files(&dir).unwrap();
+        assert_eq!(weights, vec![PathBuf::from(first), PathBuf::from(second)]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn local_weight_files_accepts_one_descriptive_file_but_requires_an_index_for_many() {
+        let dir = std::env::temp_dir().join(format!(
+            "embeddinggemma-custom-weights-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let custom = dir.join("embeddinggemma-2-bf16.safetensors");
+        std::fs::write(&custom, b"weights").unwrap();
+        assert_eq!(local_weight_files(&dir).unwrap(), vec![custom]);
+
+        std::fs::write(dir.join("vision.safetensors"), b"other weights").unwrap();
+        assert!(local_weight_files(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

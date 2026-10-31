@@ -1,10 +1,10 @@
 ; DeepDark_Oracle NSIS installer hooks
 ; ---------------------------------------------------------------------------
 ; Notes (ASCII only on purpose - NSIS parses .nsh by the ANSI codepage):
-;  1) bundle.resources uses the map form, so the runtime dependencies land
-;     directly in $INSTDIR: onnxruntime.dll, libstdc++-6.dll, libgcc_s_seh-1.dll,
-;     libwinpthread-1.dll, WebView2Loader.dll, tools\bin\ffmpeg.exe and models\.
-;     No DLL registration is required - they sit next to the exe.
+;  1) bundle.resources uses the map form, so runtime dependencies land directly
+;     in $INSTDIR: libstdc++-6.dll, libgcc_s_seh-1.dll,
+;     libwinpthread-1.dll, WebView2Loader.dll and tools\bin\ffmpeg.exe.
+;     Models are user-provided and are never included in the installer.
 ;  2) The CUDA runtime is large and only needed on NVIDIA machines. It is
 ;     bundled to $INSTDIR\_up_\.tools\cuda-runtime and copied next to the exe
 ;     after install when present.

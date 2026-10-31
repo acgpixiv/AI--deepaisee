@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Manager, State};
 
 #[derive(Serialize)]
 pub struct AppInfo {
@@ -45,11 +45,13 @@ pub fn save_config(
 ) -> Result<(), String> {
     // 采用 JSON 深合并而不是整体覆盖：前端只改一个字段时
     // （例如只传 {"scan":{"roots":[...]}}）不能把模型路径等其他配置清空。
-    let mut merged = serde_json::to_value(state.cfg.read().clone())
+    let previous_cfg = state.cfg.read().clone();
+    let mut merged = serde_json::to_value(previous_cfg.clone())
         .map_err(|e| format!("读取配置失败：{e}"))?;
     merge_json(&mut merged, &cfg);
-    let new_cfg: AppConfig =
+    let mut new_cfg: AppConfig =
         serde_json::from_value(merged).map_err(|e| format!("配置格式错误：{e}"))?;
+    normalize_workspace_config(&mut new_cfg.workspace);
 
     let autostart_before = state.cfg.read().ui.autostart;
 
@@ -59,20 +61,76 @@ pub fn save_config(
     new_cfg
         .save(&path)
         .map_err(|e| format!("保存配置失败：{e}"))?;
+    // Removing a scan root also removes its indexed rows and all associated
+    // vector slots. Still-configured nested roots remain protected.
+    let removed_roots: Vec<String> = previous_cfg
+        .scan
+        .roots
+        .iter()
+        .filter(|old| {
+            !new_cfg.scan.roots.iter().any(|current| {
+                crate::util::norm_path(old).eq_ignore_ascii_case(&crate::util::norm_path(current))
+            })
+        })
+        .cloned()
+        .collect();
+    for root in removed_roots {
+        match state.db.remove_scan_root(&root, &new_cfg.scan.roots) {
+            Ok(ids) => {
+                for id in ids {
+                    state.vectors.read().remove(id);
+                    state.media_vectors.read().remove(id);
+                    state.clip_vectors.read().remove(id);
+                    state.audio_vectors.read().remove(id);
+                }
+                let _ = state.vectors.read().save();
+                let _ = state.media_vectors.read().save();
+                let _ = state.clip_vectors.read().save();
+                let _ = state.audio_vectors.read().save();
+                let _ = state.db.log("index", &format!("已移除扫描目录并清理索引数据：{root}"));
+            }
+            Err(error) => {
+                let _ = state.db.log("error", &format!("清理已移除扫描目录失败 {root}: {error}"));
+            }
+        }
+    }
     if autostart_before != new_cfg.ui.autostart {
         apply_autostart(new_cfg.ui.autostart, &state.app_dir);
     }
     *state.cfg.write() = new_cfg;
     if let Some(indexer) = state.indexer() {
         let cfg = state.cfg.read();
-        let batch_size = match cfg.model.parallel_mode.as_str() {
-            "eco" => 1,
-            "turbo" | "狂暴" => cfg.index.batch_size.max(96).min(128),
-            _ => cfg.index.batch_size.max(48).min(64),
-        };
-        indexer.set_batch_size(batch_size);
+        indexer.set_batch_size(crate::ai::effective_batch_size(&cfg.model, cfg.index.batch_size));
+        indexer.set_worker_threads(crate::ai::effective_parallel_threads(&cfg.model));
     }
     Ok(())
+}
+
+fn normalize_workspace_config(workspace: &mut crate::config::WorkspaceConfig) {
+    fn normalize_paths(paths: &mut Vec<String>, limit: Option<usize>) {
+        let mut seen = std::collections::HashSet::new();
+        let mut normalized = Vec::with_capacity(paths.len());
+        for path in paths.drain(..) {
+            let path = crate::util::norm_path(&path);
+            if !path.is_empty() && seen.insert(path.to_ascii_lowercase()) {
+                normalized.push(path);
+            }
+        }
+        if let Some(limit) = limit {
+            normalized.truncate(limit);
+        }
+        *paths = normalized;
+    }
+    normalize_paths(&mut workspace.recent_paths, Some(3));
+    normalize_paths(&mut workspace.pinned_paths, None);
+    if !matches!(workspace.startup_scope.as_str(), "remember" | "all" | "indexed" | "fixed") {
+        workspace.startup_scope = "remember".into();
+    }
+    if !matches!(workspace.last_scope.as_str(), "all" | "indexed" | "path") {
+        workspace.last_scope = "indexed".into();
+    }
+    workspace.startup_path = crate::util::norm_path(&workspace.startup_path);
+    workspace.last_path = crate::util::norm_path(&workspace.last_path);
 }
 
 /// 把「开机自启」写进 HKCU 的 Run 键（或从中删除）。
@@ -126,22 +184,80 @@ fn merge_json(dst: &mut serde_json::Value, src: &serde_json::Value) {
 }
 
 #[tauri::command]
-pub fn search(state: State<'_, Arc<AppState>>, mut q: SearchQuery) -> Vec<Hit> {
-    state.search(&mut q)
+pub async fn search(app: tauri::AppHandle, q: SearchQuery) -> Vec<Hit> {
+    let state = Arc::clone(app.state::<Arc<AppState>>().inner());
+    tauri::async_runtime::spawn_blocking(move || search_inner(&state, q))
+        .await
+        .unwrap_or_default()
+}
+
+fn search_inner(state: &Arc<AppState>, mut q: SearchQuery) -> Vec<Hit> {
+    let query_has_cjk = q.text.chars().any(|character| {
+        matches!(character as u32,
+            0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x2fa1f)
+    });
+    let hits = state.search(&mut q);
+    // Chinese queries cannot match English-only text through FTS5. Use the
+    // multilingual embedding space for CJK input even when Chinese filename
+    // matches exist, so those lexical hits do not hide English references.
+    // Other languages only pay the semantic cost when lexical search is empty.
+    if (!hits.is_empty() && !query_has_cjk) || q.text.trim().is_empty() {
+        return hits;
+    }
+
+    // Keep the fast FTS5 path as the first attempt. When it cannot find a
+    // lexical match, wake the configured embedding model on demand so a
+    // multilingual query such as Chinese "发动机" can still recall an
+    // English document (and image-only packages can use their media vectors).
+    // A missing/unloadable model is deliberately non-fatal: the caller still
+    // receives the already computed lexical result (normally an empty list).
+    match semantic_search_inner(state, q) {
+        Ok(semantic_hits) => semantic_hits,
+        Err(error) => {
+            let _ = state
+                .db
+                .log("error", &format!("按需语义检索未能启用：{error}"));
+            hits
+        }
+    }
 }
 
 #[tauri::command]
-pub fn search_semantic(state: State<'_, Arc<AppState>>, mut q: SearchQuery) -> Result<Vec<Hit>, String> {
+pub async fn search_semantic(app: tauri::AppHandle, q: SearchQuery) -> Result<Vec<Hit>, String> {
+    let state = Arc::clone(app.state::<Arc<AppState>>().inner());
+    tauri::async_runtime::spawn_blocking(move || semantic_search_inner(&state, q))
+        .await
+        .map_err(|error| format!("语义检索任务失败：{error}"))?
+}
+
+fn semantic_search_inner(state: &Arc<AppState>, mut q: SearchQuery) -> Result<Vec<Hit>, String> {
     let text = q.text.clone();
     if text.trim().is_empty() {
         return Ok(vec![]);
+    }
+    // The normal search command stays model-free. An explicit semantic request
+    // is the point at which we lazily restore the last selected model, so a
+    // fresh application launch does not spend time or VRAM initializing AI.
+    if state.embedder.read().info().backend == "hash" {
+        let cfg = state.cfg.read().clone();
+        let previous = if cfg.model.embed_model.trim().is_empty() {
+            cfg.model.last_embed_model.clone()
+        } else {
+            cfg.model.embed_model.clone()
+        };
+        if previous.trim().is_empty() {
+            return Err("未配置可用于语义检索的嵌入模型".into());
+        }
+        model_load_inner(state, "auto".into(), Some(previous))?;
     }
     let embedder = state.embedder.read();
     let info = embedder.info();
     let vec = embedder.embed_text(&text, true).map_err(|e| e.to_string())?;
     q.query_vector = Some(vec);
-    if info.backend == "candle"
-        && info.modalities.iter().any(|m| matches!(m.as_str(), "image" | "audio" | "video"))
+    if info
+        .modalities
+        .iter()
+        .any(|m| matches!(m.as_str(), "image" | "audio" | "video"))
     {
         q.vector_space = Some("shared".into());
     }
@@ -150,7 +266,14 @@ pub fn search_semantic(state: State<'_, Arc<AppState>>, mut q: SearchQuery) -> R
 }
 
 #[tauri::command]
-pub fn similar(state: State<'_, Arc<AppState>>, file_id: i64, kind: Option<String>, top: Option<usize>) -> Vec<Hit> {
+pub async fn similar(app: tauri::AppHandle, file_id: i64, kind: Option<String>, top: Option<usize>) -> Vec<Hit> {
+    let state = Arc::clone(app.state::<Arc<AppState>>().inner());
+    tauri::async_runtime::spawn_blocking(move || similar_inner(&state, file_id, kind, top))
+        .await
+        .unwrap_or_default()
+}
+
+fn similar_inner(state: &Arc<AppState>, file_id: i64, kind: Option<String>, top: Option<usize>) -> Vec<Hit> {
     let vecs = Arc::clone(&state.vectors.read());
     let media = Arc::clone(&state.media_vectors.read());
     let clip = Arc::clone(&state.clip_vectors.read());
@@ -206,6 +329,8 @@ pub struct IndexRootOut {
     pub kinds_label: String,
     pub files: i64,
     pub bytes: i64,
+    pub discovered_files: i64,
+    pub discovered_bytes: i64,
     pub bytes_label: String,
     pub added: i64,
     pub updated: i64,
@@ -243,6 +368,8 @@ pub fn index_roots(state: State<'_, Arc<AppState>>) -> Vec<IndexRootOut> {
         last_scan: r.last_scan,
         files: r.files,
         bytes: r.bytes,
+        discovered_files: r.discovered_files,
+        discovered_bytes: r.discovered_bytes,
         bytes_label: human_size(r.bytes),
         added: r.added,
         updated: r.updated,
@@ -322,10 +449,14 @@ pub struct ScanProgress {
     pub errors: u64,
     pub missing: u64,
     pub bytes: u64,
+    pub discovered_files: u64,
+    pub discovered_bytes: u64,
     pub current: String,
     pub seconds: f64,
     pub done: bool,
     pub cancelled: bool,
+    pub extensions: Vec<crate::scan::ExtensionScanStats>,
+    pub roots: Vec<crate::scan::RootScanStats>,
 }
 
 /// 扫描 + 增量索引的共用入口。
@@ -336,6 +467,7 @@ pub fn start_scan(
     state: &Arc<AppState>,
     roots: Option<Vec<String>>,
     index_what: Option<String>,
+    scan_only: bool,
 ) -> Result<(), String> {
     if state.scan_busy.load(Ordering::Relaxed) {
         return Err("扫描已在进行中".into());
@@ -354,6 +486,14 @@ pub fn start_scan(
     });
     if sc.roots.is_empty() {
         return Err("请先选择要扫描的目录".into());
+    }
+    let needs_embedding = match index_what.as_deref() {
+        Some("text") => false,
+        Some("embed") | Some("auto") => true,
+        _ => cfg.index.auto_embed,
+    };
+    if !scan_only && needs_embedding {
+        ensure_index_model(state)?;
     }
     let _ = state.db.sync_index_roots(&cfg.scan.roots, &cfg.scan.disabled_roots);
     state.scan_cancel.store(false, Ordering::Relaxed);
@@ -381,6 +521,8 @@ pub fn start_scan(
                 root.skipped as i64,
                 root.errors as i64,
                 root.missing as i64,
+                root.discovered_files as i64,
+                root.discovered_bytes as i64,
                 &root.last_error,
             );
             if root.errors > 0 {
@@ -389,7 +531,7 @@ pub fn start_scan(
                 let _ = db.log("scan", &format!("目录扫描 {}：{} 个文件，新增 {}，更新 {}，跳过 {}，缺失 {}", root.root, root.files, root.added, root.updated, root.skipped, root.missing));
             }
         }
-        if !stats.cancelled {
+        if !stats.cancelled && !scan_only {
             let indexer = match app_state.indexer() {
                 Some(i) => i,
                 None => app_state.rebuild_indexer(),
@@ -427,8 +569,9 @@ pub fn scan_start(
     state: State<'_, Arc<AppState>>,
     roots: Option<Vec<String>>,
     index_what: Option<String>,
+    scan_only: Option<bool>,
 ) -> Result<(), String> {
-    start_scan(state.inner(), roots, index_what)
+    start_scan(state.inner(), roots, index_what, scan_only.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -452,10 +595,14 @@ pub fn scan_progress(state: State<'_, Arc<AppState>>) -> ScanProgress {
         errors: s.errors,
         missing: s.missing,
         bytes: s.bytes,
+        discovered_files: s.discovered_files,
+        discovered_bytes: s.discovered_bytes,
         current: s.current,
         seconds: s.seconds,
         done: s.done,
         cancelled: s.cancelled,
+        extensions: s.extensions,
+        roots: s.roots,
     }
 }
 
@@ -594,6 +741,13 @@ pub fn model_info(state: State<'_, Arc<AppState>>) -> ModelInfoOut {
 
 #[tauri::command]
 pub fn model_load(state: State<'_, Arc<AppState>>, backend: String, path: Option<String>) -> Result<ModelInfoOut, String> {
+    model_load_inner(state.inner(), backend, path)
+}
+
+/// Load an embedding model for an explicit UI/indexing request. Keeping this
+/// separate from the Tauri wrapper lets the indexer perform a lazy reload
+/// without pretending that opening the application needs a model.
+pub fn model_load_inner(state: &Arc<AppState>, backend: String, path: Option<String>) -> Result<ModelInfoOut, String> {
     let mut cfg = state.cfg.read().clone();
     // The frontend sends a model path, never an implementation choice. Keep
     // the old backend argument as a compatibility alias for older clients,
@@ -617,6 +771,9 @@ pub fn model_load(state: State<'_, Arc<AppState>>, backend: String, path: Option
         return Err(format!("无法识别模型格式：{}（需要 GGUF 或 safetensors）", requested));
     };
     cfg.model.embed_model = if mode == "hash" { String::new() } else { resolved_s.clone().unwrap_or(requested.clone()) };
+    if mode != "hash" {
+        cfg.model.last_embed_model = cfg.model.embed_model.clone();
+    }
     let emb: Arc<dyn crate::ai::Embedder> = match mode {
         "llama" => {
             #[cfg(feature = "llama")]
@@ -624,7 +781,8 @@ pub fn model_load(state: State<'_, Arc<AppState>>, backend: String, path: Option
                 let e = crate::ai::llama::LlamaEmbedder::load(
                     resolved_s.as_deref().unwrap_or(&requested),
                     cfg.model.context_size as i32,
-                    cfg.model.n_threads as i32,
+                    crate::ai::effective_parallel_threads(&cfg.model)
+                        .min(i32::MAX as usize) as i32,
                     &cfg.model.gpu_device,
                 )?;
                 Arc::new(e)
@@ -646,10 +804,27 @@ pub fn model_load(state: State<'_, Arc<AppState>>, backend: String, path: Option
                         .ok_or_else(|| "safetensors 模型路径没有父目录".to_string())?
                         .to_path_buf()
                 };
+                if !crate::ai::is_embedding_gemma_dir(&dir) {
+                    return Err(format!(
+                        "当前原生 Candle 适配器只支持 EmbeddingGemma2 safetensors：{}；Qwen3-Embedding/Jina v5 Omni 请导入对应 GGUF，或安装 Python/ONNX 扩展",
+                        dir.display()
+                    ));
+                }
                 let e = crate::ai::candle_backend::CandleEmbedder::load(
                     &dir,
                     &cfg.model.gpu_device,
                     crate::ai::effective_batch_size(&cfg.model, cfg.index.batch_size),
+                    cfg.model.context_size as usize,
+                    cfg.index.image_token_budget,
+                    cfg.index.video_token_budget,
+                    cfg.index.vision_encoder,
+                    cfg.index.audio_encoder,
+                    cfg.index.video_index_audio,
+                    cfg.index.audio_seconds,
+                    cfg.index.video_frame_interval,
+                    cfg.index.video_max_frames,
+                    cfg.index.image_max_side,
+                    cfg.index.pdf_image_token_budget,
                 )?;
                 Arc::new(e)
             }
@@ -660,7 +835,6 @@ pub fn model_load(state: State<'_, Arc<AppState>>, backend: String, path: Option
         }
         _ => Arc::new(crate::ai::hash::HashEmbedder::new()),
     };
-    let emb = crate::ai::maybe_replicate(emb, &cfg.model, cfg.index.batch_size);
     let info = emb.info();
     let dim = emb.dim();
     // Candle's multimodal model maps text and media into the same 768-D
@@ -677,6 +851,15 @@ pub fn model_load(state: State<'_, Arc<AppState>>, backend: String, path: Option
     cfg.model.embedding_dim = dim;
     let _ = cfg.save(&crate::config::config_path(Some(&state.app_dir)));
     *state.cfg.write() = cfg;
+    // Cross-modal encoders are opt-in and are loaded only after the user
+    // explicitly chooses a model or starts indexing.
+    let (clip, clap) = crate::state::load_cross_modal(
+        &state.cfg.read().model,
+        &state.app_dir,
+        &state.data_dir,
+    );
+    *state.clip.write() = clip;
+    *state.clap.write() = clap;
     *state.embedder.write() = emb;
     // 维度变了，向量库需要重建
     let vec_dir = state.data_dir.join("vectors");
@@ -718,6 +901,27 @@ pub fn model_load(state: State<'_, Arc<AppState>>, backend: String, path: Option
     })
 }
 
+/// Ensure an indexing run has the explicitly configured embedding backend.
+/// Search keeps the hash baseline until this function is reached, so opening
+/// the application never allocates model memory. A deactivated model falls
+/// back to `last_embed_model` for the next deliberate indexing request.
+pub fn ensure_index_model(state: &Arc<AppState>) -> Result<(), String> {
+    let cfg = state.cfg.read().clone();
+    let path = if !cfg.model.embed_model.trim().is_empty() {
+        cfg.model.embed_model.trim().to_string()
+    } else {
+        cfg.model.last_embed_model.trim().to_string()
+    };
+    if path.is_empty() {
+        return Ok(());
+    }
+    let active = state.embedder.read().info();
+    if active.ready && active.backend != "hash" {
+        return Ok(());
+    }
+    model_load_inner(state, "auto".into(), Some(path)).map(|_| ())
+}
+
 // ---------------------------------------------------------------- 模型管理
 /// Disable the active embedding model and restore the deterministic hash
 /// baseline. Clearing the persisted path is part of the operation; otherwise
@@ -725,6 +929,9 @@ pub fn model_load(state: State<'_, Arc<AppState>>, backend: String, path: Option
 #[tauri::command]
 pub fn model_deactivate(state: State<'_, Arc<AppState>>) -> Result<ModelInfoOut, String> {
     let mut cfg = state.cfg.read().clone();
+    if !cfg.model.embed_model.trim().is_empty() {
+        cfg.model.last_embed_model = cfg.model.embed_model.clone();
+    }
     cfg.model.embed_model.clear();
     cfg.model.embedding_dim = 256;
 
@@ -751,6 +958,11 @@ pub fn model_deactivate(state: State<'_, Arc<AppState>>) -> Result<ModelInfoOut,
     *state.cfg.write() = cfg;
     *state.embedder.write() = emb;
     *state.media_embedder.write() = media_emb;
+    // Deactivation must also remove any CLIP/CLAP instances loaded for the
+    // previous model. Otherwise the settings page can report stale media
+    // capability and indexing can keep using those encoders.
+    *state.clip.write() = None;
+    *state.clap.write() = None;
     *state.vectors.write() = Arc::new(vectors);
     *state.media_vectors.write() = Arc::new(media_vectors);
     let _ = state.rebuild_indexer();
@@ -824,6 +1036,30 @@ pub fn model_import_folder(
 #[tauri::command]
 pub fn open_path(path: String) -> Result<(), String> {
     open::that(&path).map_err(|e| e.to_string())
+}
+
+/// Open a result only after checking that its id still refers to the path
+/// shown by the UI. This prevents a stale result card from opening a different
+/// file after an incremental rescan or rename.
+#[tauri::command]
+pub fn open_indexed_path(
+    state: State<'_, Arc<AppState>>,
+    file_id: i64,
+    path: String,
+) -> Result<(), String> {
+    if file_id <= 0 {
+        return open_path(path);
+    }
+    let expected = crate::util::norm_path(&path);
+    let row = state
+        .db
+        .get_by_id(file_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "检索结果已失效，请重新搜索".to_string())?;
+    if crate::util::norm_path(&row.path) != expected {
+        return Err("检索结果对应的文件已变化，请重新搜索".into());
+    }
+    open_path(row.path)
 }
 
 #[tauri::command]
@@ -926,7 +1162,7 @@ pub fn ensure_preview(
     let thumb_dir = state.data_dir.join("thumbs");
     std::fs::create_dir_all(&thumb_dir).map_err(|error| error.to_string())?;
     let dest = thumb_dir.join(format!("{file_id}.jpg"));
-    if !dest.is_file() {
+    if !dest.is_file() || row.thumb_key.is_none() {
         let made = if matches!(row.kind.as_str(), "image" | "video") {
             crate::media::make_thumb(source, &dest, state.cfg.read().index.image_max_side)
         } else {
@@ -941,6 +1177,61 @@ pub fn ensure_preview(
         .set_thumb(file_id, &format!("{file_id}.jpg"))
         .map_err(|error| error.to_string())?;
     Ok(true)
+}
+
+/// Persist a PDF.js-rendered first page so later searches can load a small
+/// JPEG instead of reopening the full PDF in the WebView.
+#[tauri::command]
+pub fn save_pdf_thumbnail(
+    state: State<'_, Arc<AppState>>,
+    file_id: i64,
+    path: String,
+    data_url: String,
+) -> Result<(), String> {
+    use base64::Engine as _;
+
+    let row = state.db.get_by_id(file_id).map_err(|e| e.to_string())?
+        .ok_or_else(|| "文件不存在".to_string())?;
+    if row.ext.trim_start_matches('.').eq_ignore_ascii_case("pdf") == false
+        || crate::util::norm_path(&row.path) != crate::util::norm_path(&path)
+    {
+        return Err("PDF 缩略图来源与索引记录不匹配".into());
+    }
+    if !Path::new(&row.path).is_file() {
+        return Err("PDF 文件已不存在".into());
+    }
+    let (mime, encoded) = data_url.split_once(',').ok_or_else(|| "PDF 缩略图数据无效".to_string())?;
+    if mime != "data:image/jpeg;base64" {
+        return Err("PDF 缩略图必须是 JPEG".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)
+        .map_err(|e| format!("PDF 缩略图解码失败：{e}"))?;
+    if bytes.len() < 4 || bytes.len() > 2 * 1024 * 1024 || bytes[..2] != [0xff, 0xd8] {
+        return Err("PDF 缩略图大小或格式无效".into());
+    }
+    let thumb_dir = state.data_dir.join("thumbs");
+    std::fs::create_dir_all(&thumb_dir).map_err(|e| e.to_string())?;
+    let dest = thumb_dir.join(format!("{file_id}.jpg"));
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?.as_nanos();
+    let temp = thumb_dir.join(format!("{file_id}.{nonce}.tmp"));
+    std::fs::write(&temp, &bytes).map_err(|e| e.to_string())?;
+    if let Err(error) = std::fs::rename(&temp, &dest) {
+        if dest.is_file() {
+            std::fs::remove_file(&dest).map_err(|remove_error| {
+                let _ = std::fs::remove_file(&temp);
+                format!("替换旧 PDF 缩略图失败：{remove_error}")
+            })?;
+            if let Err(replace_error) = std::fs::rename(&temp, &dest) {
+                let _ = std::fs::remove_file(&temp);
+                return Err(replace_error.to_string());
+            }
+        } else {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error.to_string());
+        }
+    }
+    state.db.set_thumb(file_id, &format!("{file_id}.jpg")).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1291,12 +1582,193 @@ pub fn workspace_add(
     if !cfg.workspace.dirs.iter().any(|d| d.eq_ignore_ascii_case(&norm)) {
         cfg.workspace.dirs.push(norm.clone());
     }
+    if !cfg.workspace.pinned_paths.iter().any(|d| d.eq_ignore_ascii_case(&norm)) {
+        cfg.workspace.pinned_paths.push(norm.clone());
+    }
     let path = crate::config::config_path(Some(&state.app_dir));
     cfg.save(&path).map_err(|e| format!("保存配置失败：{e}"))?;
     let dirs = cfg.workspace.dirs.clone();
     *state.cfg.write() = cfg;
     let _ = state.db.log("workspace", &format!("加入工作区：{norm}"));
     Ok(dirs)
+}
+
+#[derive(Serialize)]
+pub struct WorkspaceStateOut {
+    pub recent_paths: Vec<String>,
+    pub pinned_paths: Vec<String>,
+    pub last_path: String,
+    pub last_scope: String,
+    pub startup_scope: String,
+    pub startup_path: String,
+    pub initial_scope: String,
+    pub initial_path: String,
+}
+
+fn workspace_state_from(cfg: &AppConfig) -> WorkspaceStateOut {
+    let (initial_scope, initial_path) = match cfg.workspace.startup_scope.as_str() {
+        "all" => ("all".to_string(), String::new()),
+        "indexed" => ("indexed".to_string(), String::new()),
+        "fixed" if Path::new(&cfg.workspace.startup_path).is_dir() => {
+            ("path".to_string(), cfg.workspace.startup_path.clone())
+        }
+        "remember" if cfg.workspace.last_scope == "path"
+            && Path::new(&cfg.workspace.last_path).is_dir() =>
+        {
+            ("path".to_string(), cfg.workspace.last_path.clone())
+        }
+        "remember" if cfg.workspace.last_scope == "all" => ("all".to_string(), String::new()),
+        _ => ("indexed".to_string(), String::new()),
+    };
+    WorkspaceStateOut {
+        recent_paths: cfg.workspace.recent_paths.clone(),
+        pinned_paths: cfg.workspace.pinned_paths.clone(),
+        last_path: cfg.workspace.last_path.clone(),
+        last_scope: cfg.workspace.last_scope.clone(),
+        startup_scope: cfg.workspace.startup_scope.clone(),
+        startup_path: cfg.workspace.startup_path.clone(),
+        initial_scope,
+        initial_path,
+    }
+}
+
+/// Return persisted home-page workspace choices. This is intentionally
+/// separate from `get_config` so the search view can refresh it cheaply.
+#[tauri::command]
+pub fn workspace_state(state: State<'_, Arc<AppState>>) -> WorkspaceStateOut {
+    workspace_state_from(&state.cfg.read())
+}
+
+#[tauri::command]
+pub fn workspace_remember(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+    scope: Option<String>,
+) -> Result<WorkspaceStateOut, String> {
+    let norm = crate::util::norm_path(&path);
+    if norm.trim().is_empty() || !Path::new(&norm).is_dir() {
+        return Err("工作区路径不存在或不是目录".into());
+    }
+    let mut cfg = state.cfg.read().clone();
+    cfg.workspace.recent_paths.retain(|p| !p.eq_ignore_ascii_case(&norm));
+    cfg.workspace.recent_paths.insert(0, norm.clone());
+    cfg.workspace.recent_paths.truncate(3);
+    cfg.workspace.last_path = norm;
+    if let Some(scope) = scope {
+        let scope = scope.trim().to_ascii_lowercase();
+        if matches!(scope.as_str(), "all" | "indexed" | "path") {
+            cfg.workspace.last_scope = scope;
+        }
+    } else {
+        cfg.workspace.last_scope = "path".into();
+    }
+    let path = crate::config::config_path(Some(&state.app_dir));
+    cfg.save(&path).map_err(|e| format!("保存工作区记忆失败：{e}"))?;
+    let out = workspace_state_from(&cfg);
+    *state.cfg.write() = cfg;
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn workspace_set_active(
+    state: State<'_, Arc<AppState>>,
+    scope: String,
+    path: Option<String>,
+) -> Result<WorkspaceStateOut, String> {
+    let scope = scope.trim().to_ascii_lowercase();
+    if !matches!(scope.as_str(), "all" | "indexed" | "path") {
+        return Err("无效的工作区搜索范围".into());
+    }
+    let mut cfg = state.cfg.read().clone();
+    if scope == "path" {
+        let norm = crate::util::norm_path(path.as_deref().unwrap_or_default());
+        if norm.is_empty() || !Path::new(&norm).is_dir() {
+            return Err("工作区路径不存在或不是目录".into());
+        }
+        cfg.workspace.recent_paths.retain(|p| !p.eq_ignore_ascii_case(&norm));
+        cfg.workspace.recent_paths.insert(0, norm.clone());
+        cfg.workspace.recent_paths.truncate(3);
+        cfg.workspace.last_path = norm;
+    }
+    cfg.workspace.last_scope = scope;
+    let config_path = crate::config::config_path(Some(&state.app_dir));
+    cfg.save(&config_path).map_err(|e| format!("保存工作区记忆失败：{e}"))?;
+    let out = workspace_state_from(&cfg);
+    *state.cfg.write() = cfg;
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn workspace_remove(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+) -> Result<WorkspaceStateOut, String> {
+    let norm = crate::util::norm_path(&path);
+    let mut cfg = state.cfg.read().clone();
+    cfg.workspace.dirs.retain(|p| !p.eq_ignore_ascii_case(&norm));
+    cfg.workspace.pinned_paths.retain(|p| !p.eq_ignore_ascii_case(&norm));
+    cfg.workspace.recent_paths.retain(|p| !p.eq_ignore_ascii_case(&norm));
+    if cfg.workspace.startup_path.eq_ignore_ascii_case(&norm) {
+        cfg.workspace.startup_path.clear();
+        if cfg.workspace.startup_scope == "fixed" {
+            cfg.workspace.startup_scope = "indexed".into();
+        }
+    }
+    if cfg.workspace.last_path.eq_ignore_ascii_case(&norm) {
+        cfg.workspace.last_path.clear();
+        cfg.workspace.last_scope = "indexed".into();
+    }
+    let config_path = crate::config::config_path(Some(&state.app_dir));
+    cfg.save(&config_path).map_err(|e| format!("保存工作区列表失败：{e}"))?;
+    let out = workspace_state_from(&cfg);
+    *state.cfg.write() = cfg;
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn workspace_set_startup(
+    state: State<'_, Arc<AppState>>,
+    scope: String,
+    path: Option<String>,
+) -> Result<WorkspaceStateOut, String> {
+    let scope = scope.trim().to_ascii_lowercase();
+    if !matches!(scope.as_str(), "remember" | "all" | "indexed" | "fixed") {
+        return Err("无效的启动工作区范围".into());
+    }
+    let fixed = path.unwrap_or_default();
+    let fixed = if fixed.trim().is_empty() { String::new() } else { crate::util::norm_path(&fixed) };
+    if scope == "fixed" && (fixed.is_empty() || !Path::new(&fixed).is_dir()) {
+        return Err("固定工作区路径不存在或不是目录".into());
+    }
+    let mut cfg = state.cfg.read().clone();
+    cfg.workspace.startup_scope = scope;
+    cfg.workspace.startup_path = fixed;
+    if cfg.workspace.startup_scope == "fixed"
+        && !cfg.workspace.pinned_paths.iter().any(|p| p.eq_ignore_ascii_case(&cfg.workspace.startup_path))
+    {
+        cfg.workspace.pinned_paths.push(cfg.workspace.startup_path.clone());
+    }
+    let config_path = crate::config::config_path(Some(&state.app_dir));
+    cfg.save(&config_path).map_err(|e| format!("保存启动工作区失败：{e}"))?;
+    let out = workspace_state_from(&cfg);
+    *state.cfg.write() = cfg;
+    Ok(out)
+}
+
+/// List mounted Windows drive roots for the home-page scope selector.
+#[tauri::command]
+pub fn available_drives() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        ('A'..='Z')
+            .map(|letter| format!("{letter}:\\"))
+            .filter(|root| Path::new(root).is_dir())
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec!["/".into()]
+    }
 }
 
 // ---------------------------------------------------------------- 树状图
@@ -1523,13 +1995,22 @@ pub fn db_vacuum(state: State<'_, Arc<AppState>>) -> Result<(), String> {
 
 #[tauri::command]
 pub fn db_clear(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.db.clear_all().map_err(|e| e.to_string())?;
-    let vec_dir = state.data_dir.join("vectors");
-    let dim = state.cfg.read().model.embedding_dim;
-    if let Ok(v) = crate::vector::VectorStore::open(&vec_dir, dim) {
-        let _ = v.clear();
-        *state.vectors.write() = Arc::new(v);
+    // Stop and join the worker before touching SQLite/vector files. Otherwise
+    // an in-flight encode could finish after the clear and repopulate part of
+    // the index the user just confirmed clearing.
+    if let Some(indexer) = state.indexer.write().take() {
+        indexer.stop();
     }
+    state.db.clear_all().map_err(|e| e.to_string())?;
+    for store in [
+        &state.vectors,
+        &state.media_vectors,
+        &state.clip_vectors,
+        &state.audio_vectors,
+    ] {
+        store.read().clear().map_err(|e| format!("清理向量库失败：{e}"))?;
+    }
+    let _ = state.db.log("index", "已清空全部索引数据");
     Ok(())
 }
 
@@ -1542,9 +2023,11 @@ pub fn data_dir_path(state: State<'_, Arc<AppState>>) -> String {
 pub struct ExtensionStatusOut {
     pub onnxruntime: bool,
     pub onnxruntime_path: String,
+    pub onnxruntime_version: String,
     pub python: bool,
     pub python_path: String,
     pub root: String,
+    pub detail: String,
 }
 
 fn extension_root(state: &AppState) -> std::path::PathBuf {
@@ -1586,13 +2069,37 @@ fn extension_status_for(state: &AppState) -> ExtensionStatusOut {
         }
     }
     let python = root.join(".tools").join("python").join("python.exe");
+    let version = ort.file_name()
+        .map(|name| ort.with_file_name(format!("{}.version", name.to_string_lossy())))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     ExtensionStatusOut {
         onnxruntime: ort.is_file(),
         onnxruntime_path: ort.to_string_lossy().replace('/', "\\"),
+        onnxruntime_version: version,
         python: python.is_file(),
         python_path: python.to_string_lossy().replace('/', "\\"),
         root: root.to_string_lossy().replace('/', "\\"),
+        detail: String::new(),
     }
+}
+
+fn unload_cross_modal_for_extension(state: &AppState) -> Result<(), String> {
+    if state.scan_busy.load(Ordering::Relaxed) {
+        return Err("扫描或索引运行期间不能更新或删除 ONNX Runtime".into());
+    }
+    if let Some(indexer) = state.indexer() {
+        let progress = indexer.snapshot();
+        if progress.running || progress.queued > 0 {
+            return Err("索引运行期间不能更新或删除 ONNX Runtime".into());
+        }
+        indexer.set_cross_modal(None, None);
+    }
+    *state.clip.write() = None;
+    *state.clap.write() = None;
+    Ok(())
 }
 
 /// Install an optional extension into the project-local `.tools` directory.
@@ -1624,5 +2131,127 @@ pub fn extension_install(state: State<'_, Arc<AppState>>, kind: String) -> Resul
         return Err(if msg.is_empty() { format!("扩展安装失败（退出码 {:?}）", output.status.code()) } else { msg });
     }
     let _ = state.db.log("extension", &format!("已安装项目扩展：{kind}"));
+    Ok(extension_status_for(&state))
+}
+
+#[tauri::command]
+pub fn extension_update(state: State<'_, Arc<AppState>>, kind: String) -> Result<ExtensionStatusOut, String> {
+    if kind != "onnxruntime" {
+        return Err("目前仅支持检查 ONNX Runtime 更新".into());
+    }
+    let before = extension_status_for(&state);
+    if !before.onnxruntime {
+        return Err("ONNX Runtime 尚未安装".into());
+    }
+    unload_cross_modal_for_extension(&state)?;
+    let root = extension_root(&state);
+    let mut script = root.join("scripts").join("install-onnxruntime.ps1");
+    if !script.is_file() {
+        script = state.app_dir.join("resources").join("scripts").join("install-onnxruntime.ps1");
+    }
+    if !script.is_file() {
+        return Err(format!("找不到 ONNX Runtime 更新脚本：{}", script.display()));
+    }
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Update")
+        .current_dir(&root)
+        .output()
+        .map_err(|e| format!("启动 ONNX Runtime 更新失败：{e}"))?;
+    if !output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if msg.is_empty() {
+            format!("ONNX Runtime 更新失败（退出码 {:?}）", output.status.code())
+        } else {
+            msg
+        });
+    }
+    let mut status = extension_status_for(&state);
+    if state.app_dir.join("onnxruntime.dll").is_file() {
+        let legacy_dll = state.app_dir.join("onnxruntime.dll");
+        move_extension_to_recycle_bin(&legacy_dll)?;
+        let legacy_version = state.app_dir.join("onnxruntime.dll.version");
+        if legacy_version.is_file() {
+            move_extension_to_recycle_bin(&legacy_version)?;
+        }
+    }
+    status.detail = if !before.onnxruntime_version.is_empty()
+        && before.onnxruntime_version == status.onnxruntime_version
+    {
+        format!("ONNX Runtime {} 已是最新版", status.onnxruntime_version)
+    } else {
+        format!("ONNX Runtime 已更新到 {}", status.onnxruntime_version)
+    };
+    let _ = state.db.log("extension", &status.detail);
+    Ok(status)
+}
+
+#[cfg(windows)]
+fn move_extension_to_recycle_bin(path: &std::path::Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct FileOp {
+        hwnd: *mut std::ffi::c_void,
+        operation: u32,
+        from: *const u16,
+        to: *const u16,
+        flags: u16,
+        aborted: i32,
+        mappings: *mut std::ffi::c_void,
+        progress_title: *const u16,
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHFileOperationW(operation: *mut FileOp) -> i32;
+    }
+
+    let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
+    from.extend([0, 0]);
+    let mut op = FileOp {
+        hwnd: std::ptr::null_mut(),
+        operation: 3,
+        from: from.as_ptr(),
+        to: std::ptr::null(),
+        flags: 0x0004 | 0x0010 | 0x0040 | 0x0400,
+        aborted: 0,
+        mappings: std::ptr::null_mut(),
+        progress_title: std::ptr::null(),
+    };
+    let result = unsafe { SHFileOperationW(&mut op) };
+    if result != 0 || op.aborted != 0 {
+        return Err(format!("无法将扩展移入回收站：{}（错误码 {result}）", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn move_extension_to_recycle_bin(path: &std::path::Path) -> Result<(), String> {
+    Err(format!("当前平台不支持回收站删除：{}", path.display()))
+}
+
+#[tauri::command]
+pub fn extension_remove(state: State<'_, Arc<AppState>>, kind: String) -> Result<ExtensionStatusOut, String> {
+    if kind != "onnxruntime" {
+        return Err("目前仅支持删除 ONNX Runtime 扩展".into());
+    }
+    unload_cross_modal_for_extension(&state)?;
+    let root = extension_root(&state);
+    let candidates = [
+        root.join(".tools").join("onnxruntime").join("onnxruntime.dll"),
+        root.join(".tools").join("onnxruntime").join("onnxruntime.dll.version"),
+        state.app_dir.join("onnxruntime.dll"),
+        state.app_dir.join("onnxruntime.dll.version"),
+    ];
+    let existing: Vec<_> = candidates.into_iter().filter(|path| path.is_file()).collect();
+    if existing.is_empty() {
+        return Err("没有找到已安装的 ONNX Runtime".into());
+    }
+    for path in &existing {
+        move_extension_to_recycle_bin(path)?;
+    }
+    let _ = state.db.log("extension", "已将 ONNX Runtime 扩展移入回收站");
     Ok(extension_status_for(&state))
 }

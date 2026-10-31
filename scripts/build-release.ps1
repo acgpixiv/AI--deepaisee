@@ -5,6 +5,8 @@ $ProgressPreference = "SilentlyContinue"
 # CUDA is only a build-time switch for Candle kernels; the app picks the GPU at run time.
 $repo = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "activate-local.ps1")
+if (-not $env:DEEPAISEE_VULKAN) { $env:DEEPAISEE_VULKAN = "0" }
+if (-not $env:DEEPAISEE_VULKAN) { $env:DEEPAISEE_VULKAN = "0" }
 
 function Find-CudaRoot {
   $candidates = @()
@@ -52,8 +54,6 @@ function Stage-CudaRuntime([string]$cudaRoot) {
 # Everything the installer ships must exist before tauri-bundler starts packaging.
 function Assert-ReleasePrerequisites {
   $required = @(
-    ".tools\onnxruntime\onnxruntime.dll",
-    "models\embeddinggemma2.gguf",
     "tools\bin\ffmpeg.exe",
     "libstdc++-6.dll",
     "libgcc_s_seh-1.dll",
@@ -70,7 +70,7 @@ function Assert-ReleasePrerequisites {
   }
   if ($missing.Count -gt 0) {
     $list = ($missing -join ([Environment]::NewLine + "  "))
-    throw ("Missing installer resources:" + [Environment]::NewLine + "  " + $list + [Environment]::NewLine + "Run scripts\install-onnxruntime.ps1 and stage the runtime DLLs next to the repo root.")
+    throw ("Missing installer resources:" + [Environment]::NewLine + "  " + $list + [Environment]::NewLine + "Stage the required native runtime DLLs next to the repo root.")
   }
   foreach ($pattern in @("models\clip\*", "models\clap\*")) {
     $hits = Get-ChildItem -Path (Join-Path $repo $pattern) -File -ErrorAction SilentlyContinue
@@ -93,6 +93,7 @@ function Resolve-TargetRoot {
 
 Push-Location $repo
 try {
+  & (Join-Path $PSScriptRoot "patch-llama-embeddinggemma2.ps1")
   Assert-ReleasePrerequisites
   $runtimeDir = Join-Path $repo ".tools\cuda-runtime"
   New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null

@@ -153,10 +153,11 @@ impl Embedder for HashEmbedder {
             model: "内置哈希基线".into(),
             dim: DIM,
             device: "cpu".into(),
-            // Hash media features are only a fallback for similarity; they do
-            // not place media in the model's shared text space.
-            modalities: vec!["text".into()],
-            ready: true,
+            // Hash features keep basic deterministic search working, but they
+            // are not an activated AI model and do not provide a shared
+            // multimodal space.
+            modalities: Vec::new(),
+            ready: false,
             detail: "无需模型即可使用的确定性特征，仅用于兜底/自检".into(),
         }
     }

@@ -22,6 +22,14 @@ pub fn extract_text(path: &Path, max_chars: usize) -> Option<String> {
     if PLAIN_EXTS.contains(&ext.as_str()) {
         return Some(read_plain(path, max_chars));
     }
+    // Keep page/slide boundaries in the raw body. The database stores the
+    // aggregate in the existing file-level FTS row and mirrors each form-feed
+    // separated part into its page index for precise hit locations.
+    if matches!(ext.as_str(), "pdf" | "docx" | "pptx") {
+        return extract_pages(path, max_chars).map(|pages| {
+            truncate_chars(&pages.join("\u{c}"), max_chars)
+        });
+    }
     let text = match ext.as_str() {
         "docx" => ooxml_text(path, "word/document.xml", "w:t", max_chars),
         "pptx" => ooxml_slides(path, max_chars),
@@ -36,6 +44,47 @@ pub fn extract_text(path: &Path, max_chars: usize) -> Option<String> {
         _ => return None,
     };
     Some(text)
+}
+
+/// Extract logical pages for formats where the container exposes a reliable
+/// page/slide boundary. DOCX uses explicit page breaks when present; files
+/// without them remain a single logical page and are chunked by the database.
+pub fn extract_pages(path: &Path, max_chars: usize) -> Option<Vec<String>> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "pdf" => {
+            if !pdf_has_text_operator(path) {
+                return Some(Vec::new());
+            }
+            let pages = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pdf_extract::extract_text_by_pages(path).ok()
+            }))
+            .ok()
+            .flatten()?;
+            if pages.is_empty() {
+                let fallback = pdf_text(path, max_chars);
+                return Some(if fallback.trim().is_empty() { Vec::new() } else { vec![fallback] });
+            }
+            let mut used = 0usize;
+            Some(
+                pages
+                    .into_iter()
+                    .map(|page| {
+                        let remaining = max_chars.saturating_sub(used);
+                        let value = truncate_chars(&page, remaining);
+                        used = used.saturating_add(value.chars().count());
+                        value
+                    })
+                    .collect(),
+            )
+        }
+        "docx" => Some(ooxml_docx_pages(path, max_chars)),
+        "pptx" => Some(ooxml_slide_pages(path, max_chars)),
+        _ => extract_text(path, max_chars).map(|text| vec![text]),
+    }
 }
 
 fn read_plain(path: &Path, max_chars: usize) -> String {
@@ -144,7 +193,72 @@ fn xml_unescape(s: &str) -> String {
 fn ooxml_text(path: &Path, entry: &str, tag: &str, max: usize) -> String {
     let Some(mut zip) = open_zip(path) else { return String::new() };
     let Some(xml) = read_zip_entry(&mut zip, entry, max) else { return String::new() };
+    // DOCX has no fixed page geometry in the package. Preserve explicit page
+    // breaks when present; Db::set_doc will use bounded chunks for flowing
+    // documents that have no break markers.
+    let xml = xml
+        .replace("<w:br w:type=\"page\"/>", "\u{c}")
+        .replace("<w:br w:type=\"page\" />", "\u{c}");
     truncate_chars(&xml_paragraph_text(&xml, tag, "</w:p>"), max)
+}
+
+fn ooxml_docx_pages(path: &Path, max: usize) -> Vec<String> {
+    let Some(mut zip) = open_zip(path) else { return Vec::new() };
+    let Some(xml) = read_zip_entry(&mut zip, "word/document.xml", max.saturating_mul(2).max(max)) else {
+        return Vec::new();
+    };
+    let mut pages = Vec::new();
+    let mut rest = xml.as_str();
+    let mut used = 0usize;
+    loop {
+        let split_at = rest
+            .find("w:type=\"page\"")
+            .or_else(|| rest.find("w:lastRenderedPageBreak"));
+        let (part, tail) = match split_at {
+            Some(offset) => {
+                let end = rest[offset..].find('>').map(|v| offset + v + 1).unwrap_or(rest.len());
+                (&rest[..end], &rest[end..])
+            }
+            None => (rest, ""),
+        };
+        let value = xml_paragraph_text(part, "w:t", "</w:p>");
+        let remaining = max.saturating_sub(used);
+        if remaining == 0 { break; }
+        let value = truncate_chars(&value, remaining);
+        used = used.saturating_add(value.chars().count());
+        // Keep empty slots so a later Word page retains its original number.
+        pages.push(value);
+        if tail.is_empty() { break; }
+        rest = tail;
+    }
+    pages
+}
+
+fn ooxml_slide_pages(path: &Path, max: usize) -> Vec<String> {
+    let Some(mut zip) = open_zip(path) else { return Vec::new() };
+    let mut names: Vec<String> = zip
+        .file_names()
+        .filter(|name| name.starts_with("ppt/slides/slide") && name.ends_with(".xml"))
+        .map(str::to_owned)
+        .collect();
+    names.sort_by_key(|name| {
+        name.trim_start_matches("ppt/slides/slide")
+            .trim_end_matches(".xml")
+            .parse::<u32>()
+            .unwrap_or(u32::MAX)
+    });
+    let mut pages = Vec::new();
+    let mut used = 0usize;
+    for name in names {
+        let Some(xml) = read_zip_entry(&mut zip, &name, max.saturating_sub(used).max(1)) else { continue };
+        let remaining = max.saturating_sub(used);
+        if remaining == 0 { break; }
+        let value = truncate_chars(&xml_tag_text(&xml, "a:t"), remaining);
+        used = used.saturating_add(value.chars().count());
+        // Keep empty slots so empty slides do not renumber later slides.
+        pages.push(value);
+    }
+    pages
 }
 
 /// 按段落抽文本：整篇 `xml_tag_text` 会把所有段落粘成一长串，
@@ -188,6 +302,9 @@ fn zip_entries_text<F: Fn(&str) -> bool>(
     let mut out = String::new();
     for n in names {
         if let Some(xml) = read_zip_entry(&mut zip, &n, max) {
+            if !out.is_empty() {
+                out.push('\u{c}');
+            }
             out.push_str(&xml_tag_text(&xml, tag));
             out.push('\n');
         }
@@ -279,8 +396,15 @@ fn pdf_text(path: &Path, max: usize) -> String {
     // pdf-extract has a few malformed-font assertions. A damaged PDF should
     // become an empty extraction result, never unwind the index worker.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pdf_extract::extract_text(path)
-            .map(|t| truncate_chars(&t, max))
+        pdf_extract::extract_text_by_pages(path)
+            .map(|pages| {
+                pages
+                    .into_iter()
+                    .map(|page| truncate_chars(&page, max))
+                    .filter(|page| !page.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\u{c}")
+            })
             .unwrap_or_default()
     }))
     .unwrap_or_default()

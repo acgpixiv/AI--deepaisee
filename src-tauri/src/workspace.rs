@@ -27,7 +27,7 @@ struct CachedDoc {
 #[derive(Default)]
 pub struct WorkspaceSearch {
     cache: Mutex<HashMap<String, CachedDoc>>,
-    listing: Mutex<Option<(Instant, Vec<PathBuf>)>>,
+    listing: Mutex<Option<(Instant, String, Vec<PathBuf>)>>,
     indexed: Mutex<Option<(Instant, String, HashSet<String>)>>,
 }
 
@@ -129,7 +129,9 @@ impl WorkspaceSearch {
                 }
             }
 
-            if score < 0.16 {
+            // Keep workspace results consistent with indexed search: weak
+            // matches below the user-visible 0.40 relevance floor are hidden.
+            if score < crate::search::MIN_RESULT_SCORE {
                 continue;
             }
             seq += 1;
@@ -151,7 +153,9 @@ impl WorkspaceSearch {
                 mtime_label: util::format_ts(mtime),
                 category: None,
                 thumb: false,
+                thumb_key: None,
                 score,
+                page: None,
                 reason,
                 snippet,
                 tags: Some("工作区".into()),
@@ -192,10 +196,11 @@ impl WorkspaceSearch {
     }
 
     fn listing(&self, cfg: &WorkspaceConfig) -> Vec<PathBuf> {
+        let signature = cfg.dirs.join("|");
         {
             let guard = self.listing.lock();
-            if let Some((ts, files)) = guard.as_ref() {
-                if ts.elapsed() < LISTING_TTL {
+            if let Some((ts, cached_signature, files)) = guard.as_ref() {
+                if ts.elapsed() < LISTING_TTL && cached_signature == &signature {
                     return files.clone();
                 }
             }
@@ -223,7 +228,7 @@ impl WorkspaceSearch {
             }
         }
         let mut guard = self.listing.lock();
-        *guard = Some((Instant::now(), files.clone()));
+        *guard = Some((Instant::now(), signature, files.clone()));
         files
     }
 

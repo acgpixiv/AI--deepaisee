@@ -4,12 +4,12 @@
 
 - 后端：**Rust + Tauri 2.0**（系统 WebView2，安装包 20MB 级，不是 Electron）
 - 前端：**Vue 3 + Vite**
-- AI 引擎：**llama.cpp（C++，GGUF）** 跑文本嵌入；**ONNX Runtime** 跑 CLIP（图文）与 CLAP（音文）
+- AI 引擎：**llama.cpp（C++，GGUF）** 跑文本嵌入；跨模态 CLIP/CLAP 使用可选的 **ONNX Runtime** 扩展
 - 检索：SQLite FTS5 全文 + 中文 2-gram + 拼音全拼/首字母 + 模糊匹配 + 向量语义融合 + 跨模态检索
 - 正文抽取：TXT / Markdown / Word（docx + doc）/ Excel（xlsx + xls）/ PPT（pptx + ppt）/ PDF / RTF / EPUB / ODF
 - 界面：搜索 / 相似、树状图、扫描 / 索引、模型管理 四模式
 
-当前版本 **v0.22**，版本历史见 [CHANGELOG.md](CHANGELOG.md)。
+当前工作区版本 **v0.23**，版本历史见 [CHANGELOG.md](CHANGELOG.md)。安装包不包含任何模型权重；GGUF、safetensors、CLIP/CLAP ONNX 文件均由用户自行导入。
 
 ---
 
@@ -19,7 +19,7 @@
 
 | 内容 | 位置 | 说明 |
 | --- | --- | --- |
-| **安装包** | ❌ 不随仓库分发（682 MB，超过 GitHub 限制） | 本地构建产物为 `release/DeepDark_Oracle_0.0.22_x64-setup.exe`，用 `npm run tauri:release` 生成，产物在 `src-tauri/target/release/bundle/nsis/` |
+| **安装包** | 不随仓库分发 | 本机产物位于 `src-tauri/target/release/bundle/nsis/DeepDark_Oracle_0.0.23_x64-setup.exe`（约 503.65 MiB），用 `npm run tauri:release` 生成 |
 | **可直接运行的便携版** | 根目录：`DeepDark_Oracle.exe` + 5 个 `.dll` + 启动器 | 缺模型与 ffmpeg，见下节 |
 | **前端源码** | `src/`（23 个文件，Vue 3 + TS） | 约 5,900 行 |
 | **后端源码** | `src-tauri/src/`（30 个 `.rs`） | 约 15,000 行 |
@@ -31,7 +31,7 @@
 
 **方式 A：安装包（推荐给普通用户）**
 
-运行构建好的 `DeepDark_Oracle_0.0.22_x64-setup.exe`。安装向导会让你选择安装目录，**默认落在非系统盘的 `D:\Apps\DeepDark_Oracle`**（D 盘不存在时退到 `E:\Apps`，再不行才用 `%LOCALAPPDATA%\DeepDark_Oracle`），避免把几百 MB 的模型塞进 C 盘。安装包会自动带上全部运行时 DLL、`models\`（嵌入/CLIP/CLAP）与 `tools\bin\ffmpeg.exe`，并创建开始菜单与桌面快捷方式；卸载入口在「设置 → 应用」里。
+运行构建好的 `DeepDark_Oracle_0.0.23_x64-setup.exe`。安装向导会让你选择安装目录，**默认落在非系统盘的 `D:\Apps\DeepDark_Oracle`**（D 盘不存在时退到 `E:\Apps`，再不行才用 `%LOCALAPPDATA%\DeepDark_Oracle`），避免把模型文件放进 C 盘。安装包只带程序运行时 DLL、`tools\bin\ffmpeg.exe` 等通用依赖，不包含任何 GGUF、safetensors、CLIP 或 CLAP 权重；ONNX Runtime 需在可选扩展页自行安装；模型由用户在模型配置页导入。安装包会创建开始菜单与桌面快捷方式；卸载入口在「设置 → 应用」里。
 
 **方式 B：便携版（解压即用）**
 
@@ -44,7 +44,7 @@ DeepDark_Oracle.exe            ← 直接运行，跳过菜单
 
 | 选项 | 作用 |
 | --- | --- |
-| `[1]` 正常启动 | 打开主界面，自动加载模型，并显示上次模型加载耗时 |
+| `[1]` 正常启动 | 打开主界面，使用轻量哈希基线，不自动加载用户模型 |
 | `[2]` 自检 | 跑一遍端到端检查（配置/库/模型/向量化/全文/拼音/文件名/语义/找相似/目录/标签），结果带颜色回显 |
 | `[3]` 重建索引 | 全量重抽正文 + 重算向量 + 重打画面标签 |
 | `[4]` 扫描目录 | 输入一个目录，命令行方式扫描入库（带进度） |
@@ -53,7 +53,7 @@ DeepDark_Oracle.exe            ← 直接运行，跳过菜单
 
 启动器用 PowerShell 写（`launcher.ps1`），因为 **.bat 里放中文会被 cmd 按 GBK 解析坏**。`launcher.ps1` 必须保持 **UTF-8 with BOM + CRLF**，否则 Windows PowerShell 5.1 会报解析错误。
 
-首次启动会自动加载模型（约 0.5~1.5 秒）。**便携版**的数据写在 exe 同级的 `data\`，整个文件夹可以拷走；**安装版**如果 exe 所在目录不可写（例如装在 `D:\Apps`、`Program Files` 且当前用户没有写权限），程序会自动回退到 `%LOCALAPPDATA%\DeepDark_Oracle\data`，启动器的「打开数据目录」会跟着指向实际位置。
+如果已导入或配置模型，启动时会自动尝试加载；安装包本身不含模型。用户可在模型配置页导入 GGUF 或 safetensors 模型。**便携版**的数据写在 exe 同级的 `data\`，整个文件夹可以拷走；**安装版**如果 exe 所在目录不可写（例如装在 `D:\Apps`、`Program Files` 且当前用户没有写权限），程序会自动回退到 `%LOCALAPPDATA%\DeepDark_Oracle\data`，启动器的「打开数据目录」会跟着指向实际位置。
 
 运行时必须一起带的文件（少一个就起不来或功能缺失）：
 
@@ -62,31 +62,28 @@ DeepDark_Oracle.exe            ← 直接运行，跳过菜单
 | `DeepDark_Oracle.exe` | 主程序 | — |
 | `WebView2Loader.dll` | WebView2 装载器 | **双击无反应、退出码 `0xC0000135`** |
 | `libstdc++-6.dll` / `libgcc_s_seh-1.dll` / `libwinpthread-1.dll` | gnu 运行时（llama.cpp 是 C++） | 弹「系统错误」窗后退出 |
-| `onnxruntime.dll` | ONNX 推理引擎（13.5MB） | 文字找图/找声音不可用（自检里两项标 `[FAIL]`） |
-| `models\embeddinggemma2.gguf` | 嵌入模型（533MB） | 退化成哈希基线，语义检索精度大幅下降 |
-| `models\clip\` | CLIP 图文模型（183MB） | 文字找图片/视频停用，退回颜色特征 |
-| `models\clap\` | CLAP 音文模型（155MB） | 文字找声音停用，退回频谱特征 |
+| `onnxruntime.dll`（可选扩展） | ONNX 推理引擎（约 13.5MB） | 不影响应用启动；未安装时 ONNX 图文/音文扩展能力不可用 |
 | `tools\bin\ffmpeg.exe` | 抽帧 / 音频解码 | 视频缩略图与音频/视频向量失败 |
 | `launcher.ps1` / `DeepDark_Oracle 启动器.cmd` | 启动器（可选） | 不影响主程序，只是少了菜单 |
 
-> 安装包已把上表所有文件打进安装目录，不需要单独准备；下面的「不含模型」只针对 Git 仓库里的便携版。
+> 安装包只包含程序和运行依赖，不包含 GGUF、safetensors、CLIP 或 CLAP 权重。模型由用户自行导入；不配置模型时仍可使用文件名和全文等非语义检索。
 
-> 表格里带体积的 4 项**不在本仓库**（超过 GitHub 100MB 单文件限制），要自己补，见下节。
+> 模型权重不在本仓库（超过 GitHub 100MB 单文件限制），需要自行准备并在模型配置页导入，见下节。
 
 验证办法：`DeepDark_Oracle.exe --selftest`，看 `selftest.txt` 末尾是不是 `失败 0 项`。库里还没索引文件时，检索类检查会标成 `[SKIP]` 而不是失败 —— 此时先把「扫描 / 索引」页的目录扫进来再跑一次。
 
-### 关于本仓库不含模型
+### 关于模型（仅为导入示例，不随仓库或安装包提供）
 
-GitHub 单文件硬上限 100MB，下面这些放不进 Git，**需要自己补**（缺了不会崩，只是对应功能降级，见上表最后一列）：
+本项目是检索工具，不捆绑或分发模型。可导入兼容的 GGUF 或 safetensors 模型；跨模态图片/音频能力还需要对应的 CLIP/CLAP 模型文件。GitHub 单文件硬上限 100MB，模型权重需要自行准备：
 
 | 文件 | 体积 | 从哪来 |
 | --- | --- | --- |
-| `models\embeddinggemma2.gguf` | 533MB | HuggingFace 上 EmbeddingGemma 300M 的 GGUF 转换版 |
+| `models\embeddinggemma2.gguf` | 约 533MB | HuggingFace 上 EmbeddingGemma 300M 的 GGUF 转换版；用户自行准备后导入 |
 | `models\clip\model.onnx` + `vocab.txt` | 183MB | `Xenova/chinese-clip-vit-base-patch16` 的 `onnx/model_quantized.onnx` 改名为 `model.onnx`，词表取同目录 `vocab.txt` |
 | `models\clap\audio_model.onnx` + `text_model.onnx` + `vocab.json` + `merges.txt` | 155MB | `Xenova/clap-htsat-unfused` 的两个 `onnx/*_model_quantized.onnx`，词表 `vocab.json` 与 `merges.txt` 原样保留（**不要改名**） |
 | `tools\bin\ffmpeg.exe` | 84MB | 任意 Windows 版 ffmpeg（需要 `-ss` 抽帧与 `f32le` 解码，7.x 已验证） |
 
-文件放到位后不用改配置（主程序、`--selftest`、`--cli` 用同一套自动探测）：程序启动时会在 exe 同级 `models\`（其次数据目录 `models\`）下找 `.gguf` 自动装载，CLIP/CLAP 默认读 `<exe>\models\clip` 与 `<exe>\models\clap`。跨模态模型首次装好后需要**重建一次索引**才会产出 512 维图文/音文向量。
+用户可在设置页导入模型文件夹，程序会识别 GGUF 或 safetensors 格式并复制到模型目录；也可以用快捷按钮打开该目录。跨模态模型首次导入后，需要**重建对应索引**才会产出图文/音文向量。模型文件及向量数据都不包含在安装包中。
 
 ### 2. 源码运行
 
@@ -96,7 +93,7 @@ GitHub 单文件硬上限 100MB，下面这些放不进 Git，**需要自己补*
 git clone --depth 1 https://github.com/ggml-org/llama.cpp vendor/llama.cpp
 ```
 
-v0.22 验证的是 llama.cpp `0.7.0-dev`（master，`LLAMA_VERSION_MAJOR/MINOR/PATCH = 0/7/0`）。上游 `llama.h` 的 C ABI 在小版本间会有增删，换版本后请先确认 `src-tauri/native/llama_shim.cpp` 用到的符号（`llama_model_load_from_file` / `llama_init_from_model` / `llama_batch_get_one` / `llama_get_embeddings_seq` / `llama_memory_clear` / `llama_model_n_embd_out`）仍在。
+v0.22 验证的是 llama.cpp `0.7.0-dev`（master，`LLAMA_VERSION_MAJOR/MINOR/PATCH = 0/7/0`）。构建前会运行 `scripts/patch-llama-embeddinggemma2.ps1`，给不认识新架构的 llama.cpp 增加 `gemma-embedding2` 到现有 Gemma embedding 实现的兼容映射。上游 `llama.h` 的 C ABI 在小版本间会有增删，换版本后请先确认 `src-tauri/native/llama_shim.cpp` 用到的符号（`llama_model_load_from_file` / `llama_init_from_model` / `llama_batch_get_one` / `llama_get_embeddings_seq` / `llama_memory_clear` / `llama_model_n_embd_out`）仍在。
 
 Windows 开发机可运行一次性依赖脚本安装 Rust MSVC 工具链、CMake、Ninja，拉取固定版本并恢复 npm/Cargo 依赖：
 
@@ -168,7 +165,7 @@ npm run tauri build -- --features llama,candle,candle-cuda,custom-protocol
 
 验证记录：
 
-- **v0.22（GNU / MSYS2 UCRT64）**：本机无 MSVC，用 `x86_64-pc-windows-gnu` + MSYS2 UCRT64 的 gcc 16.2 / cmake 4.4 / ninja 1.13 完整跑通 `cargo check` 与 `cargo build --release`，并产出 682 MB 的 NSIS 安装包。GNU 工具链有两条硬约束：① 中文路径会让 `windres` 打不开 `.ico`、让 MinGW `ld` 找不到标准库，`CARGO_HOME` / `RUSTUP_HOME` / `CARGO_TARGET_DIR` / `TMP` 必须全在纯 ASCII 目录（项目本身可用 `subst` 映射盘符后构建）；② 依赖 `dlltool.exe` / `windres.exe`，`PATH` 里要有 `<msys64>\ucrt64\bin`。构建命令：`cargo build --release --no-default-features --features llama,candle,custom-protocol`。
+- **v0.22（MSVC + CUDA）**：使用本机 Visual Studio 2022 C++ 工具链、CUDA 13.1 和 Vulkan/ONNX 运行时完成 `cargo build --release` 与 NSIS 打包，产出约 506 MiB 的 `DeepDark_Oracle_0.0.22_x64-setup.exe`。安装包只带程序运行时依赖，不带 GGUF、safetensors、CLIP 或 CLAP 权重；模型由用户在模型配置页导入。构建命令：`npm run tauri:release`（或 `powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1`）。
 - **CUDA（MSVC）**：已在 CUDA Toolkit 13.1 + Visual Studio 2022/MSVC 下完成 CUDA Release 编译和链接。直接运行 Cargo 构建时，可执行文件位于 `src-tauri/target/release/DeepDark_Oracle.exe`。CUDA 运行仍需要驱动和 CUDA/cuBLAS 运行时 DLL，应用会优先从项目 `.tools/cuda/` 或安装目录加载，不会替用户改系统磁盘布局。没有 NVIDIA CUDA 的机器仍可使用同一个 exe 的 llama.cpp/Vulkan 路径；Candle 模型会报告当前设备不可用，而不会悄悄回退到 CPU。
 
 **`custom-protocol` 这个 feature 不能漏**。它由 `tauri-build` 在构建脚本里读到，决定前端资源是「从磁盘内嵌协议加载」还是「连 `http://localhost:1420` 的开发服务器」；漏了这个 feature 也能编过，但打出来的 exe 双击后是**白屏**（只在 debug 下连 dev server，release 下没有服务器可连）。
@@ -292,7 +289,7 @@ SQLite 自带的 `trigram` 分词器要求 token 至少 3 个字符，**中文�
 | Chinese-CLIP（量化） | `models\clip\` | 182MB | 文字 ↔ 画面 |
 | CLAP（量化） | `models\clap\` | 154MB | 文字 ↔ 声音 |
 
-两者都走 **ONNX Runtime**（`onnxruntime.dll` 就放在 exe 旁边），推理在本机 CPU 完成，不上传任何数据。
+两者都走 **ONNX Runtime**。安装包不默认捆绑 ONNX Runtime 或模型权重；需要图文/音文扩展时，可在「设置 → 可选扩展」安装 ONNX Runtime，并自行导入对应模型。推理在本机完成，不上传任何数据。
 
 | 能力 | 状态 |
 | --- | --- |
@@ -322,11 +319,11 @@ SQLite 自带的 `trigram` 分词器要求 token 至少 3 个字符，**中文�
 
 - 首次索引时要为每个媒体文件跑一次模型：图片 ~30ms、音频 ~200ms（要解 10 秒 48kHz 波形 + 算 mel）、视频 ~50ms（抽首帧）。老库升级后需要**重建一次索引**才会出现新结果。
 - 音频需要 `tools\bin\ffmpeg.exe`；视频同理（抽帧）。没有 ffmpeg 时视频跳过并提示，不会卡住。
-- 两个模型都可以在「模型」页单独关闭，关掉后该模态退回颜色特征（256 维），文字找图/找声即失效。
+- CLIP/CLAP 扩展和 EmbeddingGemma2 Candle 原生视觉/音频塔都可以分别关闭。EmbeddingGemma2 的 safetensors 路径会把启用的文本、图片、视频、音频映射到同一个 768 维空间；关闭某个塔后，对应模态不会生成向量，不会伪报“可用”。
 
 ### 为什么不用主嵌入模型做
 
-EmbeddingGemma 2 的视觉塔（`vision_tower`）在 llama.cpp 里没有可用的 embedding 通路。我们试过用 mtmd 导出视觉塔并编码图片（向量确实是 512 维、不同图片也不同），但视觉塔输出与文本塔的 768 维**不在同一语义空间**（实测图文余弦 0.03~0.09，毫无区分度），真正负责对齐的 `embed_vision.embedding_projection` 层没有被 `convert_hf_to_gguf.py` 导出。详见 [CHANGELOG.md](CHANGELOG.md) 的 v0.17 条目 —— 所以跨模态单独接了 CLIP/CLAP。
+EmbeddingGemma 2 官方 GGUF 与同目录 `mmproj` 通过 llama.cpp `mtmd` 接入本软件。运行时会自动配对 projector，把图像、音频和视频窗口与文本 token 合并后输出共享的 768 维向量；没有匹配 projector 的 GGUF 仍仅提供文本能力。视频依赖项目内 FFmpeg，按 30 秒窗口、每秒一帧抽样，并可把同窗口音轨一起编码。CHANGELOG v0.17 记录的是旧转换器和旧探针的历史结果，不能套用到当前官方转换产物。
 
 ### 画面标签（不依赖模型，两条腿走路）
 
@@ -408,7 +405,7 @@ data\
 ├─ vectors_audio\       音频向量（CLAP，512 维）
 ├─ thumbs\              缩略图
 ├─ tmp\                 抽帧临时目录（正常时为空）
-├─ autoload.log         模型自动加载日志
+├─ autoload.log         旧版本自动加载日志（新版本不再写入）
 └─ panic.log            崩溃信息（正常时不出现）
 ```
 
@@ -435,13 +432,15 @@ data\
 
 **模型路径**：`data\config.json` 的 `model.embed_model` 指向 `.gguf` 或兼容目录中的 `model.safetensors`；留空则回退「哈希基线」（不需要模型，256 维，只适合演示）。EmbeddingGemma2 safetensors 由 Candle 原生适配器加载，未知架构只标记为 Python 候选，需在设置页安装可选 sidecar。
 
-**GPU**：模型设置页会列出当前构建实际支持的 GPU/核显，显示完整名称、总显存和空闲显存，并按显存从大到小排列。`model.gpu_device = "auto"` 默认选择显存最大的设备，并在**没有可用加速后端时自动退回 CPU 推理**（v0.21 起；状态栏会显示 `llama.cpp GGUF · CPU 推理（没有可用加速后端）`）。也可以在下拉里显式选「CPU（无可用加速设备时）」。显式指定的 GPU 失效或显存不足时同样退回 CPU，不会让整个语义检索不可用。
+**GPU**：模型设置页会列出当前构建实际支持的 GPU/核显，显示完整名称、总显存和空闲显存，并按显存从大到小排列。`model.gpu_device = "auto"` 默认选择显存最大的设备；Candle safetensors 后端要求 CUDA GPU，未编译 CUDA 时会明确报告不可用，不会把多模态模型悄悄降级成 CPU。
 
 构建脚本会自动探测项目 `.tools/cuda/` 或系统 CUDA Toolkit 并为 llama.cpp 启用 CUDA；包含 Candle CUDA 的发布构建请使用上一节的 `--features llama,candle,candle-cuda,custom-protocol`。这会生成一个同时包含两种原生后端的 exe，运行时通过设置页选择具体 GPU。运行时需要 CUDA Runtime/cuBLAS DLL 在 `PATH` 或应用目录，Windows GNU 工具链不支持该 CUDA 路径。设置 `DEEPAISEE_CUDA=0` 可显式关闭 llama.cpp 的 CUDA 构建；Candle CUDA 编译仍需要构建时存在 Toolkit。
 
 要让设置页列出 Intel/AMD 核显，需要把 Vulkan SDK（必须含 `Include/vulkan/vulkan.h` 和 `Bin/glslc.exe`）放到项目 `.tools/vulkan`；构建脚本会自动探测，也可显式设置 `$env:DEEPAISEE_VULKAN='1'`。项目会通过 GGML Vulkan 枚举离散 GPU 和集成 GPU；没有 Vulkan SDK 时不会伪造核显条目。设置 `DEEPAISEE_VULKAN=0` 可显式关闭自动探测。CLIP/CLAP 的 ONNX 路径目前使用 CPU Execution Provider，与 llama.cpp 文本模型的 GPU 选择相互独立。
 
-**索引参数**：`index.max_text_chars`（单文件正文字符上限，默认 20 万）、`index.video_frames`（期望抽帧数，默认 16）、`index.video_frame_interval`（最小抽帧间隔秒，默认 4）、`index.video_max_frames`（单视频帧数上限，默认 64）、`index.video_dedup_distance`（帧指纹去重阈值，默认 6，越小越严格）、`index.video_index_audio`（是否索引视频音轨，默认开）、`index.audio_seconds`（音频取样秒数）。`ui.*` 下是通用配置（`language` / `theme` / `autostart` / `auto_scan_on_start` / `notify_file_changes` / `default_search_mode`），`workspace.dirs` 是工作区目录列表。
+**索引参数**：专业模式按图片、视频、音频分组。EmbeddingGemma2 共用 8192 token 上下文；图片默认 280 soft tokens，视频帧默认 140，视觉预算可调 70-1120；视频默认按 1 FPS 采样并受最大帧数限制；音频按 16 kHz 单声道输入，当前 Candle 适配器为显存安全将单段上限限制为 30 秒。`index.max_text_chars` 控制正文上限，`index.image_max_side` 控制预处理尺寸，`index.vision_encoder` / `index.audio_encoder` 可在不使用对应模态时关闭。
+
+**其他嵌入模型**：Qwen3-Embedding 0.6B、Jina v5 Omni Small 的 GGUF 可尝试使用通用 llama.cpp 文本 embedding 路径，通用上下文、线程、批量和 GPU 参数仍有效；EmbeddingGemma 的图片/视频 token budget 与编码器开关不会套用到这些文本 GGUF。其他模型的 safetensors 需要匹配的 Candle 图结构或 Python/ONNX 扩展，程序会在加载时明确提示，不会伪装成 EmbeddingGemma 并输出误导性的张量错误。
 
 ---
 
@@ -511,10 +510,10 @@ A：能，前提是装了 `models\clap\` 且设置页「索引视频音轨」开
 A：工作区（设置 → 通用配置）指定的是「不建索引、搜索时现场读」的目录。搜索时打开工具栏的「工作区」开关，程序会遍历工作区目录里**还没入库**的文件，实时抽取正文参与匹配，结果与索引库结果一起排序（工作区命中会带「工作区」标签，缩略图显示为空）。适合放近期资料、U 盘、网络盘这类不值得建索引的地方；代价是首次搜索会慢一点（有 4 秒目录缓存与正文缓存）。
 
 **Q：启动时会自动扫描吗？**
-A：`ui.auto_scan_on_start` 默认开：程序启动 2.5 秒后在后台跑一次增量扫描，只对比修改时间，把新增/修改/删除的文件同步给索引，不会重算已有文件的向量。扫描结束若检测到变化，右下角会弹一条轻量提示（可在通用配置里关掉 `notify_file_changes`）。
+ A：`ui.auto_scan_on_start` 默认关闭：程序启动不会自动扫描或建立索引，用户在文件索引页点击扫描目录行或「建立索引」后才开始。开启该选项后，程序启动 2.5 秒后会在后台跑一次增量扫描，只对比修改时间，把新增/修改/删除的文件同步给索引，不会重算已有文件的向量。
 
 **Q：装了之后语义搜索不工作 / 状态栏显示「哈希基线」？**
-A：说明嵌入模型没加载成功，程序退回了 256 维哈希向量（只能做近似字面匹配）。v0.21 起 llama.cpp 在没有可用加速后端时会**自动走 CPU 推理**（状态栏显示 `llama.cpp GGUF · CPU 推理（没有可用加速后端）`），650 MB 的 `models\embeddinggemma2.gguf` 在 CPU 上也能跑，只是索引慢一些。如果仍显示哈希基线，检查 `models\embeddinggemma2.gguf` 是否随安装包放了进来（安装目录下应有 `models\` 子目录），以及模型设置页是否把它设成了当前模型。
+A：安装包不含模型。请先在模型配置页导入 GGUF 或 safetensors 模型，并确认模型加载成功；未导入或加载失败时，程序会退回哈希基线，语义检索效果会受限。模型文件应由用户自行准备，安装目录中不会预置 `models\embeddinggemma2.gguf`。
 
 **Q：安装时弹出「无法打开要写入的文件」或静默安装一闪而过？**
 A：多见于安全软件（如火绒、360）拦截**未签名**的安装程序写目标目录或解压到 `%TEMP%`。处理办法：① 双击安装包，在安全软件弹窗里选「允许」；② 或先把安装包加入安全软件信任区；③ 静默安装（`/S`）时若 `%TEMP%` 不可写会直接退出，可先把 `TEMP`/`TMP` 指到一个可写目录再运行。

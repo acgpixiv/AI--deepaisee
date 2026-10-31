@@ -27,8 +27,11 @@ export interface Hit {
   category: string;
   /** 是否有缩略图（文件名固定为 `<id>.jpg`） */
   thumb: boolean;
+  thumb_key?: string | null;
   score: number;
   reason: string;
+  /** One-based page/slide number when a page-level match is available. */
+  page?: number | null;
   snippet: string;
   /** 视觉标签（图片/视频自动生成）：蓝天、草地、雪景、夕阳… */
   tags?: string | null;
@@ -56,6 +59,20 @@ export interface SearchQuery {
   cross_modal?: boolean | null;
   /** 是否把「工作区目录」里尚未入库的文件也一起检索（正文现场抽取），不传=开启 */
   workspace?: boolean | null;
+  /** Home-page scope: all, indexed, or path. */
+  scope?: "all" | "indexed" | "path" | string | null;
+  scope_path?: string | null;
+}
+
+export interface WorkspaceState {
+  recent_paths: string[];
+  pinned_paths: string[];
+  last_path: string;
+  last_scope: string;
+  startup_scope: string;
+  startup_path: string;
+  initial_scope: string;
+  initial_path: string;
 }
 
 export interface StatsOut {
@@ -81,10 +98,19 @@ export interface ScanProgress {
   errors: number;
   missing: number;
   bytes: number;
+  discovered_files: number;
+  discovered_bytes: number;
   done: boolean;
   cancelled: boolean;
   current: string;
   seconds: number;
+  extensions: { ext: string; kind: string; count: number }[];
+  roots: {
+    root: string; dirs: number; files: number; added: number; updated: number;
+    skipped: number; errors: number; missing: number; bytes: number;
+    discovered_files: number; discovered_bytes: number; last_error: string;
+    extensions: { ext: string; kind: string; count: number }[];
+  }[];
 }
 
 export interface IndexStats {
@@ -100,6 +126,8 @@ export interface IndexStats {
   thumb_done: number;
   current: string;
   current_items: string[];
+  /** Backend task elapsed time, in whole seconds. */
+  elapsed_seconds: number;
 }
 
 export interface ModelInfo {
@@ -142,7 +170,9 @@ export interface ModelEntry {
   active: boolean;
   /** gguf 或 safetensors */
   format: string;
-  /** 当前 llama.cpp 通路是否可直接加载 */
+  /** Required model config, tokenizer and weights are present. */
+  files_complete: boolean;
+  /** 当前构建是否已包含可直接加载此模型的原生后端 */
   direct_loadable: boolean;
   /** 模型文件所在目录 */
   model_dir: string;
@@ -169,6 +199,7 @@ export interface ModelImportResult {
   files: ModelImportFile[];
   primary_model: string;
   primary_kind: string;
+  files_complete: boolean;
   direct_loadable: boolean;
   needs_conversion: boolean;
   warnings: string[];
@@ -241,6 +272,8 @@ export interface ServerStatus {
 export interface ExtensionStatus {
   onnxruntime: boolean;
   onnxruntime_path: string;
+  onnxruntime_version: string;
+  detail: string;
   python: boolean;
   python_path: string;
   root: string;
@@ -296,6 +329,9 @@ export interface RootIndexStats {
   embed_pending: number;
   last_error: string;
   kinds: { kind: string; label: string; count: number; bytes: number }[];
+  discovered_files: number;
+  discovered_bytes: number;
+  extensions?: { ext: string; kind: string; count: number }[];
 }
 
 /** 部分配置（深合并用）：后端会把传入的字段并入当前配置，其余保持不变。 */
@@ -318,7 +354,8 @@ export const api = {
   stats: () => invoke<StatsOut>("stats"),
   recent: (limit = 50) => invoke<Hit[]>("recent", { limit }),
 
-  scanStart: (roots?: string[], indexWhat?: string) => invoke<void>("scan_start", { roots, indexWhat }),
+  scanStart: (roots?: string[], indexWhat?: string, scanOnly = false) =>
+    invoke<void>("scan_start", { roots, indexWhat, scanOnly }),
   scanCancel: () => invoke<void>("scan_cancel"),
   scanProgress: () => invoke<ScanProgress>("scan_progress"),
   indexRoots: () => invoke<RootIndexStats[]>("index_roots"),
@@ -340,10 +377,14 @@ export const api = {
   modelImportFolder: (src: string) => invoke<ModelImportResult>("model_import_folder", { src }),
 
   openPath: (path: string) => invoke<void>("open_path", { path }),
+  openIndexedPath: (fileId: number, path: string) =>
+    invoke<void>("open_indexed_path", { fileId, path }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   renamePath: (path: string, name: string) => invoke<string>("rename_path", { path, name }),
   ensurePreview: (fileId: number, path: string) =>
     invoke<boolean>("ensure_preview", { fileId, path }),
+  savePdfThumbnail: (fileId: number, path: string, dataUrl: string) =>
+    invoke<void>("save_pdf_thumbnail", { fileId, path, dataUrl }),
 
   opExport: (paths: string[], out: string, fmt?: string) =>
     invoke<number>("op_export", { paths, out, fmt }),
@@ -364,6 +405,15 @@ export const api = {
   treeSearch: (query: string, limit = 200) =>
     invoke<TreeEntry[]>("tree_search", { query, limit }),
   workspaceAdd: (dir: string) => invoke<string[]>("workspace_add", { dir }),
+  workspaceState: () => invoke<WorkspaceState>("workspace_state"),
+  workspaceRemember: (path: string, scope?: string) =>
+    invoke<WorkspaceState>("workspace_remember", { path, scope }),
+  workspaceSetActive: (scope: string, path?: string) =>
+    invoke<WorkspaceState>("workspace_set_active", { scope, path }),
+  workspaceRemove: (path: string) => invoke<WorkspaceState>("workspace_remove", { path }),
+  workspaceSetStartup: (scope: string, path?: string) =>
+    invoke<WorkspaceState>("workspace_set_startup", { scope, path }),
+  availableDrives: () => invoke<string[]>("available_drives"),
 
   watchStart: () => invoke<number>("watch_start"),
   watchStop: () => invoke<void>("watch_stop"),
@@ -379,6 +429,9 @@ export const api = {
   extensionStatus: () => invoke<ExtensionStatus>("extension_status"),
   extensionInstall: (kind: "onnxruntime" | "python") =>
     invoke<ExtensionStatus>("extension_install", { kind }),
+  extensionRemove: (kind: "onnxruntime") =>
+    invoke<ExtensionStatus>("extension_remove", { kind }),
+  extensionUpdate: () => invoke<ExtensionStatus>("extension_update", { kind: "onnxruntime" }),
 };
 
 /** Tauri 未注入时（比如直接用浏览器打开 vite dev）给一个明确的错误。 */

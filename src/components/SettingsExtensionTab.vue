@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import { Download, FolderOpen, RefreshCw } from "lucide-vue-next";
+import { Download, FolderOpen, RefreshCw, Trash2 } from "lucide-vue-next";
 import { api, type ExtensionStatus } from "../api";
 import { toast } from "../store";
 import { t } from "../i18n";
@@ -32,6 +32,31 @@ async function install(kind: "onnxruntime" | "python") {
   }
 }
 
+async function updateOnnxRuntime() {
+  installing.value = "onnxruntime";
+  try {
+    status.value = await api.extensionUpdate();
+    toast(status.value.detail || `${t("ONNX Runtime")}: ${status.value.onnxruntime_version}`, "ok");
+  } catch (error) {
+    toast(`${t("扩展更新失败：")}${error}`, "error");
+  } finally {
+    installing.value = "";
+  }
+}
+
+async function removeOnnxRuntime() {
+  if (!window.confirm(t("确定将 ONNX Runtime 移入回收站？"))) return;
+  installing.value = "onnxruntime";
+  try {
+    status.value = await api.extensionRemove("onnxruntime");
+    toast(t("ONNX Runtime 已移入回收站"), "ok");
+  } catch (error) {
+    toast(`${t("扩展卸载失败：")}${error}`, "error");
+  } finally {
+    installing.value = "";
+  }
+}
+
 async function openRoot() {
   if (status.value?.root) await api.openPath(status.value.root);
 }
@@ -57,17 +82,24 @@ onMounted(refresh);
         <div class="extension-card-head"><strong>ONNX Runtime</strong><span class="extension-state" :class="{ on: status?.onnxruntime }">{{ status?.onnxruntime ? t("已安装") : t("未安装") }}</span></div>
         <p>{{ t("用于运行标准 ONNX 模型，例如 CLIP、CLAP。不能直接读取 safetensors。") }}</p>
         <div class="extension-path mono">{{ status?.onnxruntime_path || t("项目/.tools/onnxruntime/onnxruntime.dll") }}</div>
-        <button class="primary" :disabled="!!installing" @click="install('onnxruntime')"><Download :size="14" />{{ installing === "onnxruntime" ? t("安装中…") : status?.onnxruntime ? t("重新检查") : t("下载并安装") }}</button>
+        <div class="extension-card-actions">
+          <button class="primary" :disabled="!!installing" @click="status?.onnxruntime ? updateOnnxRuntime() : install('onnxruntime')">
+            <Download :size="14" />{{ installing === "onnxruntime" ? t("安装中…") : t("安装") }}
+          </button>
+          <button v-if="status?.onnxruntime" class="remove-extension" :disabled="!!installing" @click="removeOnnxRuntime">
+            <Trash2 :size="13" />{{ t("删除") }}
+          </button>
+        </div>
       </article>
 
       <article class="extension-card">
         <div class="extension-card-head"><strong>Python sidecar</strong><span class="extension-state" :class="{ on: status?.python }">{{ status?.python ? t("已安装") : t("未安装") }}</span></div>
         <p>{{ t("可选的 Python 运行时入口，用于尚未被内置模型支持的格式；不会自动安装 PyTorch。") }}</p>
         <div class="extension-path mono">{{ status?.python_path || t("项目/.tools/python/python.exe") }}</div>
-        <button class="primary" :disabled="!!installing" @click="install('python')"><Download :size="14" />{{ installing === "python" ? t("安装中…") : status?.python ? t("重新检查") : t("下载运行时") }}</button>
+        <button class="primary" :disabled="!!installing" @click="install('python')"><Download :size="14" />{{ installing === "python" ? t("安装中…") : t("安装") }}</button>
       </article>
     </div>
-    <p class="extension-note">{{ t("扩展不会写入系统目录，也不会删除已有文件。Python 运行时本身不包含模型和 PyTorch，具体模型适配器可按需另行安装。") }}</p>
+    <p class="extension-note">{{ t("扩展保存在项目目录；删除 ONNX Runtime 时会移入回收站。Python 运行时不包含模型和 PyTorch。") }}</p>
   </section>
 </template>
 
@@ -82,6 +114,9 @@ onMounted(refresh);
 .extension-state.on { color: #111; font-weight: 600; }
 .extension-path { margin: 8px 0 11px; overflow: hidden; color: #555; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .extension-card button { display: inline-flex; align-items: center; gap: 6px; }
+.extension-card-actions { display: flex; align-items: center; gap: 7px; }
+.remove-extension { min-width: 54px; padding: 6px 7px; border: 1px solid #b42318; border-radius: 2px; color: #b42318; background: #fff; font-size: 11px; cursor: pointer; }
+.remove-extension:disabled { opacity: .55; cursor: default; }
 .extension-note { margin: 12px 0 0; }
 @media (max-width: 720px) { .extension-grid { grid-template-columns: 1fr; } .extension-actions { margin-top: 8px; } }
 </style>

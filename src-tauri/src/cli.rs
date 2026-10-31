@@ -111,7 +111,7 @@ impl Ctx {
         db.sync_index_roots(&cfg.scan.roots, &cfg.scan.disabled_roots)
             .map_err(|e| format!("同步索引目录失败：{e}"))?;
         // 维度必须和真正要用的 embedder 一致，否则向量库会按错误步长解析
-        let dim = crate::ai::build_embedder_with_batch(&cfg.model, cfg.index.batch_size)
+        let dim = crate::ai::build_embedder_with_index(&cfg.model, &cfg.index, cfg.index.batch_size)
             .map(|e| e.dim())
             .unwrap_or(512);
         let vectors = VectorStore::open(&data_dir.join("vectors"), dim)
@@ -162,7 +162,7 @@ impl Ctx {
     }
 
     fn query_vec(&self, text: &str) -> Option<Vec<f32>> {
-        crate::ai::build_embedder_with_batch(&self.cfg.model, self.cfg.index.batch_size)
+        crate::ai::build_embedder_with_index(&self.cfg.model, &self.cfg.index, self.cfg.index.batch_size)
             .ok()
             .and_then(|e| e.embed_text(text, true).ok())
     }
@@ -328,19 +328,21 @@ fn cmd_search(ctx: &Ctx, args: &[String]) -> i32 {
         Some(k) => vec![k],
         None => Vec::new(),
     };
-    let no_sem = has_flag(args, "--no-semantic");
+    // Keep CLI search model-free by default, matching the GUI. Embedding is
+    // an explicit opt-in so a normal keyword lookup never wakes a model.
+    let semantic_requested = has_flag(args, "--semantic") && !has_flag(args, "--no-semantic");
     let mut q = SearchQuery {
         text: text.clone(),
         kinds,
         limit: Some(limit),
-        use_semantic: Some(!no_sem),
+        use_semantic: Some(semantic_requested),
         ..Default::default()
     };
-    if !no_sem {
+    if semantic_requested {
         q.query_vector = ctx.query_vec(&text);
     }
     // 跨模态：命令行默认开启，模型没装时字段为 None，检索段自动跳过。
-    if !has_flag(args, "--no-cross") {
+    if semantic_requested && !has_flag(args, "--no-cross") {
         if let Some(m) = &ctx.clip_model {
             q.clip_query = m.text_vec(&text).ok();
         }
@@ -456,7 +458,7 @@ fn cmd_stats(ctx: &Ctx) -> i32 {
 
 fn cmd_index(ctx: &Ctx, args: &[String]) -> i32 {
     let what = parse_flag(args, "--what").unwrap_or_else(|| "auto".into());
-    let Some(emb) = crate::ai::build_embedder_with_batch(&ctx.cfg.model, ctx.cfg.index.batch_size).ok() else {
+    let Some(emb) = crate::ai::build_embedder_with_index(&ctx.cfg.model, &ctx.cfg.index, ctx.cfg.index.batch_size).ok() else {
         println!("错误：模型未加载");
         return 1;
     };

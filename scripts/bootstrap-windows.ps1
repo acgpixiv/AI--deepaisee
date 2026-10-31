@@ -6,9 +6,9 @@ $ProgressPreference = "SilentlyContinue"
 $repo = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "activate-local.ps1")
 
-# ONNX Runtime is kept beside the project and bundled with the desktop app.
-# This is used by the optional CLIP/CLAP ONNX models; it does not modify the
-# system installation.
+# ONNX Runtime is an optional development extension kept beside the project.
+# The release installer does not bundle it; this bootstrap step only prepares
+# a local developer environment and does not modify the system installation.
 & (Join-Path $PSScriptRoot "install-onnxruntime.ps1")
 $tools = Join-Path $repo ".tools"
 $downloads = Join-Path $tools "downloads"
@@ -95,6 +95,8 @@ $llamaDir = Join-Path $repo "vendor\llama.cpp"
 if (-not (Test-Path (Join-Path $llamaDir "include\llama.h"))) {
   git clone --depth 1 --branch b9999 https://github.com/ggml-org/llama.cpp.git $llamaDir
 }
+
+& (Join-Path $PSScriptRoot "patch-llama-embeddinggemma2.ps1")
 
 Push-Location $repo
 try {

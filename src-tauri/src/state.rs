@@ -54,7 +54,7 @@ pub struct EngineParts {
 ///
 /// 两个模型都是可选的：没装就返回 None，检索时静默跳过跨模态段。
 /// 加载失败也不能让主程序起不来——用户可能只想用文件名搜索。
-fn load_cross_modal(
+pub fn load_cross_modal(
     cfg: &crate::config::ModelConfig,
     app_dir: &std::path::Path,
     data_dir: &std::path::Path,
@@ -106,7 +106,9 @@ impl AppState {
             VectorStore::open(&data_dir.join("vectors_audio"), 512)
                 .map_err(|e| format!("跨模态音频向量库打开失败: {e}"))?,
         );
-        let (clip, clap) = load_cross_modal(&cfg.model, &app_dir, &data_dir);
+        // Cross-modal encoders are loaded lazily with an explicit indexing
+        // request. Opening the search UI must remain lightweight.
+        let (clip, clap) = (None, None);
         Ok(Self {
             cfg: RwLock::new(cfg),
             db,
@@ -143,8 +145,24 @@ impl AppState {
     }
 
     pub fn search(&self, q: &mut crate::search::SearchQuery) -> Vec<crate::search::Hit> {
+        // Own the scope string before mutating the query below. Borrowing it
+        // directly from `q` would keep an immutable borrow alive across the
+        // root-scope normalization and prevent the required mutable borrow.
+        let scope = q.scope.as_deref().unwrap_or("legacy").to_owned();
         let scan = self.cfg.read().scan.clone();
-        crate::search::apply_enabled_root_scope(q, &scan.roots, &scan.disabled_roots);
+        // `all` intentionally bypasses the enabled-root restriction. The
+        // indexed database can safely search every row, while `indexed` keeps
+        // the configured-root behaviour and `path` narrows to the selected
+        // directory (including a directory that has not been indexed yet).
+        if scope == "path" {
+            if let Some(path) = q.scope_path.as_deref().map(crate::util::norm_path).filter(|p| !p.is_empty()) {
+                q.roots = vec![path];
+            }
+        } else if scope == "indexed" || scope == "legacy" {
+            crate::search::apply_enabled_root_scope(q, &scan.roots, &scan.disabled_roots);
+        } else {
+            q.roots.clear();
+        }
         // 跨模态：把查询词编码成图片/声音空间里的向量。
         // 模型没装时静默跳过，用户仍然能靠文件名/标签搜到东西。
         if q.cross_modal == Some(true) && q.text.chars().count() >= 2 {
@@ -175,8 +193,27 @@ impl AppState {
 
         // 工作区实时检索：把「工作区目录里有、索引库里没有」的文件也算进来。
         // 开关由前端传（默认开），只有首页搜索要，其他调用方（相似检索、服务端 API）不需要。
-        if q.workspace.unwrap_or(true) {
-            let ws_cfg = self.cfg.read().workspace.clone();
+        if q.workspace.unwrap_or(true) && scope != "indexed" {
+            let mut ws_cfg = self.cfg.read().workspace.clone();
+            if scope == "legacy" && ws_cfg.dirs.is_empty() {
+                ws_cfg.dirs = scan.roots.iter()
+                    .filter(|root| !scan.disabled_roots.iter().any(|disabled| {
+                        crate::util::norm_path(disabled).eq_ignore_ascii_case(&crate::util::norm_path(root))
+                    }))
+                    .cloned()
+                    .collect();
+            }
+            if scope == "path" {
+                if let Some(path) = q.scope_path.as_deref().map(crate::util::norm_path).filter(|p| !p.is_empty()) {
+                    ws_cfg.dirs = vec![path];
+                }
+            } else if scope == "all" {
+                // Full-disk scope also covers files that have not been
+                // indexed yet. Keep the existing bounded workspace extractor
+                // limits so selecting "all" cannot recursively read an
+                // unbounded drive in the UI thread.
+                ws_cfg.dirs = available_drive_roots();
+            }
             if ws_cfg.enabled && !ws_cfg.dirs.is_empty() {
                 let extra = self.workspace.search(&self.db, &ws_cfg, q, &hits);
                 if !extra.is_empty() {
@@ -207,12 +244,8 @@ impl AppState {
             cfg,
             self.data_dir.join("thumbs"),
         ));
-        let batch_size = match app_cfg.model.parallel_mode.as_str() {
-            "eco" => 1,
-            "turbo" | "狂暴" => configured_batch_size.max(96).min(128),
-            _ => configured_batch_size.max(48).min(64),
-        };
-        idx.set_batch_size(batch_size);
+        idx.set_batch_size(crate::ai::effective_batch_size(&app_cfg.model, configured_batch_size));
+        idx.set_worker_threads(crate::ai::effective_parallel_threads(&app_cfg.model));
         {
             idx.set_cross_modal(self.clip.read().clone(), self.clap.read().clone());
         }
@@ -231,6 +264,21 @@ impl AppState {
     pub fn indexer(&self) -> Option<Arc<Indexer>> {
         self.indexer.read().clone()
     }
+
+}
+
+fn available_drive_roots() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        ('A'..='Z')
+            .map(|letter| format!("{letter}:\\"))
+            .filter(|root| std::path::Path::new(root).is_dir())
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec!["/".into()]
+    }
 }
 
 /// 把工作区命中并入索引结果：按分数降序，保留原来的分页语义。
@@ -248,7 +296,7 @@ fn merge_workspace_hits(
     if sort == "relevance" || sort.is_empty() {
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     }
-    let limit = q.limit.unwrap_or(1000).max(1);
+    let limit = q.limit.unwrap_or(50_000).max(1);
     let offset = q.offset.unwrap_or(0);
     if hits.len() > offset + limit {
         hits.truncate(offset + limit);
