@@ -54,6 +54,8 @@ pub struct CandleEmbedder {
     audio_enabled: bool,
     video_index_audio: bool,
     audio_seconds: f32,
+    context_tokens: usize,
+    video_token_budget: usize,
     image_max_side: u32,
     pdf_image_token_budget: usize,
 }
@@ -140,6 +142,8 @@ impl CandleEmbedder {
             audio_enabled,
             video_index_audio,
             audio_seconds: audio_seconds.clamp(0.25, 30.0),
+            context_tokens: max_seq_len.clamp(512, 8192),
+            video_token_budget: video_token_budget.clamp(70, 1120),
             image_max_side: image_max_side.clamp(64, 4096),
             pdf_image_token_budget: pdf_image_token_budget.clamp(70, 1120),
         })
@@ -382,16 +386,26 @@ impl Embedder for CandleEmbedder {
     }
 
     fn video_window_vectors(&self, path: &Path) -> Result<Vec<Vec<f32>>, String> {
-        // Process one 30-second window at a time. Each window mixes 1 FPS
+        // Process one context-safe window at a time. Each window mixes 1 FPS
         // frames and its matching 16 kHz audio clip in EmbeddingGemma2's
-        // shared context. The caller can retain each window vector for
-        // temporal search or average them for legacy file-level access.
+        // shared context. Smaller-context model configurations therefore get
+        // more, shorter vectors instead of one failed oversized request.
         let duration = crate::media::video_duration(path).unwrap_or(0.0).max(0.1);
+        let window_seconds = crate::media::safe_video_window_seconds(
+            self.context_tokens,
+            self.video_token_budget,
+            self.audio_enabled && self.video_index_audio,
+            self.audio_seconds,
+        );
         let mut vectors = Vec::new();
         let mut start = 0.0f64;
         while start < duration {
-            let window = (duration - start).min(30.0);
-            let frames = crate::media::sample_video_frames_window(path, start, window, self.image_max_side);
+            let window = (duration - start).min(window_seconds);
+            let frames = if self.vision_enabled {
+                crate::media::sample_video_frames_window(path, start, window, self.image_max_side)
+            } else {
+                Vec::new()
+            };
             let images: Vec<image::DynamicImage> = frames
                 .iter()
                 .filter_map(|frame| {
@@ -418,7 +432,7 @@ impl Embedder for CandleEmbedder {
                 }
                 vectors.push(self.one(input, None)?);
             }
-            start += 30.0;
+            start += window;
         }
         if vectors.is_empty() {
             return Err("视频未能解码出画面或音轨（需要 ffmpeg）".into());

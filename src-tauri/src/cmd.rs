@@ -778,12 +778,15 @@ pub fn model_load_inner(state: &Arc<AppState>, backend: String, path: Option<Str
         "llama" => {
             #[cfg(feature = "llama")]
             {
-                let e = crate::ai::llama::LlamaEmbedder::load(
+                let e = crate::ai::llama::LlamaEmbedder::load_with_media_config(
                     resolved_s.as_deref().unwrap_or(&requested),
                     cfg.model.context_size as i32,
                     crate::ai::effective_parallel_threads(&cfg.model)
                         .min(i32::MAX as usize) as i32,
                     &cfg.model.gpu_device,
+                    cfg.index.video_token_budget,
+                    cfg.index.audio_seconds,
+                    cfg.index.video_frame_interval,
                 )?;
                 Arc::new(e)
             }

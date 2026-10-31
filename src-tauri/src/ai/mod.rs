@@ -829,11 +829,14 @@ pub fn build_embedder_with_index(
     #[cfg(feature = "llama")]
     {
         if model_path.extension().map(|x| x.eq_ignore_ascii_case("gguf")).unwrap_or(false) {
-            return match llama::LlamaEmbedder::load(
+            return match llama::LlamaEmbedder::load_with_media_config(
                 &resolved.to_string_lossy(),
                 cfg.context_size as i32,
                 effective_model_threads(cfg),
                 &cfg.gpu_device,
+                index.video_token_budget,
+                index.audio_seconds,
+                index.video_frame_interval,
             ) {
                 Ok(e) => Ok(Box::new(e)),
                 Err(e) => Err(format!("llama.cpp 加载失败：{e}")),

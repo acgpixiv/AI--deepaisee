@@ -296,6 +296,10 @@ pub struct LlamaEmbedder {
     media_handle: Mutex<Handle>,
     dim: usize,
     context_tokens: usize,
+    video_token_budget: usize,
+    audio_seconds: f32,
+    vision_supported: bool,
+    audio_supported: bool,
     model_name: String,
     device: String,
 }
@@ -312,6 +316,30 @@ impl LlamaEmbedder {
         n_ctx: i32,
         n_threads: i32,
         selected_device: &str,
+    ) -> Result<Self, String> {
+        Self::load_with_media_config(
+            model_path,
+            n_ctx,
+            n_threads,
+            selected_device,
+            140,
+            30.0,
+            1.0,
+        )
+    }
+
+    /// Load a GGUF embedder with the media budgets selected in the indexing
+    /// settings. Keeping this separate from `load` preserves the small public
+    /// compatibility API used by older callers while allowing video windows
+    /// to be sized against the actual model configuration.
+    pub fn load_with_media_config(
+        model_path: &str,
+        n_ctx: i32,
+        n_threads: i32,
+        selected_device: &str,
+        video_token_budget: usize,
+        audio_seconds: f32,
+        _video_frame_interval: f32,
     ) -> Result<Self, String> {
         if !std::path::Path::new(model_path).exists() {
             return Err(format!("GGUF 模型不存在：{model_path}"));
@@ -396,6 +424,7 @@ impl LlamaEmbedder {
             }
             return Err("模型未报告 embedding 维度".into());
         }
+        let capabilities = unsafe { ds_llama_capabilities(media_raw) };
         let name = std::path::Path::new(model_path)
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -405,6 +434,10 @@ impl LlamaEmbedder {
             media_handle: Mutex::new(Handle(media_raw)),
             dim: dim as usize,
             context_tokens: n_ctx.max(256) as usize,
+            video_token_budget: video_token_budget.clamp(70, 1120),
+            audio_seconds: audio_seconds.clamp(0.25, 30.0),
+            vision_supported: capabilities & 2 != 0,
+            audio_supported: capabilities & 4 != 0,
             model_name: name,
             device: selected.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| "CPU".into()),
         })
@@ -769,23 +802,41 @@ impl Embedder for LlamaEmbedder {
 
     fn embed_video_segments(&self, path: &std::path::Path) -> Result<Vec<Vec<f32>>, String> {
         let duration = crate::media::video_duration(path).unwrap_or(0.0).max(0.1);
+        // A 30-second window is only valid when its projected frames and
+        // audio fit the shared model context.  Older configs commonly use
+        // 4096 tokens, so dynamically shorten the window instead of sending
+        // an oversized sequence that makes the entire video fail.
+        let window_seconds = crate::media::safe_video_window_seconds(
+            self.context_tokens,
+            self.video_token_budget,
+            self.audio_supported,
+            self.audio_seconds,
+        );
         let mut vectors = Vec::new();
         let mut start = 0.0f64;
         while start < duration {
-            let window = (duration - start).min(30.0);
-            let frame_paths = crate::media::sample_video_frames_window(path, start, window, 1024);
+            let window = (duration - start).min(window_seconds);
+            let frame_paths = if self.vision_supported {
+                crate::media::sample_video_frames_window(path, start, window, 1024)
+            } else {
+                Vec::new()
+            };
             let mut images = Vec::new();
             for frame in &frame_paths {
                 if let Ok(image) = image::open(frame) { images.push(image.to_rgb8()); }
                 let _ = std::fs::remove_file(frame);
             }
             if let Some(parent) = frame_paths.first().and_then(|frame| frame.parent()) { let _ = std::fs::remove_dir_all(parent); }
-            let audio = crate::media::load_audio_segment_at_rate(
-                path,
-                start,
-                window,
-                self.audio_sample_rate(),
-            );
+            let audio = if self.audio_supported {
+                crate::media::load_audio_segment_at_rate(
+                    path,
+                    start,
+                    window,
+                    self.audio_sample_rate(),
+                )
+            } else {
+                None
+            };
             let mut items = Vec::with_capacity(images.len() + usize::from(audio.is_some()));
             for image in &images {
                 items.push(NativeMediaItem { kind: 1, data: image.as_ptr() as *const c_void,
@@ -796,7 +847,7 @@ impl Embedder for LlamaEmbedder {
                     length: samples.len(), width: 0, height: 0, token_budget: 0 });
             }
             if !items.is_empty() { vectors.push(self.embed_native_media(&items)?); }
-            start += 30.0;
+            start += window;
         }
         if vectors.is_empty() { return Err("视频未能解码出图像帧或音频轨".into()); }
         Ok(vectors)

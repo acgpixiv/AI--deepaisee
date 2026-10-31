@@ -493,6 +493,39 @@ pub fn sample_video_frames_window(
     let _ = std::fs::remove_dir_all(&tmp);
     Vec::new()
 }
+
+/// Pick a video window that fits the model's shared multimodal context.
+///
+/// EmbeddingGemma2 accounts for roughly one soft token per configured video
+/// frame budget and about 25 audio tokens per second.  The native GGUF path
+/// enforces this limit before it submits the sequence, so a fixed 30-second
+/// window can fail on models configured with a 4096-token context.  Keep a
+/// small margin for modality markers and text tokens, then let callers advance
+/// by the returned duration so every frame/audio sample is still indexed.
+pub fn safe_video_window_seconds(
+    context_tokens: usize,
+    frame_token_budget: usize,
+    include_audio: bool,
+    audio_seconds: f32,
+) -> f64 {
+    const MAX_WINDOW_SECONDS: f64 = 30.0;
+    const AUDIO_TOKENS_PER_SECOND: usize = 25;
+    const CONTEXT_MARGIN: usize = 256;
+
+    let context = context_tokens.max(512);
+    let frame_cost = frame_token_budget.clamp(70, 1120);
+    let per_second = frame_cost.saturating_add(if include_audio { AUDIO_TOKENS_PER_SECOND } else { 0 });
+    let available = context.saturating_sub(CONTEXT_MARGIN);
+    let by_budget = if per_second == 0 {
+        MAX_WINDOW_SECONDS as usize
+    } else {
+        available / per_second
+    };
+    let configured_audio = f64::from(audio_seconds).clamp(0.25, MAX_WINDOW_SECONDS);
+    (by_budget.max(1) as f64)
+        .min(MAX_WINDOW_SECONDS)
+        .min(configured_audio)
+}
 /// 清掉上次运行残留的 `frames-<pid>` 目录。
 ///
 /// 每个进程只用自己的 pid 目录，正常结束会删；但程序被强杀 / 崩溃时
@@ -746,4 +779,23 @@ pub fn video_size(path: &Path) -> Option<(u32, u32)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_video_window_seconds;
+
+    #[test]
+    fn video_windows_fit_common_context_sizes() {
+        assert_eq!(safe_video_window_seconds(4096, 140, true, 30.0), 23.0);
+        assert_eq!(safe_video_window_seconds(8192, 140, true, 30.0), 30.0);
+        assert_eq!(safe_video_window_seconds(4096, 1120, true, 30.0), 3.0);
+        assert_eq!(safe_video_window_seconds(4096, 140, false, 30.0), 27.0);
+    }
+
+    #[test]
+    fn video_window_never_returns_zero() {
+        assert_eq!(safe_video_window_seconds(256, 1120, true, 30.0), 1.0);
+        assert_eq!(safe_video_window_seconds(4096, 140, true, 2.0), 2.0);
+    }
 }
